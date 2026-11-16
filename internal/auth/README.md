@@ -15,6 +15,8 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `RefPolicy` (`MarshalJSON`/`UnmarshalJSON` as a `[pattern, ops]` tuple), `OpNoPush`, `OpNoForcePush`, `OpVerifySig` [policy.go:RefPolicy]
 - `EphemeralNamespacePrefix` (`refs/namespaces/ephemeral/`), `NormalizeRefName`, `EphemeralRefName` [policy.go:EphemeralNamespacePrefix]
 - `ParseRefPolicies`, `MatchPolicy`, `FoldOps` — parse the refs claim, first-match lookup over exact, `*`, or trailing `/*` patterns, fold the deprecated ops claim into refs [policy.go:MatchPolicy]
+- `MalformedError` — a token or claim that does not decode: its text is fixed (`malformed jwt`, `malformed jwt claims`, `malformed refs claim`) so a client can read it, and `Unwrap` has the decoder's error for a log [malformed.go:MalformedError]
+- `KeySourceError`, `StoredKeyError` — a `Verify` failure of the key lookup (the store failed, or the org is unknown), and a registered key that `ParsePublicKeysPEM` refuses: their `Error` text names only the issuer, and `Unwrap` has the cause for a log [verifier.go:KeySourceError]
 - `KeySource`, `OrgKeyVerifier`, `NewVerifier`, `UnionKeySource` — `Verifier` backed by per-org keys, and an overlay of in-memory PEM keys for one org [verifier.go:OrgKeyVerifier]
 
 ## Invariants
@@ -22,10 +24,13 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `ParsePublicKeysPEM` rejects non-`PUBLIC KEY` blocks, RSA under 2048 bits, unsupported key types, and an empty key set [auth.go:ParsePublicKeysPEM]
 - `MintToken` rejects an alg outside the signature map or one that does not fit the key; `GenerateKey` rejects unknown algs [mint.go:MintToken]
 - `RefPolicy.UnmarshalJSON` requires exactly a 2-element tuple [policy.go:UnmarshalJSON]
+- `ParseRefPolicies` returns only a `*MalformedError` as its error [policy.go:ParseRefPolicies]
 - `MatchPolicy` returns no match for an empty ref [policy.go:MatchPolicy]
 - `Verify` rejects tokens without exactly two dots, non-canonical base64url segments, and JSON-serialized JWS with other than one signature [verifier.go:Verify]
+- `Verify` rejects a token whose decoded protected header is not exactly one JSON object, with no byte before or after it, whitespace included, and answers the fixed text `malformed jwt`: jwx decodes only the first JSON value and signs over that object alone, so the header segment that the client sent must be those bytes [verifier.go:checkHeader]
+- `Verify` rejects a token whose protected header has a `crit` member of any value, before any key lookup and with the fixed text `jwt crit header is not supported`: no extension is understood (RFC 7515 §4.1.11) [verifier.go:checkHeader]
 - `Verify` accepts only algs in `signatureAlgorithms` and checks the key family matches the alg [verifier.go:keySupportsAlg]
-- `validateClaims` requires `exp` > now and `sub` == `SubjectLiteral`; `iat` is not checked [verifier.go:validateClaims]
+- `validateClaims` requires `exp` > now and a non-empty `sub`; `iat` is not checked [verifier.go:validateClaims]
 - `init` panics if `signatureAlgorithms` and `AllowedAlgorithms` disagree [verifier.go:init]
 - `UnionKeySource` panics on a nil inner source, empty org, no PEMs, or unparseable PEM [verifier.go:UnionKeySource]
 - `Verify` fails closed for an issuer with no keys [verifier.go:Verify]
@@ -35,7 +40,8 @@ JWT auth contract for the HTTP API and the git surface. It defines claim types, 
 - `OrgKeyVerifier.Verify` calls the injected `KeySource.PublicKeysForOrg` with the unverified `iss` claim [verifier.go:Verify]
 - `FoldOps` and `UnionKeySource.PublicKeysForOrg` do not mutate their inputs. `FoldOps` returns the caller's `refs` slice itself when `ops` is empty and a fresh slice otherwise [policy.go:FoldOps]
 - `UnionKeySource.PublicKeysForOrg` copies only for the union org. For every other org it returns the inner source's slice unchanged [verifier.go:PublicKeysForOrg]
-- No database, network, filesystem, subprocess, or logging use [auth.go:Claims]
+- `OrgKeyVerifier.Verify` logs one `slog` warning (the default logger) with the decoder's error when the claims of a token fail to decode after its signature has verified. It logs nothing for a failure before the signature check, because the client chose those bytes [verifier.go:Verify]
+- No database, network, filesystem, or subprocess use [auth.go:Claims]
 
 ## Verification
 - Run: `go test ./internal/auth/... -tags=openstorage_viewcheck -count=1 -race -timeout=30m`

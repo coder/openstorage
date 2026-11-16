@@ -1144,7 +1144,7 @@ func testQueryGrep(t *testing.T, e *testEnv) {
 				t.Fatal(err)
 			}
 			bin := t.TempDir()
-			wrapper := "#!/bin/sh\ncase \"$*\" in *" + fx.c4 + "^{commit}*) (sleep 5) & ;; esac\nexec " + realGit + " \"$@\"\n"
+			wrapper := "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then for a in \"$@\"; do [ \"$a\" = '" + fx.c4 + "' ] && { (sleep 5) & }; done; fi\nexec " + realGit + " \"$@\"\n"
 			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(wrapper), 0o755); err != nil {
 				t.Fatal(err)
 			}

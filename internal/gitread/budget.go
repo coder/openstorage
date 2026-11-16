@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/coder/openstorage/internal/gitlimit"
@@ -70,18 +69,13 @@ var (
 	// ErrOutputLimit: git's buffered output exceeded the request's
 	// allowance; git was killed and reaped as soon as that happened.
 	ErrOutputLimit = errors.New("git output exceeded the request output budget")
-	// ErrArgument: git cannot get an argument. exec refuses one with a NUL
-	// byte, one past 128 KiB on Linux, and arguments that together pass
-	// ARG_MAX (E2BIG). Arguments come from the request (paths, patterns),
-	// so this is a client error, never a server fault.
-	ErrArgument = errors.New("git argument too long or holds a NUL byte")
 	// ErrBlobTooLarge: a blob is larger than MaxBlobBytes; git was not
 	// started for it.
 	ErrBlobTooLarge = errors.New("blob exceeds the API read size limit")
 	// ErrSymlinkTooLong: a symlink's target is longer than MaxSymlinkTarget.
 	// The size that the tree lists is checked before git starts. A blob
-	// that git prints longer than listed (a replacement object that
-	// appeared since) ends git at the first byte over the limit.
+	// that git prints longer than listed (a broken object store: git reads
+	// no replacement objects) ends git at the first byte over the limit.
 	ErrSymlinkTooLong = errors.New("symlink target exceeds the API read size limit")
 	// ErrMemoryLimit: git needed more heap than its class's cap and was
 	// stopped by its own allocation failure (Linux only).
@@ -393,6 +387,9 @@ type Cmd struct {
 	// `rev-list` walk read incrementally). Its Write may return ErrStop to
 	// end git early. When nil, output is buffered, counted, and returned.
 	Stdout io.Writer
+	// Stderr, when set, also receives git's stderr, for a caller that must
+	// read git's messages when git exits 0.
+	Stderr io.Writer
 	Args   []string
 }
 
@@ -435,20 +432,14 @@ func childEnv(env []string) []string {
 // it (git is always reaped before Run returns). Limit outcomes are
 // returned as ErrBusy, ErrTimeBudget, ErrOutputLimit, or ErrMemoryLimit,
 // and never wrap *exec.ExitError, so exit-status checks cannot mistake them
-// for git's own "no match" or "not found" statuses. An argument that exec
-// refuses (a NUL byte, E2BIG) is ErrArgument. Other failures are a
-// *GitError (see there).
+// for git's own "no match" or "not found" statuses. A ctx that ends (the
+// caller gave up) returns ctx's error, also when git was killed for it.
+// Other failures are a *GitError (see there).
 func Run(ctx context.Context, c Cmd) (string, error) {
 	assertf(c.Class == Light || c.Class == Heavy, "Run: class %d", c.Class)
 	assertf(c.Dir != "", "Run: empty Dir")
 	assertf(len(c.Args) > 0, "Run: no git args")
 	name := gitlimit.Name(c.Args)
-	for _, a := range c.Args {
-		if strings.IndexByte(a, 0) >= 0 {
-			// exec would refuse it with an EINVAL that other causes share.
-			return "", fmt.Errorf("%s: %w", name, ErrArgument)
-		}
-	}
 
 	b := BudgetFrom(ctx)
 	var heap int64 // no Budget (write endpoints): no limits at all
@@ -481,6 +472,9 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	cmd.WaitDelay = childWaitDelay
 	var stderr gitlimit.TailBuffer
 	cmd.Stderr = &stderr
+	if c.Stderr != nil {
+		cmd.Stderr = io.MultiWriter(&stderr, c.Stderr)
+	}
 	var out *limitedBuffer
 	var stream *stopWriter
 	if c.Stdout != nil {
@@ -501,8 +495,11 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 	}
 	msg := stderr.String()
 	switch {
-	case errors.Is(err, syscall.E2BIG):
-		return stdout, fmt.Errorf("%s: %w: %w", name, ErrArgument, err)
+	case ctx.Err() != nil:
+		// The request ended. exec kills git for it, and then reports the
+		// kill ("signal: killed"), not the context: that is no failure of
+		// git's own.
+		return stdout, fmt.Errorf("%s: %w", name, ctx.Err())
 	case out != nil && out.overflow:
 		return stdout, fmt.Errorf("%s: %w", name, ErrOutputLimit)
 	case ctx.Err() == nil && errors.Is(limitCtx.Err(), context.DeadlineExceeded):
@@ -514,10 +511,9 @@ func Run(ctx context.Context, c Cmd) (string, error) {
 }
 
 // GitError is Run's error for a git child that failed on its own (not a
-// limit outcome). It wraps the error of the run: an *exec.ExitError when
+// limit outcome or a canceled request). It wraps the error of the run: an *exec.ExitError when
 // git exited with a status or died of a signal, or the error of a start
-// that failed for another reason than its arguments (those are
-// ErrArgument). It keeps git's stderr. A
+// that failed (exec refused the arguments). It keeps git's stderr. A
 // caller that classifies a failure reads the exit status and Stderr,
 // never the error text: that quotes the request's arguments.
 type GitError struct {

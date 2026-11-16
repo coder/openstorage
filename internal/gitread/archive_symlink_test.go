@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -146,17 +145,16 @@ func TestReadSymlinkTargetRefusesALongTarget(t *testing.T) {
 		t.Fatalf("git cat-file ran %d times for a target over the limit", n-before)
 	}
 	// The size came from a tree that listed a short blob: the blob git prints
-	// is longer, as with a replacement object.
+	// is longer, as with a broken object store.
 	if _, err := ReadSymlinkTarget(ctx, dir, sha["long"].SHA, 5); !errors.Is(err, ErrSymlinkTooLong) {
 		t.Fatalf("a blob longer than its listed size: err = %v, want ErrSymlinkTooLong", err)
 	}
 }
 
-// A replacement object that appears after the tree was listed makes git print
-// a longer blob than the listed size. The read stops at one byte over the
-// limit: git is ended, and the process does not hold the replacement (8 MiB
-// here; up to the output allowance in a request).
-func TestReadSymlinkTargetBoundsAReplacementBlob(t *testing.T) {
+// git reads every object as itself (gitlimit sets GIT_NO_REPLACE_OBJECTS):
+// a refs/replace/* ref that points a symlink's blob at an 8 MiB blob, made
+// after the tree was listed, leaves the target as the tree lists it.
+func TestReadSymlinkTargetIgnoresAReplacementBlob(t *testing.T) {
 	ctx := context.Background()
 	big := strings.Repeat("t", 8<<20)
 	dir, commit := fiRepo(t, []fiFile{{"120000", "link", "a.txt"}, {"100644", "big", big}})
@@ -172,23 +170,15 @@ func TestReadSymlinkTargetBoundsAReplacementBlob(t *testing.T) {
 		t.Fatalf("link is listed as %d bytes, want 5", sha["link"].Size)
 	}
 	gitIn(t, dir, "", "replace", sha["link"].SHA, sha["big"].SHA) // after the listing
-
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	_, err = ReadSymlinkTarget(ctx, dir, sha["link"].SHA, sha["link"].Size)
-	runtime.ReadMemStats(&after)
-	if !errors.Is(err, ErrSymlinkTooLong) {
-		t.Fatalf("a replacement of 8 MiB: err = %v, want ErrSymlinkTooLong", err)
-	}
-	if n := after.TotalAlloc - before.TotalAlloc; n > 1<<20 {
-		t.Fatalf("the read allocated %d KiB for a replacement of 8 MiB, want under 1 MiB", n>>10)
+	target, err := ReadSymlinkTarget(ctx, dir, sha["link"].SHA, sha["link"].Size)
+	if err != nil || target != "a.txt" {
+		t.Fatalf("ReadSymlinkTarget with a replacement of 8 MiB = %q, %v, want a.txt", target, err)
 	}
 	assertNoChildren(t)
 }
 
 // The read ends git once it has more than the limit: a git that prints without
-// end (what a huge replacement blob looks like to the reader) fails the read
+// end (what a huge blob looks like to the reader) fails the read
 // at once, and no git is left running.
 func TestReadSymlinkTargetEndsGitAtTheLimit(t *testing.T) {
 	dir, commit := fiRepo(t, []fiFile{{"120000", "link", "a.txt"}})

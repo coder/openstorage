@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,9 @@ type Server struct {
 	// (issue #59, verifystate.go); <= 0 disables the budget. Set by the
 	// serve wiring.
 	VerifySigBudget int
+	// keyFailures rate-limits the log lines of key failures (see
+	// verifyFailure).
+	keyFailures KeyFailureLog
 	// usage memoizes per-repo pack usage for the quota-pressure log so
 	// replayed cheap POSTs cannot amplify into per-request blob listings.
 	usage usageCache
@@ -439,13 +443,32 @@ func (s *Server) releaseLFSStaging(repo string, n int64) {
 }
 
 // repoTarget is a resolved request target: the live repo record plus the
-// canonical storage key — RepoID with the URL element's namespace suffix
-// (`+ephemeral`/`+import`) reattached. The key is the ONLY value handed to
-// hydrate, the pack/ref stores, and the update hook env; the raw path
-// element must never key storage (ADR-21).
+// canonical storage key — RepoID, with a `+ephemeral` suffix reattached for
+// the ephemeral remote. The `+import` remote keys the base RepoID: an import
+// push writes normal branches (code.storage docs/repos/imports), and
+// viaImport marks it for the read refusal and the hook. The key is the ONLY
+// value handed to hydrate, the pack/ref stores, and the update hook env; the
+// raw path element must never key storage (ADR-21).
 type repoTarget struct {
-	repo meta.Repo
-	key  string
+	repo      meta.Repo
+	key       string
+	viaImport bool
+}
+
+// importSuffix is the URL suffix of the push-only import remote.
+const importSuffix = "+import"
+
+// importReadRefusal is upstream's text for a clone or fetch through the
+// import remote (code.storage docs/repos/imports, "Caveats").
+const importReadRefusal = "reads are disabled for +import remotes; use the repository remote for clone/fetch"
+
+// refuseImportRead answers a clone or fetch through the import remote with
+// 403 text/plain: git prints a text/plain body as "remote:" lines, while it
+// hides a JSON one.
+func refuseImportRead(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = io.WriteString(w, importReadRefusal+"\n")
 }
 
 // resolveTarget canonicalizes a validated path element to its repoTarget.
@@ -462,6 +485,9 @@ func (s *Server) resolveTarget(ctx context.Context, pathElem string) (repoTarget
 	}
 	assertf(repo.RepoID != "", "resolveTarget: resolver returned empty RepoID for %q", base)
 	suffix := strings.TrimPrefix(pathElem, base) // "" | "+ephemeral" | "+import"
+	if suffix == importSuffix {
+		return repoTarget{repo: repo, key: repo.RepoID, viaImport: true}, true
+	}
 	return repoTarget{repo: repo, key: repo.RepoID + suffix}, true
 }
 
@@ -544,7 +570,7 @@ func (s *Server) verifyClaims(ctx context.Context, token, repo, scope string) (*
 	assertf(s.Verifier != nil && s.Org != "", "Server used without Verifier/Org")
 	claims, err := s.Verifier.Verify(ctx, token)
 	if err != nil {
-		return nil, http.StatusUnauthorized, err
+		return nil, http.StatusUnauthorized, s.verifyFailure(ctx, err)
 	}
 	// A signature valid for some *other* registered org must not grant
 	// access to this org's repos.
@@ -632,6 +658,46 @@ func hydrateFailed(w http.ResponseWriter, repo string, err error) {
 
 func pktLine(s string) string { return fmt.Sprintf("%04x%s", len(s)+4, s) }
 
+// persistentHiddenRefs is the ref prefix that the persistent remote hides
+// (docs/explanation/git-protocol-and-namespaces.md: persistent remotes must
+// not see ephemeral refs). The API stores its ephemeral branches under the
+// base repository as refs/namespaces/ephemeral/... (auth.EphemeralRefName).
+const persistentHiddenRefs = "refs/namespaces/"
+
+// persistentKey reports whether storage key repo is a persistent remote:
+// the base repository's own key. An import push uses that key too
+// (resolveTarget), so these rules cover it.
+func persistentKey(repo string) bool { return BaseRepo(repo) == repo }
+
+// serviceCmd builds the upload-pack or receive-pack child of every git
+// smart-HTTP request. On the persistent remote, transfer.hideRefs leaves
+// persistentHiddenRefs out of both advertisements, and receive-pack refuses
+// each update or delete of such a ref with its own ng ("deny updating a
+// hidden ref"). The settings change no other git command: hydration, REST
+// reads and LFS reachability read those refs directly.
+//
+// upload-pack also serves no want of a hidden ref's commit, whatever the
+// repository, global or system git config says: with the tip and reachable
+// bits off, git also ignores uploadpack.allowAnySHA1InWant. (HEAD never
+// points at a hidden ref of a persistent key: see hydrateRefs.)
+func serviceCmd(ctx context.Context, target repoTarget, service string, args ...string) *exec.Cmd {
+	assertf(service == "upload-pack" || service == "receive-pack", "serviceCmd: unknown service %q", service)
+	var gitArgs []string
+	if persistentKey(target.key) {
+		gitArgs = []string{
+			"-c", "transfer.hideRefs=" + persistentHiddenRefs,
+			"-c", "uploadpack.allowTipSHA1InWant=false",
+			"-c", "uploadpack.allowReachableSHA1InWant=false",
+		}
+	}
+	gitArgs = append(gitArgs, service, "--stateless-rpc")
+	cmd := exec.CommandContext(ctx, "git", append(gitArgs, args...)...)
+	// The server speaks protocol v0 only: v2's fetch serves any want, so a
+	// GIT_PROTOCOL in serve's own environment would undo the want settings.
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_PROTOCOL=") })
+	return cmd
+}
+
 func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo string) {
 	svcParam := r.URL.Query().Get("service")
 	if svcParam != "git-upload-pack" && svcParam != "git-receive-pack" {
@@ -656,6 +722,10 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 		httpError(w, http.StatusNotFound, "repository not found")
 		return
 	}
+	if service == "upload-pack" && target.viaImport {
+		refuseImportRead(w)
+		return
+	}
 	repoPath, err := s.hydrate(r.Context(), target.key, service, target.repo.DefaultBranch, claims)
 	if err != nil {
 		hydrateFailed(w, target.key, err)
@@ -666,7 +736,7 @@ func (s *Server) handleInfoRefs(w http.ResponseWriter, r *http.Request, repo str
 	if _, err := io.WriteString(w, pktLine("# service="+svcParam+"\n")+"0000"); err != nil {
 		return
 	}
-	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", "--advertise-refs", repoPath)
+	cmd := serviceCmd(r.Context(), target, service, "--advertise-refs", repoPath)
 	cmd.Stdout = w
 	cmd.Stderr = os.Stderr
 	if err := gitlimit.RunIn(r.Context(), repoPath, cmd); err != nil {
@@ -697,6 +767,10 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 	target, ok := s.resolveTarget(r.Context(), repo)
 	if !ok {
 		httpError(w, http.StatusNotFound, "repository not found")
+		return
+	}
+	if service == "upload-pack" && target.viaImport {
+		refuseImportRead(w)
 		return
 	}
 	// Decoded-byte ingress cap (issue #55, pushcap.go): bound the bytes a
@@ -877,12 +951,14 @@ func (s *Server) handleServiceRPC(w http.ResponseWriter, r *http.Request, repo, 
 		return
 	}
 
-	cmd := exec.CommandContext(r.Context(), "git", service, "--stateless-rpc", repoPath)
-	cmd.Env = os.Environ()
+	cmd := serviceCmd(r.Context(), target, service, repoPath)
 	// No-op for upload-pack; receive-pack assigns the real hold release.
 	releasePushHold := func() {}
 	if service == "receive-pack" {
 		cmd.Env = pushHookEnv(cmd.Env, target.key, s.Org)
+		if target.viaImport {
+			cmd.Env = envconfig.Set(cmd.Env, EnvImportPush, "1")
+		}
 		// Loopback sync pushes carry the run's claim-holder token
 		// (verified JWT claim, issue #86); the update hook fences the ref
 		// CAS on it. Stripped above so operator env can never poison it.

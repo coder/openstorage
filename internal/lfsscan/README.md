@@ -14,7 +14,7 @@ Lenient Git LFS pointer decoder plus a bounded walk that runs three `git` subpro
 - `ParseLFSPointer` rejects data over `LFSPointerMaxSize` or containing NUL, needs a known version line and an `oid sha256:` line in any order, and needs a 64-char lowercase hex OID; it never panics on arbitrary input [pointer.go:ParseLFSPointer]
 - Each object charges 1 + size/4096 units; exceeding the budget returns `ErrLFSScanBudget` [scan.go:ReachableLFSOIDs]
 - An invalid rev-list OID, a `missing` batch-check line, a malformed size or header, or a failed subprocess fails the walk with no OID set [scan.go:ReachableLFSOIDs]
-- Every git call uses `--no-replace-objects`, and rev-list runs unfiltered so every object is charged [scan.go:ReachableLFSOIDs]
+- Every git call runs with `GIT_NO_REPLACE_OBJECTS=1` (`gitlimit.NoReplaceObjects`), and rev-list runs unfiltered so every object is charged [scan.go:ReachableLFSOIDs]
 
 ## Side Effects
 - Runs `git rev-list --objects --no-object-names --all`, `git cat-file --batch-check`, and `git cat-file --batch` in repoPath, each holding the repository's `gitlimit` lease until it exits [scan.go:ReachableLFSOIDs] [lease_test.go:TestReachableLFSOIDsLeaseFollowsEveryStage]

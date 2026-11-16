@@ -17,7 +17,9 @@ no `repo` claim) and return the plain `{"error"}` envelope on failure.
 | `DELETE /api/v1/webhooks/{id}` | → 204; 404 |
 
 The signing secret is returned exactly once, from `POST`; the server generates one when
-the body omits it. `GET` never echoes secrets.
+the body omits it. `GET` never echoes secrets. A `secret` that holds a NUL byte → 400
+(`invalid secret (want UTF-8 text without NUL)`), and nothing is stored. A `DELETE` `{id}`
+that holds a NUL byte or invalid UTF-8 names no webhook → 404, as an unknown `id` does.
 
 ## Delivery headers
 

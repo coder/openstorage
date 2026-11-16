@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -176,6 +177,16 @@ func TestLeaseEndsWithTheChildAndTheFileStays(t *testing.T) {
 	}
 	if fi.Mode().Perm() != 0o600 {
 		t.Fatalf("lease file mode %v, want 0600", fi.Mode().Perm())
+	}
+}
+
+// CombinedOutputIn returns only the last 64 KiB of the output, with
+// stdout and stderr in the order the child wrote them.
+func TestCombinedOutputInKeepsTheLast64KiB(t *testing.T) {
+	repo := t.TempDir()
+	out, err := CombinedOutputIn(t.Context(), repo, exec.Command("sh", "-c", "head -c 1048576 /dev/zero | tr '\\0' x; echo; echo the end >&2"))
+	if err != nil || len(out) != 64<<10 || !strings.HasSuffix(string(out), "x\nthe end\n") {
+		t.Fatalf("CombinedOutputIn = %d bytes ending %q, %v; want the last %d bytes", len(out), out[max(len(out)-12, 0):], err, 64<<10)
 	}
 }
 

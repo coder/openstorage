@@ -3,7 +3,6 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -110,8 +109,8 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createWebhookRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, &req); err != nil {
+		writeInvalidBody(w, err)
 		return
 	}
 	if !validWebhookURL(req.URL) {
@@ -134,6 +133,9 @@ func (h *webhooksAPI) handleCreate(w http.ResponseWriter, r *http.Request) {
 		// A whitespace-only secret is always a caller bug: it would sign
 		// deliveries with a key nobody can plausibly have intended.
 		writeErr(w, http.StatusBadRequest, "invalid secret: must not be blank")
+		return
+	} else if !meta.ValidText(secret) {
+		writeErr(w, http.StatusBadRequest, invalidTextMsg("secret"))
 		return
 	}
 

@@ -6,6 +6,7 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/coder/openstorage/internal/githttp"
+	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -162,11 +164,31 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		Status:        status,
 		Code:          code,
 		Detail:        msg,
-		Instance:      problemInstance(w),
+		Instance:      boundInstance(problemInstance(w)),
 		InvalidParams: params,
 		Guard:         guard,
 		CurrentSHA:    currentSHA,
 	}
+}
+
+// maxInstanceBytes bounds `instance`, the escaped request path that an error
+// answer repeats. No route validates the length of a path, and a path of
+// `&` bytes (six bytes each in JSON) of the 1 MiB header limit answers with 6 MB.
+const maxInstanceBytes = 16384
+
+// boundInstance cuts an `instance` to maxInstanceBytes. EscapedPath
+// percent-encodes every byte that is not ASCII, so the cut cannot split a
+// character. It backs off from a partial `%XX` escape and adds no ellipsis, so
+// the value stays a URI reference.
+func boundInstance(s string) string {
+	if len(s) <= maxInstanceBytes {
+		return s
+	}
+	cut := maxInstanceBytes
+	if i := strings.LastIndexByte(s[cut-2:cut], '%'); i >= 0 {
+		cut += i - 2
+	}
+	return s[:cut]
 }
 
 var textUnmarshalerType = reflect.TypeFor[encoding.TextUnmarshaler]()
@@ -216,6 +238,76 @@ func requiredFields(msg string, fields ...[2]string) error {
 		return nil
 	}
 	return newFieldErrors(msg, params...)
+}
+
+// invalidTextMsg is the 400 message for request text that is not
+// meta.ValidText: a NUL byte, or bytes that are not UTF-8. PostgreSQL
+// refuses such text in a text value (SQLSTATE 22021) and a NUL in jsonb
+// (22P05), so no backend stores it.
+func invalidTextMsg(name string) string {
+	return "invalid " + name + " (want UTF-8 text without NUL)"
+}
+
+// invalidTextFields returns a fieldError for the first field (dotted wire
+// path -> value) whose value is not meta.ValidText, or nil when all are.
+// A JSON body decodes to valid UTF-8, so for its fields this finds a NUL.
+func invalidTextFields(fields ...[2]string) error {
+	for _, f := range fields {
+		if !meta.ValidText(f[1]) {
+			return newFieldError(f[0], "must be UTF-8 text without NUL", invalidTextMsg(f[0]))
+		}
+	}
+	return nil
+}
+
+// invalidTextEach returns a fieldError for each field (dotted wire path ->
+// value) whose value is not meta.ValidText, in the order given.
+func invalidTextEach(fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := invalidTextFields(f); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
+}
+
+// tooLongMsg is the 400 message for a request value longer than max bytes.
+// git would take the value as one argument or one environment entry, which
+// must fit gitlimit.MaxArgBytes with what the server puts around it.
+func tooLongMsg(name string, max int) string {
+	return fmt.Sprintf("invalid %s (want at most %d bytes)", name, max)
+}
+
+// tooLongField returns a fieldError when value, the request field name (a
+// dotted wire path), is longer than max bytes (tooLongMsg), or nil.
+func tooLongField(name, value string, max int) error {
+	if len(value) <= max {
+		return nil
+	}
+	return newFieldError(name, fmt.Sprintf("must be at most %d bytes", max), tooLongMsg(name, max))
+}
+
+// tooLongEach returns tooLongField's problem of each field (dotted wire
+// path -> value), in the order given.
+func tooLongEach(max int, fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := tooLongField(f[0], f[1], max); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
+}
+
+// writeInvalidText writes the 400 for the first field that is not
+// meta.ValidText and reports whether it did.
+func writeInvalidText(w http.ResponseWriter, fields ...[2]string) bool {
+	err := invalidTextFields(fields...)
+	if err != nil {
+		writeInvalid(w, err.Error(), err)
+	}
+	return err != nil
 }
 
 // writeInvalidField writes the 400 for one invalid request-body field.

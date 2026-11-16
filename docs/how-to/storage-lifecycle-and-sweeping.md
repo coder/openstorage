@@ -57,13 +57,13 @@ These do **not** reclaim space:
 List a repository's blobs under `packs/` straight from the blob store:
 
 ```sh
-openstorage list-packs --repo repo_01k5abc...   # takes the server-generated RepoID
+openstorage list-packs --repo repo_761aac427fd3   # takes the server-generated RepoID
 ```
 
 - `--repo` takes the **RepoID** (`repo_...`, returned by repo creation and
   `GET /api/v1/repo`), not the repository name.
 - Namespace pushes store under sibling prefixes. List them with a suffix:
-  `--repo repo_01k5abc...+ephemeral`.
+  `--repo repo_761aac427fd3+ephemeral`.
 - A quota denial's `stored` bytes cover the base **and** all namespace prefixes.
 - The command reads `OPENSTORAGE_S3_URL`/`OPENSTORAGE_PG_URL` (or `--data-dir` in local
   mode) from the environment. See the [CLI reference](../reference/cli.md#openstorage-list-packs).
@@ -167,8 +167,11 @@ Tuning:
 Every repository has a storage-bytes quota
 ([`OPENSTORAGE_PACK_QUOTA_BYTES`](../reference/configuration.md#openstorage_pack_quota_bytes),
 default 10 GiB, `0` disables). It covers packs **and LFS objects**. A repository and its
-`+ephemeral` / `+import` namespaces share one quota, charged to the base repository; the
-namespaces also share its LFS object space.
+`+ephemeral` namespace share one quota, charged to the base repository; the
+namespace also shares its LFS object space. An `+import` push writes the repository's own
+refs. Packs that an `+import` push stored under the old `<repo_id>+import` key, in 0.20.0
+and earlier, keep counting against the quota until the repository is deleted
+([upgrade note](../explanation/git-protocol-and-namespaces.md#upgrading-from-0200-or-earlier)).
 
 ### What a denial looks like
 

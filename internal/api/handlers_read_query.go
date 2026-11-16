@@ -11,7 +11,6 @@ package api
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -74,11 +74,18 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 // Boolean query params are parsed via coreBoolParam (handlers_read_core.go)
 // — one literal "true"/"false" dialect for the whole read surface.
 
-// cleanPathParams validates repeatable `path` filters: no empties, no NULs.
+// cleanPathParams validates repeatable `path` filters: no empties, no
+// NULs, none over maxGitPathBytes, none outside the repository.
 func cleanPathParams(paths []string) ([]string, error) {
 	for _, p := range paths {
 		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
 			return nil, fmt.Errorf("invalid path filter %q", p)
+		}
+		if len(p) > maxGitPathBytes {
+			return nil, errors.New(tooLongMsg("path", maxGitPathBytes))
+		}
+		if pathLeavesRepo(p) {
+			return nil, fmt.Errorf("path filter %q is outside the repository", p)
 		}
 	}
 	return paths, nil
@@ -246,9 +253,10 @@ type commitDiffResponse struct {
 }
 
 // handleDiff implements GET /api/v1/repos/diff: `ref` and `base_ref` accept
-// any revision (deprecated camelCase aliases `sha`/`baseSha` — the
-// endpoint's historical quirk; note `base_sha` was never a param and stays
-// an ignored unknown, though the response now carries a `base_sha` field).
+// what gitread.ResolveRef resolves, no revision expressions (deprecated
+// camelCase aliases `sha`/`baseSha` — the endpoint's historical quirk;
+// note `base_sha` was never a param and stays an ignored unknown, though
+// the response now carries a `base_sha` field).
 // `ref_is_ephemeral`/`base_is_ephemeral` resolve either side in the
 // ephemeral namespace. Explicit base_ref selects a three-dot comparison:
 // the diff runs from merge-base(base_ref, ref) to ref with merge_base_sha
@@ -472,13 +480,7 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	if strings.ContainsRune(path, 0) {
-		// exec refuses a NUL in an argument, and no path holds one.
-		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
-		return
-	}
-	if pathLeavesRepo(path) {
-		writeErr(w, http.StatusBadRequest, "path is outside the repository")
+	if !readPathOK(w, path) {
 		return
 	}
 	ephemeral, err := coreBoolParam(q, "ephemeral")
@@ -499,6 +501,11 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 	for _, spec := range ranges {
 		if strings.TrimSpace(spec) == "" || strings.ContainsRune(spec, 0) {
 			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid range %q", spec))
+			return
+		}
+		// git gets each range as an argument of its own.
+		if len(spec) > gitlimit.MaxArgBytes {
+			writeErr(w, http.StatusBadRequest, tooLongMsg("range", gitlimit.MaxArgBytes))
 			return
 		}
 	}
@@ -691,6 +698,33 @@ type grepPosition struct {
 	line grepLineEntry
 }
 
+// grepPathProblems adds the problem of each entry of the `paths` of a grep
+// body that is not a path inside the repository: one problem for each
+// entry, named paths.N. A body of bad entries costs one answer of bounded
+// size: once the collector is full, an entry is counted and builds no
+// problem.
+func grepPathProblems(errs *bodyErrors, paths []string) {
+	for i, p := range paths {
+		blank := strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0)
+		long := !blank && len(p) > maxGitPathBytes
+		// git gets the entry without its trailing slash: "/" alone is
+		// no pathspec.
+		trimmed := strings.TrimSuffix(p, "/")
+		outside := !blank && !long && trimmed != "" && pathLeavesRepo(trimmed)
+		switch {
+		case !blank && !long && !outside:
+		case errs.full():
+			errs.skip()
+		case blank:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
+		case long:
+			errs.add(tooLongField("paths."+strconv.Itoa(i), p, maxGitPathBytes))
+		default:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p)))
+		}
+	}
+}
+
 // handleGrep implements POST /api/v1/repos/grep: synchronous git grep at
 // the resolved ref (docs/explanation/domain-model.md allows strictly-fresher-than-index synchronous
 // results). Limits truncate the collected result (incomplete_results);
@@ -703,19 +737,30 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body grepRequestBody
-	if err := json.Unmarshal(raw, &body); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(raw, &body); err != nil {
+		writeInvalidBody(w, err)
 		return
 	}
+	// Every invalid body field is named, in the order of the docs table
+	// (bodyErrors).
+	var errs bodyErrors
 	pattern := body.Query.Pattern
 	if strings.TrimSpace(pattern) == "" {
-		writeInvalidField(w, "query.pattern", "is required", "query.pattern is required")
-		return
+		errs.add(newFieldError("query.pattern", "is required", "query.pattern is required"))
+	} else {
+		// git takes the pattern as an argument of its own, which cannot hold
+		// a NUL and must fit gitlimit.MaxArgBytes.
+		if err := invalidTextFields([2]string{"query.pattern", pattern}); err != nil {
+			errs.add(err)
+		} else {
+			errs.add(tooLongField("query.pattern", pattern, gitlimit.MaxArgBytes))
+		}
 	}
 	caseSensitive := true
 	if body.Query.CaseSensitive != nil {
 		caseSensitive = *body.Query.CaseSensitive
 	}
+	grepPathProblems(&errs, body.Paths)
 	before, after := 0, 0
 	if body.Context.Before != nil {
 		before = *body.Context.Before
@@ -731,39 +776,51 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		if after < 0 {
 			params = append(params, invalidParam{Name: "context.after", Reason: "must be at least 0"})
 		}
-		writeInvalid(w, "context lines must be non-negative", newFieldErrors("context lines must be non-negative", params...))
-		return
+		errs.add(newFieldErrors("context lines must be non-negative", params...))
 	}
 	maxLines := grepDefaultMaxLines
 	if body.Limits.MaxLines != nil {
 		maxLines = *body.Limits.MaxLines
 		if maxLines < 1 || maxLines > grepMaxLinesCap {
-			writeInvalidField(w, "limits.max_lines", fmt.Sprintf("must be between 1 and %d", grepMaxLinesCap),
-				fmt.Sprintf("invalid limits.max_lines (want 1..%d)", grepMaxLinesCap))
-			return
+			errs.add(newFieldError("limits.max_lines", fmt.Sprintf("must be between 1 and %d", grepMaxLinesCap),
+				fmt.Sprintf("invalid limits.max_lines (want 1..%d)", grepMaxLinesCap)))
 		}
 	}
 	maxPerFile := grepDefaultMatchesPer
 	if body.Limits.MaxMatchesPerFile != nil {
 		maxPerFile = *body.Limits.MaxMatchesPerFile
 		if maxPerFile < 1 {
-			writeInvalidField(w, "limits.max_matches_per_file", "must be at least 1", "invalid limits.max_matches_per_file (want >= 1)")
-			return
+			errs.add(newFieldError("limits.max_matches_per_file", "must be at least 1", "invalid limits.max_matches_per_file (want >= 1)"))
+		}
+	}
+	// A cursor that does not decode is a problem of the body, but the
+	// route has always answered it after the repository lookup, so a
+	// missing repository is a 404 first. It is named here only together
+	// with other invalid fields; alone it keeps its place below.
+	var commit, cursorPath string
+	var cursorLine int
+	var cursorErr error
+	if body.Pagination.Cursor != "" {
+		var decodeErr error
+		if commit, cursorPath, cursorLine, decodeErr = decodeGrepCursor(body.Pagination.Cursor); decodeErr != nil {
+			cursorErr = newFieldError("pagination.cursor", "is not a valid cursor", decodeErr.Error())
 		}
 	}
 	pageLimit := grepDefaultPageLimit
+	var limitErr error
 	if body.Pagination.Limit != nil {
 		pageLimit = *body.Pagination.Limit
 		if pageLimit < 1 {
-			writeInvalidField(w, "pagination.limit", "must be at least 1", "invalid pagination.limit (want >= 1)")
-			return
+			limitErr = newFieldError("pagination.limit", "must be at least 1", "invalid pagination.limit (want >= 1)")
 		}
 	}
-	for i, p := range body.Paths {
-		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
-			writeInvalidField(w, "paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p))
-			return
-		}
+	if cursorErr != nil && (limitErr != nil || errs.err() != nil) {
+		errs.add(cursorErr)
+	}
+	errs.add(limitErr)
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
+		return
 	}
 	// Narrow the git-side search to the requested path prefixes (openapi:
 	// "path prefixes used to narrow the search before pattern matching").
@@ -789,13 +846,9 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		refName = repo.DefaultBranch
 	}
 
-	var commit string
-	var cursorPath string
-	var cursorLine int
 	if body.Pagination.Cursor != "" {
-		commit, cursorPath, cursorLine, err = decodeGrepCursor(body.Pagination.Cursor)
-		if err != nil {
-			writeInvalidField(w, "pagination.cursor", "is not a valid cursor", err.Error())
+		if cursorErr != nil {
+			writeInvalid(w, cursorErr.Error(), cursorErr)
 			return
 		}
 		// The cursor's anchor commit must still exist in this repo. Only a
@@ -933,6 +986,22 @@ func archiveFilenamePart(s string) string {
 	return b.String()
 }
 
+// archiveGlobProblems adds the problem of each blank entry of a glob list of
+// an archive body, named name.N. Like grepPathProblems, it builds no
+// problem once the collector is full.
+func archiveGlobProblems(errs *bodyErrors, name string, globs []string) {
+	for i, glob := range globs {
+		if strings.TrimSpace(glob) != "" && !strings.ContainsRune(glob, 0) {
+			continue
+		}
+		if errs.full() {
+			errs.skip()
+			continue
+		}
+		errs.add(newFieldError(name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob)))
+	}
+}
+
 // handleArchive implements POST /api/v1/repos/archive: a gz-compressed
 // tarball of the tree at `ref` (default branch when omitted), shaped by
 // include/exclude globs, max_blob_size, and an optional entry-name prefix.
@@ -945,35 +1014,31 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	var body archiveRequestBody
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &body); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		if err := unmarshalBody(raw, &body); err != nil {
+			writeInvalidBody(w, err)
 			return
 		}
 	}
+	// Every invalid body field is named, in the order of the docs table
+	// (bodyErrors).
+	var errs bodyErrors
+	archiveGlobProblems(&errs, "include_globs", body.IncludeGlobs)
+	archiveGlobProblems(&errs, "exclude_globs", body.ExcludeGlobs)
 	maxBlobSize := int64(0)
 	if body.MaxBlobSize != nil {
 		maxBlobSize = *body.MaxBlobSize
 		if maxBlobSize < 0 {
-			writeInvalidField(w, "max_blob_size", "must be at least 0", "invalid max_blob_size (want >= 0)")
-			return
-		}
-	}
-	for _, list := range []struct {
-		name  string
-		globs []string
-	}{{"include_globs", body.IncludeGlobs}, {"exclude_globs", body.ExcludeGlobs}} {
-		for i, glob := range list.globs {
-			if strings.TrimSpace(glob) == "" || strings.ContainsRune(glob, 0) {
-				writeInvalidField(w, list.name+"."+strconv.Itoa(i), "must be a non-empty glob", fmt.Sprintf("invalid glob %q", glob))
-				return
-			}
+			errs.add(newFieldError("max_blob_size", "must be at least 0", "invalid max_blob_size (want >= 0)"))
 		}
 	}
 	// Reject prefixes that could make extracted entries escape the
 	// destination root (tar slip): absolute paths, "."/".." segments,
 	// NUL bytes, backslashes.
 	if !gitread.ValidArchivePrefix(body.Archive.Prefix) {
-		writeInvalidField(w, "archive.prefix", "must be a relative path inside the archive", fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix))
+		errs.add(newFieldError("archive.prefix", "must be a relative path inside the archive", fmt.Sprintf("invalid archive.prefix %q", body.Archive.Prefix)))
+	}
+	if err := errs.err(); err != nil {
+		writeInvalid(w, err.Error(), err)
 		return
 	}
 	// The prefix is a folder name (openapi example "sdk-docs/"); normalize

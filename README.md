@@ -25,7 +25,7 @@ of replicas on Postgres and S3. The code.storage SDKs work against it, with
 
 ## Install
 
-Install a release binary with mise, or build from source with Go 1.27.3 or newer:
+Install a release binary with mise, or build from source with Go 1.27.4 or newer:
 
 ```sh
 # Install a release binary:
@@ -129,8 +129,8 @@ Two stateless replicas (`node-a`, `node-b`), built from the repo `Dockerfile`, s
 Postgres and SeaweedFS. A push through one node is visible through the other.
 
 > [!WARNING]
-> This is a development stack: default credentials, published backing-service ports,
-> and plain HTTP. For real deployments, follow the [production guide](docs/how-to/deploy-production.md).
+> This is a development stack: default credentials, published backing-service ports
+> (on `127.0.0.1` only), and plain HTTP. For real deployments, follow the [production guide](docs/how-to/deploy-production.md).
 
 ```sh
 # 1. Generate keys on the host from this checkout (requires openstorage; see Install).
@@ -179,7 +179,7 @@ the packs.
 
 ```sh
 # 1. Start an S3-compatible service for this example (SeaweedFS).
-docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.51@sha256:f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8 server -s3 -dir=/data -ip.bind=0.0.0.0
+docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0 server -s3 -dir=/data -ip.bind=0.0.0.0
 until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
 # The bucket must exist before serve boots. On a cold store both bucket creation and
 # object writes can precede a writable volume, so retry create + a real write as one unit

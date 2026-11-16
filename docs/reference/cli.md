@@ -3,19 +3,21 @@
 The `openstorage` binary contains the server and its operational helpers:
 
 ```
-openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|s3wal-meta|version> [flags]
+openstorage <serve|hook|keygen|mint|signing-key|list-packs|purge-repo|repair-refs|s3wal-meta|version> [flags]
 ```
 
 Sources: [`cmd/openstorage/main.go`](../../cmd/openstorage/main.go) and
 [`cmd/openstorage/signingkey.go`](../../cmd/openstorage/signingkey.go). Environment
 variables: [configuration reference](configuration.md).
 
-**Storage resolution** (`serve`, `signing-key`, `list-packs`, `purge-repo`): explicit env
-URLs win, then `--data-dir` / `$OPENSTORAGE_DATA_DIR` (local mode) fills missing slots.
-Every backend scheme works, including the experimental
+**Storage resolution** (`serve`, `signing-key`, `list-packs`, `purge-repo`, `repair-refs`):
+explicit env URLs win, then `--data-dir` / `$OPENSTORAGE_DATA_DIR` (local mode) fills
+missing slots. Every backend scheme works, including the experimental
 [`s3wal://`](configuration.md#openstorage_pg_url) zero-infra pair. `signing-key` and
-`purge-repo` open its metadata/ref stores from the database URL; `list-packs` reads blobs
-through the `s3://` URL and never opens the database URL.
+`purge-repo` open its metadata/ref stores from the database URL, and `repair-refs` opens
+both stores from it, the metadata store only to read the repository row, and the blob
+store from the `s3://` URL (or `--data-dir`) when the repository has a branch; `list-packs`
+reads blobs through the `s3://` URL and never opens the database URL.
 
 ## `openstorage serve`
 
@@ -246,6 +248,112 @@ runs.
 Re-running on an already-purged repository rescans its blob prefixes for stragglers (bytes
 an in-flight pre-delete push published after the first pass) and reaps them through the
 same quarantine handshake.
+
+## `openstorage repair-refs`
+
+Removes the refs of one repository that stop its hydration. Every hydration of a
+repository that holds such a ref fails, and git reads of it answer `500`. Two kinds of ref
+do that:
+
+- **A ref that git can never lock.** git creates `<ref>.lock` before it writes a ref, so a
+  name with a part over 255 bytes, or a last part over 250 bytes, cannot be written into a
+  cache repository. Before the API limited ref names ([Branches](http-api.md#branches)), a
+  token with `git:write` could create a notes ref with a 251 to 255 byte last part. No API
+  route, push or sync can delete a notes ref, so an operator removes it here.
+- **A branch whose tip is not a commit.** git refuses to write a blob, a tree or an
+  annotated tag under `refs/heads/`. Before the update hook refused such a push
+  ([git protocol](../explanation/git-protocol-and-namespaces.md)), a token with
+  `git:write` could push a branch at one of them, and the ref store took the value.
+
+The runbook, with the log lines to look for, is
+[Refs that git can never lock](../how-to/deploy-production.md#refs-that-git-can-never-lock).
+
+```
+openstorage repair-refs [flags] <repo-id>
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `<repo-id>` | required | The server-generated repository ID (`repo_...`), the key of the repository in the ref store |
+| `--yes` | `false` | Delete the listed refs. Without it the command only lists them and changes nothing |
+| `--data-dir` | `$OPENSTORAGE_DATA_DIR` | Local mode: derives the database and blob locations when no env URL is set |
+
+The command reads every ref of the repository and picks the ones that git can never lock.
+It leaves out the limit on the length of the whole lock path, which depends on where a
+node keeps its cache directory. It never touches a ref that git can lock and that holds
+a commit or lives outside `refs/heads/`: a tag at a blob is healthy.
+
+For each branch (a ref under `refs/heads/`), the command also reads the object type of
+the tip. It reads the type from the repository's packs in the blob store, and never from
+git's error text. The first read downloads the registered packs into a temporary
+directory under `$TMPDIR`, so `$TMPDIR` needs room for them. The command removes the
+directory as soon as it has read the tips, before it prints the list, and also after an
+error, SIGINT, SIGTERM or SIGHUP. A run that `nohup` started ignores SIGHUP. After SIGKILL
+or SIGQUIT, delete the `openstorage-repair-refs-*` directory under `$TMPDIR` by hand. A
+repository with no branch needs no blob store. A branch is on the list when its tip is a
+blob, a tree or an annotated tag, even a tag of a commit: git refuses all three. The
+objects and packs stay, and a later push can use them. The command reads the packs once,
+as of the start of the run: a push that lands during the run adds objects that the run does
+not see.
+
+```sh
+openstorage repair-refs --data-dir ~/cs-data repo_761aac427fd3        # list
+openstorage repair-refs --data-dir ~/cs-data --yes repo_761aac427fd3  # delete
+```
+
+The list for a repository with two branches at a blob and at an annotated tag:
+
+```text
+repo:    repo_761aac427fd3
+url:     https://example.com/acme/app.git
+scanned: 5 refs
+branches whose tip is not a commit (2):
+  45b983be36b73c0788dc9cbcb76cbb80fc7bb057 refs/heads/notes  (a blob)
+  9d3f0b6b7d1d0f6f8b3a8ac3a8e0d3f0d4a8ab1e refs/heads/v1  (an annotated tag)
+nothing changed: run the command again with --yes to delete these refs
+```
+
+The command first reads the repository row. An ID with no repository is an error. The
+list prints `repo:`, `url:` and `scanned: <n> refs`. Then, when refs match, it prints
+`refs that git can never lock (<n>):` with one `<sha> <ref>` line for each match, and
+`branches whose tip is not a commit (<n>):` with one `<sha> <ref>  (<type>)` line for each
+match, where the type is `a blob`, `a tree` or `an annotated tag`. A lockable branch whose
+tip object the packs do not hold has its own list, described below. The output ends with
+`nothing changed`, and when only such branches are listed, that line says that the command
+deletes no branch whose tip object is missing. When no ref and no branch matches at all, it
+prints `no ref that git can never lock and no branch whose tip is not a commit`.
+A scan of 0 refs prints `this repository has no refs` instead: it is empty, it was
+purged, or its last refs were just deleted. A database URL or `--data-dir` that is not the
+one `serve` uses is an error (`not found`, or an error that names the missing `repos`
+table). A wrong local `--data-dir`
+can also leave an empty database file there, so check the path.
+
+With `--yes`, the command swaps each ref's listed SHA for the zero SHA, one compare-and-swap
+for each ref, and prints `deleted: <ref>`. When a ref no longer holds the listed SHA, it
+prints `lost CAS, not deleted`, keeps that ref, does not retry, and exits with an error
+after the other refs. Run the command again to list what is left. Put the flags before
+`<repo-id>`: a flag after it is an error.
+
+A branch whose tip object the packs do not hold is never deleted, unless git can never
+lock its name: the name rule comes first, and it needs no object. The list shows a kept
+branch under `branches whose tip object is missing (<n>), never deleted:`, and with `--yes`
+the command deletes the other refs and then exits with an error. Git cannot write a kept
+branch either, so the repository stays wedged. The object can be in a pack that the registry lost or that
+a repack replaced: check the packs with [`openstorage list-packs`](#openstorage-list-packs)
+before you do anything else. A blob URL that the command cannot open, a type that it does
+not know, and a read that fails are errors, and the command deletes nothing on any of them.
+
+The command keeps a ref that is the repository's default branch, as
+`DELETE /repos/branches` does, and the list marks it. `--yes` deletes the other refs,
+prints `kept: <ref> is the default branch`, and exits with an error. Set another default
+branch with `PATCH /repo`, then run the command again.
+
+The command changes the ref store only. It sends no push webhook and no sync poke. It can
+run while `serve` runs. `--yes` lists the refs again and deletes what it finds, so a ref
+that appeared after an earlier list goes too. With `--yes` it first runs the ref-store
+schema setup that `serve` runs at boot, as `purge-repo` does, so that the delete bumps
+the repository generation. The list runs no schema setup. A replica on v0.20.0 or earlier
+accepts such names, so run the command after the last replica is upgraded.
 
 ## `openstorage s3wal-meta`
 

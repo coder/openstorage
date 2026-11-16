@@ -54,6 +54,7 @@ var leaseExempt = map[string]string{
 	"internal/simtest/gitenv.go:simGit":                         "test support: runs in the scratch repositories of simulations",
 	"internal/gitread/heaplimit.go:heapLimitedGit":              "builder: gitread.Run starts the command through RunIn",
 	"internal/api/handlers_write_commit.go:gitCmd":              "builder: its callers start the command through OutputIn or StartIn",
+	"internal/githttp/server.go:serviceCmd":                     "builder: handleInfoRefs and handleServiceRPC start the command through RunIn and StartIn",
 }
 
 // execImporters lists every non-test file outside internal/gitlimit that
@@ -66,7 +67,7 @@ var execImporters = map[string]string{
 	"internal/api/handlers_write_merge.go":  "git version reads no repository (leaseExempt); the rest reads exit statuses",
 	"internal/api/handlers_write_refs.go":   "the ref commands start through OutputIn",
 	"internal/githttp/hook.go":              "runs inside a hook and inherits the lease (leaseExempt)",
-	"internal/githttp/hydrate.go":           "every start goes through OutputIn, StartIn or CombinedOutputIn",
+	"internal/githttp/hydrate.go":           "every start goes through OutputIn, StartIn or RunIn",
 	"internal/githttp/server.go":            "upload-pack and receive-pack start through RunIn and StartIn",
 	"internal/gitread/budget.go":            "only *exec.ExitError, to read an exit status",
 	"internal/gitread/gitread.go":           "only *exec.ExitError, to read an exit status",
@@ -82,7 +83,7 @@ var execImporters = map[string]string{
 	"internal/sync/worker.go":               "runs git in a temporary mirror under os.TempDir, never in a cache repository (leaseExempt)",
 }
 
-var leaseBuilders = map[string]bool{"heapLimitedGit": true, "gitCmd": true}
+var leaseBuilders = map[string]bool{"heapLimitedGit": true, "gitCmd": true, "serviceCmd": true}
 
 var plainStarters = map[string]bool{"Start": true, "Run": true, "Output": true, "CombinedOutput": true}
 

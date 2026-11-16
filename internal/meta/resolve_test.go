@@ -34,7 +34,34 @@ func testResolveRepoKey(t *testing.T, s Backend) {
 		t.Fatalf("resolve by url RepoID = %q, want %q", byURL.RepoID, created.RepoID)
 	}
 
-	for _, key := range []string{"", "no-such-repo", "repo_ffffffffffffffff"} {
+	// Valid text with control characters or non-ASCII resolves as itself.
+	for _, url := range []string{"team/a\x01\x7fb", "team/café-\uFFFD"} {
+		odd, err := s.CreateRepo(ctx, org, url, "main")
+		if err != nil {
+			t.Fatalf("create repo %q: %v", url, err)
+		}
+		got, err := ResolveRepoKey(ctx, s, org, url)
+		if err != nil || got.RepoID != odd.RepoID {
+			t.Fatalf("resolve %q = %+v, %v, want %q", url, got, err, odd.RepoID)
+		}
+	}
+
+	// SQLite and S3-WAL hold a url with a NUL (PostgreSQL refuses it): such
+	// a row resolves by url and by id.
+	legacy, err := s.CreateRepo(ctx, org, "team/legacy\x00x", "main")
+	if _, isPG := s.(*PG); isPG != (err != nil) {
+		t.Fatalf("create a NUL url on %T: err = %v, want an error only on PostgreSQL", s, err)
+	}
+	if err == nil {
+		for _, key := range []string{legacy.URL, legacy.RepoID} {
+			got, err := ResolveRepoKey(ctx, s, org, key)
+			if err != nil || got.RepoID != legacy.RepoID {
+				t.Fatalf("resolve legacy %q = %+v, %v, want %q", key, got, err, legacy.RepoID)
+			}
+		}
+	}
+
+	for _, key := range []string{"", "no-such-repo", "repo_ffffffffffffffff", "team/a\x00b", "team/a\xffb"} {
 		if _, err := ResolveRepoKey(ctx, s, org, key); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("resolve %q: err = %v, want ErrNotFound", key, err)
 		}

@@ -60,6 +60,10 @@ const (
 	// Minted per request by the server and stripped from inherited env
 	// like the other per-push inputs.
 	EnvPushHold = "OPENSTORAGE_GIT_PUSH_HOLD"
+	// EnvImportPush marks a push that came through the `+import` remote
+	// ("1"). The push writes the base repo's refs; pre-receive refuses it
+	// when the repo has a sync base (refuseSyncedImport).
+	EnvImportPush = "OPENSTORAGE_GIT_IMPORT_PUSH"
 	// EnvAtomic marks the push `--atomic` (issue #28). githooks(5) exposes
 	// no atomic indicator, so the HTTP layer sniffs the wire capability
 	// (atomic.go) and sets this; pre-receive then evaluates the policy
@@ -383,6 +387,11 @@ func preReceive(ctx context.Context) (retErr error) {
 	if len(commands) == 0 {
 		return errors.New("pre-receive: git invoked hook with no commands")
 	}
+	if envconfig.Getenv(EnvImportPush) == "1" {
+		if err := refuseSyncedImport(ctx, repo); err != nil {
+			return err
+		}
+	}
 	atomicPush := envconfig.Getenv(EnvAtomic) == "1"
 
 	// Full-policy verdicts are evaluated AT MOST once per command per push
@@ -396,10 +405,25 @@ func preReceive(ctx context.Context) (retErr error) {
 	// beyond its signature-gated commands.
 	verdicts := make([]error, len(commands))
 	verdictDone := make([]bool, len(commands))
+	tipVerdicts := sync.OnceValue(func() []error { return branchTipVerdicts(commands) })
 	evalOne := func(i int) error {
 		if !verdictDone[i] {
 			c := commands[i]
-			verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			switch {
+			case hiddenOnRemote(repo, c.ref):
+				verdicts[i] = refusef("ref %s is hidden on this remote, which takes no refs under refs/namespaces/ (the HTTP API writes ephemeral branches)", c.ref)
+			case !pushCommandUpdatable(c.ref, c.old, c.new):
+				// Never committed: git refuses a funny name before the
+				// update hook, which denies the rest. So the publication
+				// gate stores no pack that only such names need.
+				verdicts[i] = refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth)
+			case tipVerdicts()[i] != nil:
+				// git refuses it after the hooks, but the update hook's
+				// CAS has stored it by then (branchTipVerdicts).
+				verdicts[i] = tipVerdicts()[i]
+			default:
+				verdicts[i] = enforceRefPolicy(ctx, repo, c.ref, c.old, c.new)
+			}
 			verdictDone[i] = true
 		}
 		return verdicts[i]
@@ -418,17 +442,14 @@ func preReceive(ctx context.Context) (retErr error) {
 	// name and aborting the local atomic transaction, so letting one
 	// through recreates the authority-accepted/client-rejected wedge.
 	if atomicPush {
-		// Evaluated one command at a time, name check first, STOPPING at
-		// the first denial (Codex round-10 P2): a denied atomic push's
+		// Evaluated one command at a time (each command's name check
+		// before its policy), STOPPING at the first denial (Codex round-10 P2): a denied atomic push's
 		// outcome is already fixed, and each further evaluation can cost
 		// subprocess work (no-force-push runs git merge-base, verify-sig
 		// walks and verifies) — eager whole-slice evaluation let one
 		// doomed request scale that by its command count. A complete loop
 		// leaves verdicts fully populated (all nil) for the later gates.
-		for i, c := range commands {
-			if !pushCommandUpdatable(c.ref, c.old, c.new) {
-				return atomicDenied(refusef("ref name %s is not updatable here (namespace root, git-invalid or unmaterializable name, or deeper than %d segments)", c.ref, maxPushRefDepth))
-			}
+		for i := range commands {
 			if err := evalOne(i); err != nil {
 				return atomicDenied(err)
 			}
@@ -518,6 +539,14 @@ func preReceive(ctx context.Context) (retErr error) {
 			}
 		}
 		for i, c := range commands {
+			// git refuses a hidden ref before any update hook runs
+			// (serviceCmd): it never commits, so it takes no hold and no
+			// sidecar marker. A hold would block hydration and REST writes
+			// of that ephemeral branch for as long as the client keeps
+			// the push open.
+			if hiddenOnRemote(repo, c.ref) {
+				continue
+			}
 			// Reserve only names this server could ever commit (Codex
 			// round-5 security P2): git hands namespace roots like the
 			// literal refs/heads to pre-receive yet can never complete
@@ -1167,13 +1196,6 @@ const (
 	maxPushRefNameBytes    = 900
 )
 
-// pushRefSegmentNameMax is the HARD per-component limit (Linux NAME_MAX):
-// the boundary at which the git files backend cannot represent the path
-// at all, as opposed to the conservative policy caps above. Deletions are
-// held only to this (see pushRefDeletable) so legacy refs between the
-// policy caps and the hard limit stay deletable.
-const pushRefSegmentNameMax = 255
-
 // pushRefPathMax is the TARGET OS's PATH_MAX budget for the deepest path
 // git materializes for a pushed ref: the loose lock file
 // `<repository dir>/<ref>.lock`. git resolves its git dir to an ABSOLUTE
@@ -1287,24 +1309,33 @@ func pushRefDeletable(name string) bool {
 	if strings.HasSuffix(name, ".") { // git: a refname cannot end with a dot
 		return false
 	}
-	segs := strings.Split(name, "/")
-	for i, seg := range segs {
+	for _, seg := range strings.Split(name, "/") {
 		if !gitRefSegmentValid(seg) {
 			return false
 		}
-		// Filesystem NAME_MAX (255): intermediate segments are directory
-		// names; the final segment must also carry the ".lock" suffix.
-		limit := pushRefSegmentNameMax
-		if i == len(segs)-1 {
-			limit -= len(".lock")
-		}
-		if len(seg) > limit {
-			return false
-		}
+	}
+	// The HARD per-component limits (filesystem NAME_MAX, and the ".lock"
+	// suffix on the final part), as opposed to the conservative policy
+	// caps above. Deletions are held only to these so legacy refs between
+	// the policy caps and the hard limits stay deletable. The same rule
+	// picks the refs that `openstorage repair-refs` removes.
+	if ref.Unlockable(name) {
+		return false
 	}
 	// The whole lock path must fit PATH_MAX against the ACTUAL repository
 	// directory (round-21 P2 established the budget for creations).
 	return !pushRefPathTooLong(pushRepoDirLen(), len(name))
+}
+
+// hiddenOnRemote reports whether receive-pack hides refName on the remote
+// of storage key repo (serviceCmd). git refuses such a command before
+// pre-receive and runs no update hook for it, yet still lists it on
+// pre-receive's stdin and, under --atomic, commits the other commands. So
+// pre-receive's verdict denies it: an atomic push that names one lands
+// nothing, and a pack that only such commands need is never published.
+func hiddenOnRemote(repo, refName string) bool {
+	// git hides the prefix itself too: it drops the trailing slash.
+	return persistentKey(repo) && (strings.HasPrefix(refName, persistentHiddenRefs) || refName+"/" == persistentHiddenRefs)
 }
 
 // pushCommandUpdatable applies the right name gate for one command:
@@ -1448,7 +1479,8 @@ func atomicPushDFCheck(commands []refCommand) error {
 // allowed commands all target already-stored objects is refused whole —
 // its pack could only serve the denied refs (round-7 decoy) — with a
 // message telling the client to push the allowed updates separately. It
-// reuses enforceRefPolicy verbatim — the quarantine is visible to
+// reuses the shared verdicts (enforceRefPolicy, plus the refusals of hidden
+// refs and of names the server cannot store) — the quarantine is visible to
 // pre-receive via git's alternates, so is-ancestor and verify-sig checks
 // work here exactly as in the update hook; verify-sig-policied winners are
 // verified twice, an accepted redundancy for failing closed.
@@ -1651,6 +1683,13 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		if _, err := os.Stat(pushHoldUnreservedMarker(holdPath, refName)); errors.Is(err, os.ErrNotExist) && !jit {
 			refHeld = true
 		}
+	}
+
+	// A branch tip that is no commit would reach the CAS below, and git
+	// refuses it only afterwards (branchTipVerdicts). Checked before the
+	// policy: the object type decides it, whatever the policy says.
+	if err := branchTipVerdicts([]refCommand{{old: old, new: new, ref: refName}})[0]; err != nil {
+		return err
 	}
 
 	// Verified verdict (Codex round-16 P2): pre-receive already ran the
@@ -2017,6 +2056,34 @@ func enforceSyncClaimFence(ctx context.Context, repo, holder string) error {
 	return nil
 }
 
+// importSyncedRefusal is the pre-receive refusal of an import push to a
+// repository with a sync base.
+const importSyncedRefusal = "import push refused: the repository has a sync base; +import remotes accept pushes only for repositories without one"
+
+// refuseSyncedImport refuses a `+import` push to a repository that has a
+// sync base, so an imported ref never reaches a connected upstream
+// (code.storage docs/repos/imports). In serve, a repo writes its upstream
+// link only together with its repo row (meta.EventingStore.CreateLinkedRepo:
+// both serve queues track create state), so one read before any pack is
+// published decides the whole push. It fails
+// closed when the metadata store cannot answer, and the pusher then sees
+// only hookFailure's fixed line.
+func refuseSyncedImport(ctx context.Context, repo string) error {
+	assertf(repo != "" && BaseRepo(repo) == repo, "refuseSyncedImport: %q is not a base repo key", repo)
+	ms, err := meta.Open(ctx, mustEnv(envHookPGURL...))
+	if err != nil {
+		return fmt.Errorf("import push: open meta store: %w", err)
+	}
+	defer ms.Close()
+	switch _, err := ms.GetRepoUpstream(ctx, repo); {
+	case errors.Is(err, meta.ErrNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("import push: load upstream link: %w", err)
+	}
+	return Refuse(errors.New(importSyncedRefusal))
+}
+
 // errCASDrop is the synthetic post-commit connection-drop error the
 // EnvCASDrop knobs inject.
 var errCASDrop = errors.New("injected post-commit connection drop")
@@ -2210,6 +2277,12 @@ func loadRefPolicies(policyJSON, opsJSON string) ([]auth.RefPolicy, error) {
 	if policyJSON != "" {
 		m.policies, m.err = auth.ParseRefPolicies(policyJSON)
 		if m.err != nil {
+			// The pusher reads the error's text (a *auth.MalformedError says
+			// only that the claim is malformed). The decoder's text goes to
+			// the operator's hook-errors file.
+			var bad *auth.MalformedError
+			assertf(errors.As(m.err, &bad), "ParseRefPolicies returned %T, not *auth.MalformedError", m.err)
+			hookErrorsLogger().Error("update: refs claim does not parse", "err", bad.Err)
 			m.err = Refuse(fmt.Errorf("update: %w", m.err)) // the pusher's own token
 		}
 	}
@@ -2747,6 +2820,78 @@ func condenseGitReason(out []byte) string {
 		msg = msg[:max] + "..."
 	}
 	return msg
+}
+
+// branchTipVerdicts refuses each command that sets a branch (a ref under
+// refs/heads/) to an object that is not a commit: a blob, a tree or an
+// annotated tag. git refuses to store such a value too, but only after the
+// update hook's compare-and-swap has committed it to the ref store. The
+// store then holds a value that no cache can materialize, every read of the
+// repository fails, and later updates of the branch lose their CAS. Other
+// namespaces take any object, as in git. The kinds of all the new values
+// come from one git child, decided by object type. A failed child fails
+// every candidate closed.
+func branchTipVerdicts(commands []refCommand) []error {
+	verdicts := make([]error, len(commands))
+	var ids []string
+	seen := map[string]bool{}
+	for _, c := range commands {
+		if isBranchTip(c.ref, c.new) && !seen[c.new] {
+			seen[c.new] = true
+			ids = append(ids, c.new)
+		}
+	}
+	if len(ids) == 0 {
+		return verdicts
+	}
+	kinds, err := objectKinds(ids)
+	for i, c := range commands {
+		switch {
+		case !isBranchTip(c.ref, c.new):
+		case err != nil:
+			verdicts[i] = fmt.Errorf("update: read the object type of %s: %w", c.new, err)
+		case kindNames[kinds[c.new]] != "":
+			verdicts[i] = refusef("update: %s must point at a commit, not %s", c.ref, kindNames[kinds[c.new]])
+		}
+	}
+	return verdicts
+}
+
+func isBranchTip(refName, new string) bool {
+	return strings.HasPrefix(refName, "refs/heads/") && new != ref.ZeroSHA
+}
+
+// kindNames is how a refusal names the kinds of object that a branch cannot
+// point at. An object that is missing has no kind to refuse: receive-pack
+// refuses a command whose new value it lacks, before the update hook runs.
+var kindNames = map[string]string{"blob": "a blob", "tree": "a tree", "tag": "an annotated tag"}
+
+// objectKinds returns the type of each id, one of commit, tree, blob, tag or
+// missing, from one git child.
+func objectKinds(ids []string) (map[string]string, error) {
+	var out strings.Builder
+	cmd := exec.Command("git", "cat-file", "--batch-check=%(objecttype)")
+	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != len(ids) {
+		return nil, fmt.Errorf("cat-file --batch-check answered %d lines for %d ids", len(lines), len(ids))
+	}
+	kinds := make(map[string]string, len(ids))
+	for i, l := range lines {
+		switch l {
+		case "commit", "tree", "blob", "tag":
+			kinds[ids[i]] = l
+		case ids[i] + " missing":
+			kinds[ids[i]] = "missing"
+		default:
+			return nil, fmt.Errorf("cat-file --batch-check answered %q for %s", l, ids[i])
+		}
+	}
+	return kinds, nil
 }
 
 // objectExists reports whether sha names an object in the repo git put us

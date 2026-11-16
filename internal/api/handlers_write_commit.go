@@ -74,6 +74,11 @@ const (
 	wcMaxGitlinkBytes = 64
 )
 
+// wcMaxDiffBytes caps the decoded patch of one diff-commit, summed over
+// its chunks: the commit-pack cap, so that both streaming commit
+// endpoints take at most 250 MiB of content. A var so tests can lower it.
+var wcMaxDiffBytes int64 = 262144000
+
 // wcMaxCommitBlobBytes caps the decoded file contents of one commit-pack
 // request, summed over every chunk of every file (spec 2026-10-28, #597:
 // 413 above 262144000 bytes). A var so tests can cross it cheaply.
@@ -449,7 +454,7 @@ func wcReadMetadata(w http.ResponseWriter, lr *wcLineReader) (*wcMetadata, bool)
 	}
 	var frame wcFrame
 	if err := json.Unmarshal(line, &frame); err != nil {
-		wcFail(w, http.StatusBadRequest, "invalid", "malformed NDJSON frame: "+err.Error(), "", "")
+		wcFail(w, http.StatusBadRequest, "invalid", frameMsg(err), "", "")
 		return nil, false
 	}
 	if frame.Metadata == nil || frame.BlobChunk != nil || frame.DiffChunk != nil {
@@ -500,6 +505,10 @@ func wcPathShapeError(p string) error {
 
 var wcValidModes = map[string]bool{"100644": true, "100755": true, "120000": true, "160000": true}
 
+// wcModeAliases are the permission-style modes that upstream stores as a
+// regular file (spec 5d8e1801, #806).
+var wcModeAliases = map[string]string{"644": "100644", "100664": "100644", "755": "100755", "100775": "100755"}
+
 // wcValidateBranchParam validates one branch-name request field (docs/explanation/streaming-commit-protocols.md:
 // no refs/ prefix; conservative component rule shared with repo creation).
 func wcValidateBranchParam(field, name string) error {
@@ -509,61 +518,44 @@ func wcValidateBranchParam(field, name string) error {
 	if strings.HasPrefix(name, "refs/") {
 		return newFieldError(field, "must not include the refs/ prefix", field+" must not include the refs/ prefix")
 	}
-	if !validBranchName(name) {
+	if !validNewBranchName(name) {
 		return newFieldError(field, "must be a valid branch name", "invalid "+field)
 	}
 	return nil
 }
 
-// wcValidateAuthor validates one ident. Newlines would corrupt the
-// GIT_AUTHOR_*/GIT_COMMITTER_* env-based ident encoding.
-func wcValidateAuthor(field string, a wcAuthor) error {
+// wcAuthorProblems returns each problem of one ident: the empty name and
+// email (one problem), a NUL in the name or the email (one problem each),
+// newlines, which would corrupt the GIT_AUTHOR_*/GIT_COMMITTER_*
+// env-based ident encoding, and a name or an email over maxGitIdentBytes
+// (one problem each). An environment value cannot hold a NUL.
+func wcAuthorProblems(field string, a wcAuthor) []error {
+	var problems []error
 	if err := requiredFields(field+" name and email are required",
 		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email}); err != nil {
-		return err
+		problems = append(problems, err)
 	}
+	problems = append(problems, invalidTextEach(
+		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email})...)
 	if strings.ContainsAny(a.Name+a.Email, "\n\r") {
-		return newFieldError(field, "must not contain newlines", field+" contains newlines")
+		problems = append(problems, newFieldError(field, "must not contain newlines", field+" contains newlines"))
 	}
-	return wcValidateIdentityEnv(field, a.Name, a.Email)
+	problems = append(problems, tooLongEach(maxGitIdentBytes,
+		[2]string{field + ".name", a.Name}, [2]string{field + ".email", a.Email})...)
+	return problems
 }
 
-// wcMaxIdentityBytes bounds an author or committer name or email. git gets
-// each through an environment entry such as GIT_COMMITTER_EMAIL=<email>,
-// and exec on Linux refuses an entry over 128 KiB (E2BIG).
-const wcMaxIdentityBytes = 128<<10 - len("GIT_COMMITTER_EMAIL=") - 1
+// maxGitIdentBytes bounds a name or an email of an author or a committer.
+// git gets each one as an environment entry such as
+// GIT_COMMITTER_EMAIL=<email>, which must fit gitlimit.MaxArgBytes.
+const maxGitIdentBytes = gitlimit.MaxArgBytes - len("GIT_COMMITTER_EMAIL=")
 
-// wcValidateIdentityEnv refuses an identity that exec cannot pass in git's
-// environment: a NUL byte, or a name or email over wcMaxIdentityBytes.
-func wcValidateIdentityEnv(field, name, email string) error {
-	if strings.IndexByte(name+email, 0) >= 0 {
-		return newFieldError(field, "must not contain a NUL byte", field+" contains a NUL byte")
-	}
-	if max(len(name), len(email)) > wcMaxIdentityBytes {
-		msg := fmt.Sprintf("name and email must be at most %d bytes each", wcMaxIdentityBytes)
-		return newFieldError(field, msg, field+" "+msg)
+// wcValidateAuthor validates one ident and returns its first problem.
+func wcValidateAuthor(field string, a wcAuthor) error {
+	if problems := wcAuthorProblems(field, a); len(problems) > 0 {
+		return problems[0]
 	}
 	return nil
-}
-
-// wcValidateCommitMessage refuses a message that git cannot store: git
-// commit-tree refuses a message with a NUL byte.
-func wcValidateCommitMessage(msg string) error {
-	if strings.IndexByte(msg, 0) >= 0 {
-		return newFieldError("commit_message", "must not contain a NUL byte", "commit_message contains a NUL byte")
-	}
-	return nil
-}
-
-// wcMessageInput is the stdin for `git commit-tree -F -`. The message goes
-// through stdin because exec refuses an argument past 128 KiB (E2BIG).
-// -F takes the message as is, so this adds the line feed that -m adds to
-// a message without one: the commit is the one that -m made.
-func wcMessageInput(msg string) io.Reader {
-	if msg != "" && !strings.HasSuffix(msg, "\n") {
-		msg += "\n"
-	}
-	return strings.NewReader(msg)
 }
 
 // wcValidateMetadata checks the fields shared by commit-pack and
@@ -574,10 +566,14 @@ func wcValidateMetadata(md *wcMetadata) error {
 	if err := wcValidateBranchParam("target_branch", md.TargetBranch); err != nil {
 		return err
 	}
+	if wrefEphemeralHEAD(md.TargetBranch, md.Ephemeral) {
+		return newFieldError("target_branch", "must not be HEAD for an ephemeral branch", "invalid target_branch")
+	}
 	if md.CommitMessage == "" {
 		return errors.New("missing commit_message")
 	}
-	if err := wcValidateCommitMessage(md.CommitMessage); err != nil {
+	// git refuses a NUL in a commit message.
+	if err := invalidTextFields([2]string{"commit_message", md.CommitMessage}); err != nil {
 		return err
 	}
 	if err := wcValidateAuthor("author", md.Author); err != nil {
@@ -600,7 +596,8 @@ func wcValidateMetadata(md *wcMetadata) error {
 }
 
 // wcValidateFiles checks the commit-pack file-operation table: unique
-// paths + content ids, safe paths, known modes/operations.
+// paths + content ids, safe paths, known modes/operations. It fills in the
+// default operation and mode in place.
 func wcValidateFiles(files []wcFileOp) error {
 	paths := make(map[string]bool, len(files))
 	ids := make(map[string]bool, len(files))
@@ -613,24 +610,34 @@ func wcValidateFiles(files []wcFileOp) error {
 			return fmt.Errorf("duplicate path %q", f.Path)
 		}
 		paths[f.Path] = true
-		if f.ContentID == "" {
+		// The spec: operation defaults to upsert, and content_id is
+		// required for an upsert only.
+		if f.Operation == "" {
+			f.Operation = "upsert"
+		}
+		if f.ContentID == "" && f.Operation == "upsert" {
 			return fmt.Errorf("missing content_id for %q", f.Path)
 		}
-		if ids[f.ContentID] {
-			return fmt.Errorf("duplicate content_id %q", f.ContentID)
+		if f.ContentID != "" {
+			if ids[f.ContentID] {
+				return fmt.Errorf("duplicate content_id %q", f.ContentID)
+			}
+			ids[f.ContentID] = true
 		}
-		ids[f.ContentID] = true
 		switch f.Operation {
 		case "upsert":
 			if f.Mode == "" {
 				f.Mode = "100644" // SDK default when the caller sets none
 			}
+			if mode, ok := wcModeAliases[f.Mode]; ok {
+				f.Mode = mode
+			}
 			if !wcValidModes[f.Mode] {
 				return fmt.Errorf("invalid mode %q for %q", f.Mode, f.Path)
 			}
 		case "delete":
-			// Mode ignored; no blob chunks may follow (checked in the
-			// stream loop).
+			// Mode ignored; at most one empty final chunk may follow
+			// (checked in the stream loop).
 		default:
 			return fmt.Errorf("invalid operation %q for %q", f.Operation, f.Path)
 		}
@@ -727,7 +734,7 @@ func wcNewScratch(repoPath string) (*wcScratch, error) {
 	// must never leak into server-created commits. git names a file it
 	// cannot read in a warning, and a 400 or 409 body shows git's stderr, so
 	// every file git reads outside the repository must lie under the
-	// scratch dir, where wcApplyServerFailure sees it: HOME and
+	// scratch dir, where applyPatch sees it (wcApplyStderr): HOME and
 	// XDG_CONFIG_HOME lead the default attributes file there, and
 	// GIT_ATTR_NOSYSTEM drops the install's own etc/gitattributes.
 	env := make([]string, 0, 32)
@@ -790,12 +797,13 @@ const wcMaxApplyMsgBytes = 4096
 // patch does not apply to the tree and 128 for every "bad error": a patch it
 // refuses on sight, a patch that clashes with the tree while it writes the
 // index, and a failure of the index itself (unreadable, locked, no room to
-// write). Only git's message tells those apart, so status comes from the
-// whole stderr, which a long path can push far past wcMaxApplyMsgBytes.
+// write). Only git's message tells those apart, so status comes from every
+// line of stderr (wcApplyStderr), which a long path can push far past
+// wcMaxApplyMsgBytes.
 type wcApplyRejection struct {
 	exit   int    // git's exit status, -1 when SIGABRT ended it (see wcGitAborted)
-	status int    // wcApplyStatus of git's whole stderr, 400 for an abort, 500 if server is set
-	server bool   // that stderr shows a failure of the server's own git (see wcApplyServerFailure)
+	status int    // the status of git's whole stderr (wcApplyStderr), 400 for an abort, 500 if server is set
+	server bool   // that stderr shows a failure of the server's own git (see (*wcApplyStderr).serverFailure)
 	msg    string // that stderr cut to wcMaxApplyMsgBytes
 }
 
@@ -809,7 +817,7 @@ func (r *wcApplyRejection) Error() string {
 // hold a newline, and git prints names unquoted, so a name can put any of
 // these lines into stderr: they say what git was told, not what failed.
 // applyPatch therefore never shows a message that names the server's own
-// paths (see wcApplyServerFailure), whatever these lines say.
+// paths (see (*wcApplyStderr).serverFailure), whatever these lines say.
 var (
 	// A patch that no base tree can make apply: a name that git's own path
 	// rules reject (`.git.`, `git~1`, a symlinked `.gitmodules`), a patch
@@ -821,11 +829,103 @@ var (
 	wcApplyClashLine = "error: unable to add cache entry for "
 )
 
-// wcApplyStatus is the HTTP status for git apply's exit status and stderr:
-// 409 for a patch that does not fit the base tree, 400 for one that fits no
-// tree, and 500 for the server's own failure, whose stderr names scratch
-// paths and stays in the log.
-func wcApplyStatus(exit int, stderr string) int {
+// wcApplyStderr reads git apply's stderr as git writes it, and keeps only
+// what applyPatch needs: the facts that its status and
+// serverFailure read, the head that the client sees, and the tail
+// that the log sees. It keeps about 128 KiB, whatever git prints: git apply
+// prints a line per file that fails, so its stderr grows with the patch.
+type wcApplyStderr struct {
+	needles  []string            // the server's own paths (serverFailure)
+	carry    []byte              // the last bytes, for a needle that two writes split
+	line     []byte              // the start of the current line, up to wcApplyLineKeep bytes
+	head     []byte              // the first wcApplyHeadBytes of stderr
+	tail     gitlimit.TailBuffer // the last 64 KiB, for the log
+	payload  bool                // a line starts with one of wcApplyPayloadLines
+	clash    bool                // a line starts with wcApplyClashLine
+	fatal    bool                // a line starts with "fatal: "
+	pathSeen bool                // stderr holds one of needles
+}
+
+// wcApplyHeadBytes is the head of stderr that wcApplyStderr keeps for the
+// client's message: far more than wcMaxApplyMsgBytes, so that white space
+// before git's first line does not shorten it.
+const wcApplyHeadBytes = 64 << 10
+
+// wcApplyLineKeep is the start of a line that wcApplyStderr reads: the
+// longest line head it looks for.
+var wcApplyLineKeep = func() int {
+	n := len("fatal: ")
+	for _, p := range append([]string{wcApplyClashLine}, wcApplyPayloadLines...) {
+		n = max(n, len(p))
+	}
+	return n
+}()
+
+func (c *wcApplyStderr) Write(p []byte) (int, error) {
+	n := len(p)
+	c.head = append(c.head, p[:min(n, wcApplyHeadBytes-len(c.head))]...)
+	_, _ = c.tail.Write(p)
+	if len(c.needles) > 0 {
+		keep := 0
+		for _, s := range c.needles {
+			keep = max(keep, len(s)-1)
+		}
+		buf := append(c.carry, p...)
+		for _, s := range c.needles {
+			c.pathSeen = c.pathSeen || bytes.Contains(buf, []byte(s))
+		}
+		c.carry = append(c.carry[:0], buf[max(len(buf)-keep, 0):]...)
+	}
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		part := p
+		if i >= 0 {
+			part = p[:i]
+		}
+		c.line = append(c.line, part[:min(len(part), max(wcApplyLineKeep-len(c.line), 0))]...)
+		if i < 0 {
+			break
+		}
+		c.endLine()
+		p = p[i+1:]
+	}
+	return n, nil
+}
+
+// endLine reads the start of the line that ended.
+func (c *wcApplyStderr) endLine() {
+	for _, p := range wcApplyPayloadLines {
+		c.payload = c.payload || bytes.HasPrefix(c.line, []byte(p))
+	}
+	c.clash = c.clash || bytes.HasPrefix(c.line, []byte(wcApplyClashLine))
+	c.fatal = c.fatal || bytes.HasPrefix(c.line, []byte("fatal: "))
+	c.line = c.line[:0]
+}
+
+// done reads the last line, which ends without a newline.
+func (c *wcApplyStderr) done() {
+	if len(c.line) > 0 {
+		c.endLine()
+	}
+}
+
+// message is git's stderr cut to wcMaxApplyMsgBytes, without white space
+// around it. The kept head stands for a longer stderr: git prints no run of
+// white space that fills it.
+func (c *wcApplyStderr) message() string {
+	msg := strings.TrimSpace(string(c.head))
+	if len(msg) > wcMaxApplyMsgBytes {
+		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
+	}
+	return msg
+}
+
+// status is the HTTP status for git apply's exit status and the stderr
+// that c read: 409 for a patch that does not fit the base tree, 400 for one
+// that fits no tree, and 500 for the server's own failure, whose stderr
+// names scratch paths and stays in the log.
+func (c *wcApplyStderr) status(exit int) int {
+	c.done()
 	switch exit {
 	case 1:
 		return http.StatusConflict
@@ -833,42 +933,44 @@ func wcApplyStatus(exit int, stderr string) int {
 	default:
 		return http.StatusInternalServerError
 	}
-	clash := false
-	for line := range strings.Lines(stderr) {
-		for _, p := range wcApplyPayloadLines {
-			if strings.HasPrefix(line, p) {
-				return http.StatusBadRequest
-			}
-		}
-		clash = clash || strings.HasPrefix(line, wcApplyClashLine)
-	}
-	if clash {
+	switch {
+	case c.payload:
+		return http.StatusBadRequest
+	case c.clash:
 		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
 }
 
-// wcApplyServerFailure reports whether git's stderr shows a failure of the
-// server's own git, whatever the patch holds, so that the client never sees
-// it: it names a path of the server's (the scratch directory or the cached
-// repository), or it has a fatal line. git dies for a broken config, a held
-// lock or a missing object, and reports a bad patch with error lines.
-func (sc *wcScratch) wcApplyServerFailure(stderr string) bool {
-	assertf(sc.dir != "" && sc.repoPath != "", "wcApplyServerFailure: empty scratch path")
-	for line := range strings.Lines(stderr) {
-		if strings.HasPrefix(line, "fatal: ") {
-			return true
-		}
-	}
+// serverFailure reports whether the stderr that c read shows a failure of
+// the server's own git, whatever the patch holds, so that the client never
+// sees it: it names a path of the server's (c.needles), or it has a fatal
+// line. git dies for a broken config, a held lock or a missing object, and
+// reports a bad patch with error lines.
+func (c *wcApplyStderr) serverFailure() bool {
+	c.done()
+	return c.fatal || c.pathSeen
+}
+
+// newApplyStderr is a wcApplyStderr that looks for the scratch directory
+// and the cached repository, as given and with symlinks resolved.
+func (sc *wcScratch) newApplyStderr() *wcApplyStderr {
+	assertf(sc.dir != "" && sc.repoPath != "", "newApplyStderr: empty scratch path")
+	c := &wcApplyStderr{}
 	for _, dir := range []string{sc.dir, sc.repoPath} {
-		if strings.Contains(stderr, dir) {
-			return true
-		}
-		if real, err := filepath.EvalSymlinks(dir); err == nil && real != dir && strings.Contains(stderr, real) {
-			return true
+		c.needles = append(c.needles, dir)
+		if real, err := filepath.EvalSymlinks(dir); err == nil && real != dir {
+			c.needles = append(c.needles, real)
 		}
 	}
-	return false
+	return c
+}
+
+// wcApplyStatus is (*wcApplyStderr).status for a whole stderr.
+func wcApplyStatus(exit int, stderr string) int {
+	var c wcApplyStderr
+	_, _ = c.Write([]byte(stderr))
+	return c.status(exit)
 }
 
 // applyPatch runs `git apply` on the spooled patch. The patch goes on
@@ -885,25 +987,18 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 	defer f.Close()
 	cmd := sc.gitCmd(ctx, []string{"LC_ALL=C"}, append([]string{"apply"}, args...)...)
 	cmd.Stdin = f
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := sc.newApplyStderr()
+	cmd.Stderr = stderr
 	o, err := gitlimit.OutputIn(ctx, sc.repoPath, cmd)
 	if err == nil {
 		return string(o), nil
 	}
 	var exit *exec.ExitError
 	if ctx.Err() != nil || !errors.As(err, &exit) || (exit.ExitCode() < 0 && !wcGitAborted(exit)) {
-		// The error is logged: keep the last 64 KiB of git's stderr. (The
-		// classification below reads all of it.)
-		var tail gitlimit.TailBuffer
-		_, _ = tail.Write(stderr.Bytes())
-		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, tail.String())
+		// The error is logged: it quotes the last 64 KiB of git's stderr.
+		return "", fmt.Errorf("%s: %w: %s", gitlimit.Name(append([]string{"apply"}, args...)), err, stderr.tail.String())
 	}
-	full := strings.TrimSpace(stderr.String())
-	msg := full
-	if len(msg) > wcMaxApplyMsgBytes {
-		msg = strings.ToValidUTF8(msg[:wcMaxApplyMsgBytes], "") + " …"
-	}
+	msg := stderr.message()
 	aborted := wcGitAborted(exit)
 	if msg == "" {
 		msg = fmt.Sprintf("git apply exited with status %d", exit.ExitCode())
@@ -911,8 +1006,8 @@ func (sc *wcScratch) applyPatch(ctx context.Context, patchPath string, args ...s
 			msg = "git apply aborted"
 		}
 	}
-	server := sc.wcApplyServerFailure(full)
-	status := wcApplyStatus(exit.ExitCode(), full)
+	server := stderr.serverFailure()
+	status := stderr.status(exit.ExitCode())
 	if aborted {
 		status = http.StatusBadRequest
 	}
@@ -1033,6 +1128,65 @@ func (sc *wcScratch) resolveTree(ctx context.Context, commitSHA string) (string,
 	return sha, nil
 }
 
+// restoreTargetTree resolves restore-commit's target to its tree. found
+// is false when the target names no commit: no object, a tree, a blob,
+// or a tag of one. A commit whose tree, or a tag whose commit, git cannot
+// read is the repository's failure, an error, and so is any other git
+// failure (a fatal exit, a killed git). target is a full object id, so
+// that cat-file -e exit 1 below means only that no such object exists.
+func (sc *wcScratch) restoreTargetTree(ctx context.Context, target string) (tree string, found bool, err error) {
+	assertf(ref.ValidSHA(target), "restoreTargetTree: malformed sha %q", target)
+	_, kindErr := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}")
+	if kindErr == nil {
+		out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{commit}^{tree}")
+		if wcGitExit(err, 1) {
+			return "", false, fmt.Errorf("restore target %s: commit has no readable tree: %w", target, err)
+		} else if err != nil {
+			return "", false, err
+		}
+		if tree = strings.TrimSpace(out); !ref.ValidSHA(tree) {
+			return "", false, fmt.Errorf("rev-parse %s^{commit}^{tree} emitted %q", target, tree)
+		}
+		return tree, true, nil
+	}
+	if !wcGitExit(kindErr, 1) {
+		return "", false, kindErr
+	}
+	// rev-parse exits 1 for no object, for no commit at the end of the
+	// target's tag chain, and for an object on the way that git cannot
+	// read.
+	if _, err := sc.git(ctx, nil, nil, "cat-file", "-e", target); wcGitExit(err, 1) {
+		return "", false, nil // no such object
+	} else if err != nil {
+		return "", false, err
+	}
+	// The object exists. git peels its tag chain to the end (<target>^{})
+	// and fails only when an object on the way is missing, or a tag
+	// cannot be parsed. Nothing here reads a tag's message.
+	out, err := sc.git(ctx, nil, nil, "rev-parse", "--verify", "--quiet", "--end-of-options", target+"^{}")
+	if err != nil {
+		return "", false, fmt.Errorf("restore target %s: git cannot peel it: %w (and %w)", target, err, kindErr)
+	}
+	end := strings.TrimSpace(out)
+	if !ref.ValidSHA(end) {
+		return "", false, fmt.Errorf("rev-parse %s^{} emitted %q", target, end)
+	}
+	out, err = sc.git(ctx, nil, nil, "cat-file", "-t", end)
+	if err != nil {
+		return "", false, err
+	}
+	if strings.TrimSpace(out) == "commit" {
+		return "", false, fmt.Errorf("restore target %s: git cannot read commit %s: %w", target, end, kindErr)
+	}
+	return "", false, nil // a tree or a blob, or a tag of one
+}
+
+// wcGitExit reports whether err is a git run that exited with code.
+func wcGitExit(err error, code int) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
+}
+
 // wcBlobSink streams one file's decoded bytes into `git hash-object -w
 // --stdin` (blob created in the scratch odb) without buffering the content.
 type wcBlobSink struct {
@@ -1136,24 +1290,41 @@ func (sc *wcScratch) buildTree(ctx context.Context, baseTree string, entries []w
 // commitTree creates the commit object in the scratch odb. parent "" makes
 // a root commit. Committer defaults to the author (docs/explanation/streaming-commit-protocols.md).
 func (sc *wcScratch) commitTree(ctx context.Context, tree, parent string, md *wcMetadata) (string, error) {
-	assertf(ref.ValidSHA(tree), "commitTree: malformed tree %q", tree)
 	committer := md.Author
 	if md.Committer != nil {
 		committer = *md.Committer
 	}
+	var parents []string
+	if parent != "" {
+		parents = []string{parent}
+	}
+	return sc.writeCommit(ctx, tree, parents, md.CommitMessage, md.Author, committer)
+}
+
+// writeCommit runs `git commit-tree` in the scratch odb and returns the new
+// commit's sha. The message goes on stdin (-F -), so git takes a message of
+// any length: as an argument (-m) it would have to fit
+// gitlimit.MaxArgBytes. -m ends a message with a line feed when it lacks
+// one and -F - does not, so the line feed is added here: the commit is the
+// one that -m made. The idents go in the environment (maxGitIdentBytes).
+func (sc *wcScratch) writeCommit(ctx context.Context, tree string, parents []string, message string, author, committer wcAuthor) (string, error) {
+	assertf(ref.ValidSHA(tree), "writeCommit: malformed tree %q", tree)
 	env := []string{
-		"GIT_AUTHOR_NAME=" + md.Author.Name,
-		"GIT_AUTHOR_EMAIL=" + md.Author.Email,
+		"GIT_AUTHOR_NAME=" + author.Name,
+		"GIT_AUTHOR_EMAIL=" + author.Email,
 		"GIT_COMMITTER_NAME=" + committer.Name,
 		"GIT_COMMITTER_EMAIL=" + committer.Email,
 	}
 	args := []string{"commit-tree", "-F", "-"}
-	if parent != "" {
-		assertf(ref.ValidSHA(parent), "commitTree: malformed parent %q", parent)
-		args = append(args, "-p", parent)
+	for _, p := range parents {
+		assertf(ref.ValidSHA(p), "writeCommit: malformed parent %q", p)
+		args = append(args, "-p", p)
 	}
 	args = append(args, tree)
-	out, err := sc.git(ctx, wcMessageInput(md.CommitMessage), env, args...)
+	if message != "" && !strings.HasSuffix(message, "\n") {
+		message += "\n"
+	}
+	out, err := sc.git(ctx, strings.NewReader(message), env, args...)
 	if err != nil {
 		return "", err
 	}
@@ -1365,7 +1536,7 @@ func wcRejectNoChanges(w http.ResponseWriter, md *wcMetadata, plan *wcPlan, base
 
 // wcStreamBlobs drives the blob_chunk state machine (docs/explanation/streaming-commit-protocols.md §1): chunks
 // per file are contiguous and eof-terminated; every upsert must be fed;
-// deletes must not be; decoded chunks are capped at 4 MiB, and their sum
+// a delete gets at most one empty final chunk; decoded chunks are capped at 4 MiB, and their sum
 // over the request at wcMaxCommitBlobBytes (413). Content bytes
 // stream straight into hash-object — except 160000 gitlinks, whose payload
 // is the referenced commit sha in hex (they have no blob). Returns
@@ -1380,9 +1551,15 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		sha     string
 	}
 	states := make(map[string]*blobState)
+	// The spec's request example sends one empty final chunk for a delete.
+	// It carries nothing, so it is accepted once and ignored.
+	deleteIDs := make(map[string]bool)
 	for i := range files {
-		if files[i].Operation == "upsert" {
+		switch {
+		case files[i].Operation == "upsert":
 			states[files[i].ContentID] = &blobState{op: &files[i]}
+		case files[i].ContentID != "":
+			deleteIDs[files[i].ContentID] = true
 		}
 	}
 	var open *blobState // the file currently receiving chunks
@@ -1408,12 +1585,16 @@ func (s *server) wcStreamBlobs(w http.ResponseWriter, r *http.Request, lr *wcLin
 		}
 		var frame wcFrame
 		if err := json.Unmarshal(line, &frame); err != nil {
-			return fail(http.StatusBadRequest, "malformed NDJSON frame: "+err.Error())
+			return fail(http.StatusBadRequest, frameMsg(err))
 		}
 		switch {
 		case frame.BlobChunk != nil:
 			ch := frame.BlobChunk
 			st, ok := states[ch.ContentID]
+			if !ok && deleteIDs[ch.ContentID] && ch.Data == "" && ch.EOF && open == nil {
+				delete(deleteIDs, ch.ContentID)
+				continue
+			}
 			if !ok {
 				return fail(http.StatusBadRequest, "blob_chunk for unknown or non-upsert content_id "+ch.ContentID)
 			}
@@ -1672,7 +1853,7 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 		}
 		var frame wcFrame
 		if err := json.Unmarshal(line, &frame); err != nil {
-			wcFail(w, http.StatusBadRequest, "invalid", "malformed NDJSON frame: "+err.Error(), "", "")
+			wcFail(w, http.StatusBadRequest, "invalid", frameMsg(err), "", "")
 			return "", 0, false
 		}
 		if frame.DiffChunk == nil || frame.Metadata != nil || frame.BlobChunk != nil {
@@ -1688,11 +1869,14 @@ func (s *server) wcSpoolDiff(w http.ResponseWriter, lr *wcLineReader, sc *wcScra
 			wcFail(w, http.StatusBadRequest, "invalid", fmt.Sprintf("diff chunk exceeds %d bytes", wcMaxChunkBytes), "", "")
 			return "", 0, false
 		}
+		if total += int64(len(data)); total > wcMaxDiffBytes {
+			wcFail(w, http.StatusBadRequest, "invalid", fmt.Sprintf("diff exceeds %d bytes", wcMaxDiffBytes), "", "")
+			return "", 0, false
+		}
 		if _, err := f.Write(data); err != nil {
 			wcFail(w, http.StatusInternalServerError, "internal", internalErrorMsg, "", "")
 			return "", 0, false
 		}
-		total += int64(len(data))
 		chunks++
 		sawEOF = frame.DiffChunk.EOF
 	}
@@ -1745,8 +1929,12 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	// commit; the deprecated target_commit_sha stays a 40-hex sha.
 	revision := md.BaseRef != nil
 	md.applyCurrentNames()
-	if md.CommitMessage == "" {
-		md.CommitMessage = "Restore to " + md.TargetCommitSHA
+	// The default message names the target, which is checked below. A
+	// placeholder stands in until then, so that a NUL in the target is a
+	// problem of the target and not of commit_message.
+	defaultMessage := md.CommitMessage == ""
+	if defaultMessage {
+		md.CommitMessage = "Restore"
 	}
 	if err := wcValidateMetadata(md); err != nil {
 		wcFail(w, http.StatusBadRequest, "invalid", err.Error(), "", "")
@@ -1759,6 +1947,9 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	if !revision && !ref.ValidSHA(md.TargetCommitSHA) {
 		wcFail(w, http.StatusBadRequest, "invalid", "base_ref is required (or the deprecated 40-hex target_commit_sha)", "", "")
 		return
+	}
+	if defaultMessage {
+		md.CommitMessage = "Restore to " + md.TargetCommitSHA
 	}
 	plan, ok := s.wcPlanCommit(w, r, repo.RepoID, md)
 	if !ok {
@@ -1797,16 +1988,13 @@ func (s *server) handleRestoreCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	// The restore target must exist and be a commit; its tree becomes the
 	// new commit's tree verbatim.
-	// rev-parse --verify --quiet exits 1 for a target that names no commit.
-	// Any other failure (a fatal exit, a killed git) says nothing about the
-	// target.
-	tree, err := sc.resolveTree(r.Context(), target)
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-		writeProblem(w, http.StatusNotFound, codeRefNotFound, "restore target "+target+" not found")
-		return
-	} else if err != nil {
+	tree, found, err := sc.restoreTargetTree(r.Context(), target)
+	if err != nil {
 		s.wcInternal(w, r, "resolve restore target", err)
+		return
+	}
+	if !found {
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "restore target "+target+" not found")
 		return
 	}
 	if revision && !s.wcRestoreMoves(w, r, sc, md, plan, target, tree) {

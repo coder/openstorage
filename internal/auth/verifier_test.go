@@ -81,8 +81,8 @@ func TestVerify_KeySourceError(t *testing.T) {
 	v := NewVerifier(fakeKeySource{})
 	_, err := v.Verify(context.Background(), mustMint(t, key, "ES256", validClaims("acme")))
 	var kse *KeySourceError
-	if !errors.As(err, &kse) || kse.Org != "acme" || err.Error() != `issuer "acme": org not found` {
-		t.Fatalf("Verify = %v, want a KeySourceError for acme", err)
+	if !errors.As(err, &kse) || kse.Org != "acme" || err.Error() != `issuer "acme": keys unavailable` || kse.Err.Error() != "org not found" {
+		t.Fatalf("Verify = %v, want a KeySourceError for acme with fixed text over the store's error", err)
 	}
 	_, err = v.Verify(context.Background(), mustMint(t, key, "ES256", validClaims("ac\x00me")))
 	if err == nil || errors.As(err, &kse) {
@@ -92,6 +92,52 @@ func TestVerify_KeySourceError(t *testing.T) {
 	if !errors.As(err, &kse) || kse.Org != "ac\tme" {
 		t.Errorf("iss with a tab: Verify = %v, want the key lookup to run", err)
 	}
+}
+
+// TestVerify_KeyErrorsAreFixedText: the git and LFS transports show a client
+// the text of the error that Verify returns for a key failure. A key store's
+// error can name its database host, and a key parser's error names the key's
+// encoding, so the text of both errors is fixed and the cause stays behind
+// Unwrap, for a log.
+func TestVerify_KeyErrorsAreFixedText(t *testing.T) {
+	key := mustGenerateKey(t, "ES256")
+	tok := mustMint(t, key, "ES256", validClaims("acme"))
+	const canary = "dial tcp canary-db.internal:5432: connection refused"
+	storeErr := errors.New(canary)
+
+	t.Run("the key store fails", func(t *testing.T) {
+		_, err := NewVerifier(failingKeySource{err: storeErr}).Verify(context.Background(), tok)
+		var kse *KeySourceError
+		if !errors.As(err, &kse) || !errors.Is(err, storeErr) {
+			t.Fatalf("Verify = %T %v, want a KeySourceError over the store's error", err, err)
+		}
+		if err.Error() != `issuer "acme": keys unavailable` || strings.Contains(err.Error(), "canary") {
+			t.Fatalf("error text %q is not the fixed text", err)
+		}
+	})
+
+	t.Run("a registered key does not parse", func(t *testing.T) {
+		for _, pem := range []string{"junk", "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"} {
+			good := mustPublicPEM(t, key)
+			for _, pems := range [][]string{{pem}, {good, pem}} {
+				_, err := NewVerifier(fakeKeySource{"acme": pems}).Verify(context.Background(), tok)
+				var ske *StoredKeyError
+				if !errors.As(err, &ske) || ske.Org != "acme" || ske.Err == nil {
+					t.Fatalf("keys %q: Verify = %T %v, want a StoredKeyError", pems, err, err)
+				}
+				if err.Error() != `issuer "acme": a registered key cannot be used` {
+					t.Fatalf("keys %q: error text %q is not the fixed text", pems, err)
+				}
+			}
+		}
+	})
+}
+
+// failingKeySource answers every lookup with err.
+type failingKeySource struct{ err error }
+
+func (f failingKeySource) PublicKeysForOrg(context.Context, string) ([]string, error) {
+	return nil, f.err
 }
 
 // TestVerify_AlgorithmMatrix covers each allowed algorithm: a token signed
@@ -492,8 +538,11 @@ func TestVerify_RejectsWeakRSAKeySource(t *testing.T) {
 				source["acme"] = pems
 				for _, token := range []string{weakToken, strongToken} {
 					claims, err := v.Verify(t.Context(), token)
-					if err == nil || claims != nil || !strings.Contains(err.Error(), "minimum 2048") {
-						t.Fatalf("Verify returned claims=%v, err=%v; want RSA minimum error", claims, err)
+					// The text of a stored key's error is for the log: it
+					// is behind Unwrap, and Error is fixed text.
+					var ske *StoredKeyError
+					if err == nil || claims != nil || !errors.As(err, &ske) || !strings.Contains(ske.Err.Error(), "minimum 2048") {
+						t.Fatalf("Verify returned claims=%v, err=%v; want a StoredKeyError over the RSA minimum error", claims, err)
 					}
 				}
 			}

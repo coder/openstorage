@@ -9,7 +9,7 @@ updates use compare-and-swap; several response details are load-bearing for clie
 ```
 Organization (org)                     ← tenant; from subdomain + JWT `iss`
  └── Repository
-      ├── repo_id: string             ← internal ID (e.g. "repo_7f2b3d9" / UUID)
+      ├── repo_id: string             ← internal ID (server-generated: `repo_` and 12 hex digits, e.g. "repo_761aac427fd3")
       ├── url: string                 ← client-facing URL path; may contain slashes ("team/project"); the value used in the JWT `repo` claim
       ├── default_branch: string      ← defaults to "main"
       ├── created_at: ISO-8601 string
@@ -39,7 +39,7 @@ Organization (org)                     ← tenant; from subdomain + JWT `iss`
 |---|---|---|
 | persistent | `{repo_id}.git` | normal branches/tags/notes; triggers webhooks + upstream sync |
 | ephemeral  | `{repo_id}+ephemeral.git` | disposable branches; never mirrored/synced upstream; default-branch protection does not apply; promotable to persistent |
-| import     | `{repo_id}+import.git` | bulk ingestion; pushed objects go (per official docs) to immediate cold archival |
+| import     | `{repo_id}+import.git` | push only; an import push writes normal branches and tags; refused for synced repos ([details](git-protocol-and-namespaces.md#import-remote)) |
 
 The API addresses ephemeral refs with boolean flags, not ref names: `ephemeral`,
 `ephemeral_base`, `base_is_ephemeral`, `target_is_ephemeral`, `source_is_ephemeral`. To

@@ -271,6 +271,46 @@ func TestRunTimeBudgetKillsAndReapsGit(t *testing.T) {
 	b.Close()
 }
 
+// A request canceled while its git runs is a cancellation: Run kills git
+// for it and reports the context's error, never the kill as git's own
+// failure (a *GitError for "signal: killed"). The test cancels only after
+// git printed, so git is running then. git's stderr reads like a heap
+// failure, so the cancellation also comes before a limit outcome. A
+// request canceled before git starts is a cancellation too.
+func TestRunCanceledRequestIsACancellation(t *testing.T) {
+	fakeGit(t, `echo "fatal: Out of memory, malloc failed (tried to allocate 1 bytes)" >&2; echo ready; exec sleep 30`)
+	released := make(chan struct{})
+	close(released)
+	for _, budgeted := range []bool{false, true} {
+		for _, early := range []bool{false, true} {
+			t.Run(fmt.Sprintf("budget=%v/before start=%v", budgeted, early), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if budgeted {
+					b := testBudget(NewSlots(1, 1, 0), time.Minute, DefaultOutputBytes)
+					t.Cleanup(b.Close)
+					ctx = WithBudget(ctx, b)
+				}
+				out := &blockingWriter{entered: make(chan struct{}), release: released}
+				if early {
+					cancel()
+				} else {
+					go func() {
+						<-out.entered // git printed: it runs
+						cancel()
+					}()
+				}
+				_, err := Run(ctx, Cmd{Class: Heavy, Dir: t.TempDir(), Stdout: out, Args: []string{"cat-file", "--batch"}})
+				var gitErr *GitError
+				if !errors.Is(err, context.Canceled) || errors.As(err, &gitErr) || IsBudgetError(err) {
+					t.Fatalf("err = %v, want the cancellation, not a git failure or a limit", err)
+				}
+				assertNoChildren(t)
+			})
+		}
+	}
+}
+
 func TestRunBusyFailsBeforeStartingGit(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "ran")
 	fakeGit(t, "echo x >> "+marker)

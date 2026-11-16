@@ -239,3 +239,159 @@ func TestUnquoteGitPathRejectsMalformedQuoting(t *testing.T) {
 		}
 	}
 }
+
+// blameCommitTree commits a tree of the given "<mode> <type> <oid>" entries
+// (mktree -z, so a name may hold a newline) and returns the commit.
+func blameCommitTree(t *testing.T, dir string, entries map[string]string) string {
+	t.Helper()
+	var in strings.Builder
+	for name, entry := range entries {
+		in.WriteString(entry + "\t" + name + "\x00")
+	}
+	mk := exec.Command("git", "mktree", "-z")
+	mk.Dir = dir
+	mk.Env = append(os.Environ(), gitEnv...)
+	mk.Stdin = strings.NewReader(in.String())
+	tree, err := mk.Output()
+	if err != nil {
+		t.Fatalf("git mktree: %v", err)
+	}
+	return strings.TrimSpace(mustGit(t, dir, "commit-tree", strings.TrimSpace(string(tree)), "-m", "c"))
+}
+
+// git names a missing or unreadable file "fatal: no such path <path> in
+// <commit>", so a path that holds a newline and "fatal: -L " puts a line
+// that starts "fatal: -L " in that message. It is not a bad range: the
+// missing path is not found, and the unreadable one is git's failure.
+// The same name with a range past its end is a bad range.
+func TestBlameRangeTextInAPathIsNotARangeError(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--bare")
+	src := filepath.Join(t.TempDir(), "f")
+	writeFile(t, filepath.Dir(src), "f", "l1\nl2\nl3\n", 0o644)
+	blob := strings.TrimSpace(mustGit(t, dir, "hash-object", "-w", src))
+	name := "x\nfatal: -L y"
+	commit := blameCommitTree(t, dir, map[string]string{name: "100644 blob " + blob})
+	ctx := context.Background()
+	if _, err := Blame(ctx, dir, commit, "x\nfatal: -L y2", []string{"1,2"}, false); !errors.Is(err, ErrNotFound) {
+		t.Errorf("missing path with forged -L text: err = %v, want ErrNotFound", err)
+	}
+	if _, err := Blame(ctx, dir, commit, name, []string{"9,10"}, false); !errors.Is(err, ErrBadRange) {
+		t.Errorf("range past the end: err = %v, want ErrBadRange", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "objects", blob[:2], blob[2:])); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Blame(ctx, dir, commit, name, []string{"1,2"}, false)
+	if err == nil || errors.Is(err, ErrBadRange) || errors.Is(err, ErrNotFound) {
+		t.Errorf("unreadable file with forged -L text: err = %v, want git's failure", err)
+	}
+}
+
+// failingBlameGit puts a git first on PATH that runs the real git, except
+// that a call with any of the given arguments prints stderr and exits
+// with code.
+func failingBlameGit(t *testing.T, code int, stderr string, args ...string) {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+	var match []string
+	for _, a := range args {
+		match = append(match, quote(a))
+	}
+	// printf and [ are builtins: some git children run without PATH.
+	fakeGit(t, fmt.Sprintf("for a in \"$@\"; do for m in %s; do [ \"$a\" = \"$m\" ] && { printf '%%s' %s >&2; exit %d; }; done; done\nexec %s \"$@\"",
+		strings.Join(match, " "), quote(stderr), code, quote(real)))
+}
+
+// Only git's exit 129, or exit 128 with a fixed head at the start of
+// stderr, is a bad range; anything else ls-tree decides, and a.txt is a
+// file there, so the failure is git's.
+func TestBlameRangeFailureReadsOnlyGitsHead(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		name, stderr string
+		code         int
+		bad          bool
+	}{
+		{"-L head", "fatal: -L invalid line number: 0", 128, true},
+		{"-L head, range text with a newline", "fatal: -L parameter 'a\nb' starting at line 1: No match", 128, true},
+		{"usage", "usage: git blame", 129, true},
+		{"short file", "fatal: file README.md has only 1 line", 128, true},
+		{"short file, path with a newline", "fatal: file x\ny has only 2 lines", 128, true},
+		{"-L line after another head", "fatal: no such path x\nfatal: -L y in 1111", 128, false},
+		{"-L head after a warning", "warning: unable to access '/root/.config/git/attributes': Permission denied\nfatal: -L invalid line number: 0", 128, true},
+		{"short file after two warnings", "warning: a\nwarning: b\nfatal: file README.md has only 1 line", 128, true},
+		{"-L line after a warning and another head", "warning: a\nfatal: no such path x\nfatal: -L y in 1111", 128, false},
+		{"warnings only", "warning: a\nwarning: fatal: -L y", 128, false},
+		{"short file after a two-line warning and an error", "warning: Negative patterns are ignored in git attributes\nUse '\\!' for literal leading exclamation.\nerror: is not a valid attribute name: .gitattributes:2\nfatal: file README.md has only 1 line", 128, true},
+		{"-L line after an error and another head", "error: a\nfatal: no such path x\nfatal: -L y in 1111", 128, false},
+		{"-L head with exit 130", "fatal: -L invalid line number: 0", 130, false},
+		{"short file with exit 130", "fatal: file README.md has only 1 line", 130, false},
+		{"short file without a number", "fatal: file README.md has only  line", 128, false},
+		{"short-file tail after another head", "fatal: unable to read x has only 1 line", 128, false},
+		{"short-file line after another line", "fatal: unable to read x\nfatal: file y has only 1 line", 128, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failingBlameGit(t, tc.code, tc.stderr, "blame")
+			_, err := Blame(context.Background(), f.dir, f.c1, "README.md", []string{"1,2"}, false)
+			if got := errors.Is(err, ErrBadRange); got != tc.bad || err == nil || errors.Is(err, ErrNotFound) {
+				t.Errorf("err = %v, ErrBadRange = %v, want %v", err, got, tc.bad)
+			}
+		})
+	}
+}
+
+// After a failed blame, ls-tree decides "not found": a symlink is a file,
+// a submodule is not, and a failed ls-tree is git's failure, not a
+// missing path.
+func TestBlameNotFoundIsDecidedByLsTree(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "a.txt", "one\n", 0o644)
+	if err := os.Symlink("a.txt", filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c")
+	head := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+head+",sub")
+	mustGit(t, dir, "commit", "-q", "-m", "submodule")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	ctx := context.Background()
+
+	if _, err := Blame(ctx, dir, commit, "sub", nil, false); !errors.Is(err, ErrNotFound) {
+		t.Errorf("blame of a submodule: err = %v, want ErrNotFound", err)
+	}
+	t.Run("symlink", func(t *testing.T) {
+		failingBlameGit(t, 128, "fatal: unable to read 1111", "blame")
+		if _, err := Blame(ctx, dir, commit, "link", nil, false); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("failed blame of a symlink: err = %v, want git's failure", err)
+		}
+	})
+	t.Run("second ls-tree fails", func(t *testing.T) {
+		failingBlameGit(t, 128, "fatal: unable to read 1111", "blame", ":(literal)a.txt/")
+		if _, err := Blame(ctx, dir, commit, "a.txt", nil, false); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("failed blame and ls-tree of a.txt/: err = %v, want git's failure", err)
+		}
+	})
+}
+
+// A repository whose .gitattributes git warns about (a negative pattern,
+// over two lines, and a bad attribute name) still answers a range past the
+// end of the file as a bad range.
+func TestBlameRangeErrorAfterAttributeWarnings(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, ".gitattributes", "!neg diff\nfoo error:\n", 0o644)
+	writeFile(t, dir, "a.txt", "one\ntwo\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "c")
+	commit := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	if _, err := Blame(context.Background(), dir, commit, "a.txt", []string{"9,10"}, false); !errors.Is(err, ErrBadRange) {
+		t.Fatalf("range past the end: err = %v, want ErrBadRange", err)
+	}
+}

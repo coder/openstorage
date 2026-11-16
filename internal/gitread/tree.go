@@ -308,8 +308,8 @@ func CatBlobTo(ctx context.Context, repoPath, sha string, w io.Writer) error {
 // ReadSymlinkTarget returns the target of the symlink whose blob is sha, size
 // bytes long as the tree lists it. A target over MaxSymlinkTarget fails with
 // ErrSymlinkTooLong. A listed size over the limit fails before git starts. A
-// blob that git prints longer than it was listed (a replacement object that
-// appeared since) ends git after MaxSymlinkTarget+1 bytes, so the read holds at
+// blob that git prints longer than it was listed (a broken object store: git
+// reads no replacement objects) ends git after MaxSymlinkTarget+1 bytes, so the read holds at
 // most 4 KiB whatever the blob is; file streaming goes through CatBlobTo. The
 // target does not count against the output allowance, which the bound replaces.
 func ReadSymlinkTarget(ctx context.Context, repoPath, sha string, size int64) (string, error) {

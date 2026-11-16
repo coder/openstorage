@@ -28,10 +28,11 @@ import (
 )
 
 // A repo URL element is a base repo name optionally followed by one
-// namespace suffix, `+ephemeral` or `+import` (docs/explanation/git-protocol-and-namespaces.md). Namespaced repos
-// use fully separate ref stores, pack spaces, and cache dirs keyed by the
-// full name — docs/explanation/git-protocol-and-namespaces.md allows "git namespaces or separate ref stores", and
-// separate stores give the required isolation for free.
+// namespace suffix, `+ephemeral` or `+import` (docs/explanation/git-protocol-and-namespaces.md). The ephemeral
+// namespace uses a fully separate ref store, pack space, and cache dir keyed
+// by the full name — docs/explanation/git-protocol-and-namespaces.md allows "git namespaces or separate ref stores", and
+// separate stores give the required isolation for free. The push-only
+// `+import` remote keys the base repo (resolveTarget).
 var repoNameRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*(\+(ephemeral|import))?\z`)
 
 // ValidRepoName guards against path traversal via the URL repo element.
@@ -3748,6 +3749,15 @@ var ErrHeldRefStale = errors.New("a push holds a ref whose cached value is older
 // Hold and marker handling is the same in both modes.
 func hydrateRefs(ctx context.Context, st ref.RefStore, bl blob.BlobStore, cacheDir, repo, defaultBranch string, strictHeld bool) (repoPath string, refsErr error, err error) {
 	headTarget := HeadTarget(defaultBranch)
+	if hiddenOnRemote(repo, headTarget) {
+		// git advertises HEAD and its symref whatever HEAD points at, so a
+		// HEAD on a ref that the persistent remote hides (an earlier
+		// version, an older replica or a sync could store such a default)
+		// would show that ref's name and commit. Point it at the same name
+		// under refs/heads/ instead, which normally does not exist: the
+		// remote then advertises no HEAD.
+		headTarget = "refs/heads/" + headTarget
+	}
 	repoPath, err = EnsureCacheRepoCtx(ctx, cacheDir, repo)
 	if err != nil {
 		return "", nil, err

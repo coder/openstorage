@@ -120,3 +120,75 @@ func TestDiffPatchesApplyCleanly(t *testing.T) {
 		t.Fatalf("git apply --check failed: %v\n%s\npatch:\n%s", err, out, concat.String())
 	}
 }
+
+// A type change (T) is one --raw and one --numstat record, and two
+// --patch sections, a deletion and an addition: the file's patch holds
+// both, the file after it keeps its own, and the patches apply.
+func TestDiffTypeChange(t *testing.T) {
+	dir := t.TempDir()
+	mustGit(t, dir, "init", "-q", "--initial-branch=main")
+	writeFile(t, dir, "typefile", "one\n", 0o644)
+	writeFile(t, dir, "filetosub", "two\n", 0o644)
+	writeFile(t, dir, "keep", "x\n", 0o644)
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "commit", "-q", "-m", "files")
+	files := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	if err := os.Remove(filepath.Join(dir, "typefile")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("keep", filepath.Join(dir, "typefile")); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "rm", "-q", "--cached", "filetosub")
+	if err := os.Remove(filepath.Join(dir, "filetosub")); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, dir, "update-index", "--add", "--cacheinfo", "160000,"+files+",filetosub")
+	writeFile(t, dir, "keep", "x\ny\n", 0o644)
+	mustGit(t, dir, "add", "typefile", "keep")
+	mustGit(t, dir, "commit", "-q", "-m", "a symlink and a submodule")
+	other := strings.TrimSpace(mustGit(t, dir, "rev-parse", "HEAD"))
+	for _, tc := range []struct {
+		name, base, target string
+		oldMode, newMode   [2]string // typefile's, filetosub's
+	}{
+		{"to a symlink and a submodule", files, other, [2]string{"100644", "100644"}, [2]string{"120000", "160000"}},
+		{"back to files", other, files, [2]string{"120000", "160000"}, [2]string{"100644", "100644"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, stats, err := Diff(context.Background(), dir, tc.base, tc.target, DiffOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := diffByPath(got)
+			if len(got) != 3 || stats.Files != 3 || m["keep"].Status != "M" || !strings.HasPrefix(m["keep"].Patch, "diff --git a/keep b/keep\n") || strings.Count(m["keep"].Patch, "diff --git ") != 1 {
+				t.Fatalf("files = %+v, want filetosub, keep (M, its own patch) and typefile", got)
+			}
+			for i, path := range []string{"typefile", "filetosub"} {
+				d := m[path]
+				if d.Status != "T" || d.Additions != 1 || d.Deletions != 1 || d.Binary {
+					t.Errorf("%s = %+v, want T with 1 addition and 1 deletion", path, d)
+				}
+				header := "diff --git a/" + path + " b/" + path + "\n"
+				del := header + "deleted file mode " + tc.oldMode[i] + "\n"
+				add := header + "new file mode " + tc.newMode[i] + "\n"
+				if !strings.HasPrefix(d.Patch, del) || strings.Count(d.Patch, header) != 2 || !strings.Contains(d.Patch, "\n"+add) {
+					t.Errorf("%s patch = %q, want its deletion, then its addition", path, d.Patch)
+				}
+			}
+			var all strings.Builder
+			for _, d := range got {
+				all.WriteString(d.Patch)
+			}
+			work := t.TempDir()
+			mustGit(t, work, "init", "-q")
+			mustGit(t, work, "fetch", "-q", dir, tc.base)
+			mustGit(t, work, "read-tree", "FETCH_HEAD")
+			cmd := exec.Command("git", "apply", "--cached", "--check")
+			cmd.Dir, cmd.Stdin = work, strings.NewReader(all.String())
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git apply --cached --check: %v\n%s", err, out)
+			}
+		})
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -112,13 +113,19 @@ func mustClaims(r *http.Request) *auth.Claims {
 // refPolicies parses the token's ref-policy claims the same way the git
 // update hook does (docs/reference/authentication.md): the ordered `refs` tuples with the deprecated
 // repo-wide `ops` claim folded in exactly once. Malformed claims fail
-// closed — callers must map the error to 403.
+// closed — callers must map the error to 403. The error is an
+// *auth.MalformedError, whose text a caller may show a client. The
+// decoder's text goes to the log here: a registered key signed the claim,
+// so the operator who minted the token can fix it.
 func refPolicies(claims *auth.Claims) ([]auth.RefPolicy, error) {
 	var policies []auth.RefPolicy
 	if len(claims.Refs) > 0 {
 		var err error
 		policies, err = auth.ParseRefPolicies(string(claims.Refs))
 		if err != nil {
+			var bad *auth.MalformedError
+			assertf(errors.As(err, &bad), "ParseRefPolicies returned %T, not *auth.MalformedError", err)
+			slog.Warn("token refs claim does not parse", "iss", claims.Iss, "repo", claims.Repo, "err", bad.Err)
 			return nil, err
 		}
 	}
@@ -145,12 +152,19 @@ func policyDeniesRepoDelete(policies []auth.RefPolicy) (string, bool) {
 // alphanumeric, then alphanumerics plus . _ - (docs/reference/http-api.md: invalid input -> 400).
 var branchComponentRe = regexp.MustCompile(`\A[A-Za-z0-9][A-Za-z0-9._-]*\z`)
 
+// maxBranchLastPartBytes is NAME_MAX (255) minus len(".lock"): git locks a
+// ref at <last part>.lock.
+const maxBranchLastPartBytes = 255 - len(".lock")
+
 // validBranchName reports whether name is an acceptable branch/tag name:
 // slash-separated conservative ref components, no "..", no ".lock" suffix,
 // no trailing dot. Within this charset those are exactly git's own
 // check-ref-format rules — every accepted name must survive as a real ref,
 // because stored default branches now drive `symbolic-ref HEAD` on every
 // hydrate (issue #18) and a git-rejected name would poison hydration.
+// A name that the API writes must also pass validNewBranchName. Lookups
+// and deletes take this rule alone, so a ref that an older version wrote
+// can still be deleted.
 func validBranchName(name string) bool {
 	if name == "" || len(name) > 255 || strings.Contains(name, "..") {
 		return false
@@ -161,6 +175,66 @@ func validBranchName(name string) bool {
 			return false
 		}
 	}
+	return true
+}
+
+// validNewBranchName reports whether the API can write a ref under name:
+// validBranchName, and a last part that leaves room for git's ".lock" file
+// within the 255-byte file-name limit. A longer last part makes every
+// hydration fail ("cannot lock ref"), so the repository's git reads
+// answer 500 until the ref is deleted.
+func validNewBranchName(name string) bool {
+	return validBranchName(name) && len(name[strings.LastIndexByte(name, '/')+1:]) <= maxBranchLastPartBytes
+}
+
+// validDefaultBranch reports whether branch can be a repository's default
+// branch: a branch name, or its refs/heads/-qualified spelling. Any other
+// refs/ name is refused: the default names a branch. (Hydration points a
+// persistent repository's HEAD away from a hidden refs/namespaces/ default.)
+func validDefaultBranch(branch string) bool {
+	short := strings.TrimPrefix(branch, "refs/heads/")
+	return !strings.HasPrefix(short, "refs/") && validNewBranchName(short)
+}
+
+// defaultBranchProblem returns the 400 problem of a default branch that is
+// not valid, or nil. It names the body field at path. The query parameter
+// and the source repository's branch (path "") have no body field to name.
+func defaultBranchProblem(branch, path string) error {
+	if validDefaultBranch(branch) {
+		return nil
+	}
+	if path == "" {
+		return errors.New("invalid default_branch")
+	}
+	return newFieldError(path, "is not a valid branch name", "invalid default_branch")
+}
+
+// bodyBranchProblem returns the problem of the default branch that the body
+// of a create names: top for its default_branch, or base for the
+// base_repo's, which a create uses only when the body has no default_branch
+// of its own. The query parameter is no body field and is not part of it.
+// At most one of the two is not nil.
+func bodyBranchProblem(req *createRepoRequest, spec *usyncBaseRepo) (top, base error) {
+	switch {
+	case req.DefaultBranch != "":
+		return defaultBranchProblem(req.DefaultBranch, "default_branch"), nil
+	case spec != nil && spec.DefaultBranch != "":
+		return nil, defaultBranchProblem(spec.DefaultBranch, "base_repo.default_branch")
+	}
+	return nil, nil
+}
+
+// writeBodyErrors writes the 400 for the problems of a create body (in the
+// order of the docs) and reports whether it did. A held problem that is the
+// only one is not reported here: the default branch check of a create runs
+// after checks of state (a ref policy, a source repository), and a request
+// with that one problem keeps the answer of the first of them.
+func writeBodyErrors(w http.ResponseWriter, errs *bodyErrors, held ...error) bool {
+	err := errs.err()
+	if err == nil || (len(errs.errs) == 1 && errs.dropped == 0 && slices.Contains(held, errs.errs[0])) {
+		return false
+	}
+	writeInvalid(w, err.Error(), err)
 	return true
 }
 
@@ -316,7 +390,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	var req createRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -343,7 +417,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	if branch == "" {
 		branch = "main"
 	}
-	if !validBranchName(branch) {
+	if !validDefaultBranch(branch) {
 		if req.DefaultBranch == "" { // the query parameter: no body field to name
 			writeErr(w, http.StatusBadRequest, "invalid default_branch")
 		} else {
@@ -413,9 +487,9 @@ func (s *server) handleGetRepo(w http.ResponseWriter, r *http.Request) {
 // validBranchName, which already refuses every name we know git refuses
 // (a trailing dot, "..", ".lock"); git's own verdict guards against a rule
 // validBranchName misses, because hydration later runs `symbolic-ref HEAD
-// <target>` with the stored name. Only git's exit 1 means
-// that git rejects the name. Any other failure (a killed git, a failed
-// exec) says nothing about the name and is returned.
+// <target>` with the stored name. Only git's exit 1 means that git
+// rejects the name. Any other failure (a killed git, a failed exec) says
+// nothing about the name and is returned.
 func validRefFormat(ctx context.Context, target string) (bool, error) {
 	assertf(strings.HasPrefix(target, "refs/"), "validRefFormat: unqualified target %q", target)
 	err := gitlimit.Run(exec.CommandContext(ctx, "git", "check-ref-format", target))
@@ -497,7 +571,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	var req patchRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -516,13 +590,16 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// upstream's field is, by name and description, a branch. The derived
 	// HEAD target must also satisfy git's own ref-format rules, which git
 	// checks after validBranchName (that check already refuses the rules
-	// we know of, such as a trailing dot): hydration runs `symbolic-ref HEAD <target>` on every node, and a
-	// persisted target git rejects would break the repo's git/read
-	// surface until another PATCH repairs the row.
-	target := githttp.HeadTarget(branch)
-	shortName := strings.TrimPrefix(branch, "refs/heads/")
-	valid := !strings.HasPrefix(shortName, "refs/") && validBranchName(shortName)
+	// we know of, such as a trailing dot): hydration runs `symbolic-ref
+	// HEAD <target>` on every node, and a persisted target git rejects
+	// would break the repo's git/read surface until another PATCH repairs
+	// the row.
+	valid := validDefaultBranch(branch)
+	var target string
 	if valid {
+		// HeadTarget asserts that the name has no whitespace, so it runs
+		// only for a name that validDefaultBranch accepted.
+		target = githttp.HeadTarget(branch)
 		var err error
 		if valid, err = validRefFormat(r.Context(), target); err != nil {
 			s.internalErr(w, r, "check default_branch with git", err)
@@ -636,9 +713,16 @@ func (s *server) handleListRepos(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
+	q, prefix := strings.TrimSpace(query.Get("q")), strings.TrimSpace(query.Get("prefix"))
+	for _, f := range []struct{ name, value string }{{"q", q}, {"prefix", prefix}} {
+		if !meta.ValidText(f.value) {
+			writeErr(w, http.StatusBadRequest, invalidTextMsg(f.name))
+			return
+		}
+	}
 	res, err := s.store.ListRepos(r.Context(), claims.Iss, meta.ListParams{
-		Q:      strings.TrimSpace(query.Get("q")),
-		Prefix: strings.TrimSpace(query.Get("prefix")),
+		Q:      q,
+		Prefix: prefix,
 		Cursor: query.Get("cursor"),
 		Limit:  limit,
 	})

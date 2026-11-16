@@ -40,6 +40,11 @@ A token is a compact JWS: three segments (header, payload, signature) separated 
 - Standard JWT libraries emit this form, including the ones the SDKs use (`jose`, PyJWT,
   golang-jwt). Earlier versions accepted other spellings; a hand-built token that relies
   on one must be reissued.
+- The decoded header must be exactly one JSON object, with no byte before or after it,
+  whitespace included. Any other spelling fails verification (see
+  [Failure mapping](#failure-mapping)), even when the signature covers the object alone.
+  Earlier versions accepted extra bytes around the object in that case. A hand-built token
+  that relies on that must be reissued.
 - Canonical encoding does not provide replay protection or make token text a unique
   credential identity. For example, an ECDSA signature has a second valid form with
   different bytes.
@@ -88,6 +93,13 @@ PS256. ECDSA (P-256/384/521) and Ed25519 are unaffected.
 ```
 
 - `repo` carries the repository **url** value (what `GET /api/repo-urls/{repo_id}` returns).
+- A `repo` that holds a NUL byte names no new repository: `POST /repos` answers `400`
+  (`invalid repo claim (want UTF-8 text without NUL)`). PostgreSQL cannot store such
+  text, so there the repository endpoints answer `404` for such a claim, and the git
+  surface `403`, as for any claim that names no repository. A repository that SQLite
+  or S3-WAL created for such a claim before this check keeps working with that claim,
+  except that a repeat `POST /repos` for it answers `400`. `POST /repos/pull-upstream`
+  still finishes a pending sync create of it.
 - A token with no `repo` claim is org-wide and behaves exactly like `repo: "org"`:
   org-scoped endpoints accept it, and repository endpoints and the git surface refuse it
   with `403`. A `repo` that is present but empty (`""` or `null`) is not org-wide: every
@@ -142,6 +154,11 @@ Encoding: a JSON array of `[pattern, ops]` 2-element tuples. Evaluation:
 Ops apply to git receive-pack **and** every HTTP write endpoint. They are the only
 branch-protection mechanism; there is no server-side protection config.
 
+Policy checks read each object as itself: they run git with
+`GIT_NO_REPLACE_OBJECTS=1`, so a `refs/replace/*` ref, which any token with
+`git:write` can push, changes neither the ancestry that `no-force-push` reads nor the
+commits and signatures that `verify-sig` reads.
+
 ## Failure mapping
 
 | Condition | Status |
@@ -149,10 +166,12 @@ branch-protection mechanism; there is no server-side protection config.
 | REST API: no `Authorization` header, or a scheme other than `Bearer` | 401 `unauthorized` (`Authentication required`) |
 | Git transport: no Basic auth with the user `t`. LFS transport: neither that nor an `Authorization: Bearer` token | 401 |
 | the token fails verification (malformed, bad signature, expired, unknown issuer) | REST API: 403 `forbidden` (`Invalid or expired token`), as upstream answers. Git and LFS transports: 401, so that git asks for credentials ([deviation](../explanation/wire-compatibility.md#known-deviations-from-the-vendored-spec)) |
+| the token's header has a `crit` member of any value, even when the signature is valid (RFC 7515 §4.1.11: a recipient refuses an extension that it does not understand, and the server understands none) | the same as a token that fails verification, in the row above |
 | a verified token issued for another organization | 403 `forbidden`; the REST detail is `Credential is not valid for this tenant` |
 | the key store fails while the server verifies the token | REST API, fork source tokens included: 403 `authentication_unavailable` (retry). Git and LFS transports: 401, as for an invalid token |
 | valid token, insufficient scope or ref policy denies | 403 |
 | `repo` claim mismatch with target | 403 (do not leak existence: 404 acceptable per vendor error-string instability) |
+| a `refs` claim that does not parse | 403 on the endpoints that check ref policies, and the push hook refuses a push |
 
 Error body: `{"error": "<message>"}` plus the problem-details fields described under
 [HTTP API conventions](http-api.md#conventions) (`type`, `title`, `status`, a generic

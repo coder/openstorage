@@ -52,6 +52,15 @@ func TestRepoURLByID(t *testing.T) {
 		}
 		requireEnvelope(t, resp, body)
 
+		// 404, not 500: no id holds a NUL or invalid UTF-8.
+		for _, id := range []string{"a%00b", "a%FFb"} {
+			resp, body = e.doReq(t, http.MethodGet, "/api/repo-urls/"+id, orgTok, nil, "")
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("id %s = %d (%s), want 404", id, resp.StatusCode, body)
+			}
+			requireEnvelope(t, resp, body)
+		}
+
 		// 404: a valid id from another org must be invisible.
 		otherOrg := e.newOrg(t)
 		otherTok := e.mint(t, tokenSpec{iss: otherOrg, repo: auth.RepoClaimOrg, scopes: []string{auth.ScopeOrgRead}})

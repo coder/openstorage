@@ -16,12 +16,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -165,6 +168,17 @@ func wmParents(t *testing.T, e *testEnv, repoID, commitSHA string) []string {
 	return strings.Fields(out)
 }
 
+// wmMessage returns the full message of a commit from the
+// (re-)materialized cache repo, without its final newlines.
+func wmMessage(t *testing.T, e *testEnv, repoID, commitSHA string) string {
+	t.Helper()
+	repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, repoID, "main")
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	return strings.TrimRight(coreGit(t, repoPath, "log", "-1", "--format=%B", commitSHA), "\n")
+}
+
 // wmTargets are the pre-seeded target branches (all at the main tip c2) so
 // mutation tests stay independent of each other.
 var wmTargets = []string{
@@ -173,6 +187,7 @@ var wmTargets = []string{
 	"t-pol-nopush", "t-pol-nff", "t-pol-vs-ff", "t-pol-vs-merge",
 	"t-alias-ref", "t-alias-refsheads", "t-alias-both",
 	"t-pin-ff", "t-pin-merge", "t-pin-alias",
+	"t-squash-nomsg", "t-defmsg", "t-defmsg-ref",
 }
 
 // wmFixture is one seeded repo for the merge tests.
@@ -538,7 +553,7 @@ func TestMergeStrategies(t *testing.T) {
 		t.Run("squash collapses to a single-parent commit", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
 				wmMergeBody("multi", "t-squash", "merge", map[string]any{
-					"squash": true, "author": wmTestAuthor,
+					"squash": true, "author": wmTestAuthor, "commit_message": "squash msg",
 				}))
 			body := wmDecode(t, raw)
 			if resp.StatusCode != http.StatusOK || body["result"] != "squash" {
@@ -554,6 +569,48 @@ func TestMergeStrategies(t *testing.T) {
 				rresp, rbody := e.doReq(t, http.MethodGet, "/api/v1/repos/file?path="+f+"&ref=t-squash", fx.token, nil, "")
 				if rresp.StatusCode != http.StatusOK {
 					t.Errorf("read %s = %d %q", f, rresp.StatusCode, rbody)
+				}
+			}
+			if msg := wmMessage(t, e, fx.repoID, commit); msg != "squash msg" {
+				t.Errorf("squash message = %q, want %q", msg, "squash msg")
+			}
+		})
+
+		// Spec 5d8e1801 (#807): squash requires commit_message. Without
+		// one the merge answers 400 before it reads any branch.
+		t.Run("squash needs commit_message", func(t *testing.T) {
+			for _, extra := range []map[string]any{
+				{"squash": true, "author": wmTestAuthor},
+				{"squash": true, "author": wmTestAuthor, "commit_message": ""},
+			} {
+				resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, wmMergeBody("multi", "t-squash-nomsg", "ff_prefer", extra))
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, body %s, want 400", resp.StatusCode, raw)
+				}
+				if msg := wmProblem(t, resp, raw); msg != "commit_message is required with squash" {
+					t.Fatalf("error = %q", msg)
+				}
+				if body := wmDecode(t, raw); body["code"] != "bad_request" {
+					t.Fatalf("code = %v, want bad_request", body["code"])
+				}
+			}
+			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-squash-nomsg"]; got != fx.c2 {
+				t.Fatalf("t-squash-nomsg moved to %q", got)
+			}
+		})
+
+		// Spec 5d8e1801 (#807): a merge commit without commit_message gets
+		// git's form, with the branch names of the request.
+		t.Run("default merge message", func(t *testing.T) {
+			for source, target := range map[string]string{"feature": "t-defmsg", "refs/heads/ffsrc": "t-defmsg-ref"} {
+				body := map[string]any{"source_ref": source, "target_branch": target, "strategy": "merge", "author": wmTestAuthor}
+				resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
+				if resp.StatusCode != http.StatusOK || wmDecode(t, raw)["result"] != "merge_commit" {
+					t.Fatalf("%s: status %d body %s", source, resp.StatusCode, raw)
+				}
+				want := "Merge branch '" + strings.TrimPrefix(source, "refs/heads/") + "' into " + target
+				if msg := wmMessage(t, e, fx.repoID, wmDecode(t, raw)["commit_sha"].(string)); msg != want {
+					t.Errorf("%s: message = %q, want %q", source, msg, want)
 				}
 			}
 		})
@@ -701,6 +758,17 @@ func TestMergeEphemeral(t *testing.T) {
 			}
 		})
 
+		t.Run("persistent HEAD target passes validation", func(t *testing.T) {
+			// Only an ephemeral target named HEAD is refused (400). A
+			// persistent one reaches the target lookup, which finds no
+			// such branch in this fixture.
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("feature", "HEAD", "ff_prefer", nil))
+			if resp.StatusCode != http.StatusNotFound || !strings.Contains(string(raw), "target branch HEAD not found") {
+				t.Fatalf("status %d body %s, want 404 target branch HEAD not found", resp.StatusCode, raw)
+			}
+		})
+
 		t.Run("ephemeral target stays namespaced", func(t *testing.T) {
 			before := wmRefsSnapshot(t, e, fx.repoID)
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
@@ -755,6 +823,17 @@ func TestMergeRefPolicies(t *testing.T) {
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-pol-nopush"]; got != fx.c2 {
 				t.Fatalf("t-pol-nopush moved to %q", got)
 			}
+		})
+
+		// Issue #841: the answer is the fixed text, never the decoder's.
+		t.Run("malformed refs claim answers fixed text", func(t *testing.T) {
+			tok := mintWith(`[[5,[]]]`)
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", tok,
+				wmMergeBody("feature", "t-pol-nopush", "merge", map[string]any{"author": wmTestAuthor}))
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("status = %d, body %s", resp.StatusCode, raw)
+			}
+			tcdRequireFixed(t, "merge", raw, "malformed refs claim")
 		})
 
 		t.Run("no-force-push allows merge commits", func(t *testing.T) {
@@ -1274,8 +1353,15 @@ func TestMergePreview(t *testing.T) {
 			}
 		})
 
-		t.Run("unrelated histories preview as if allowed", func(t *testing.T) {
-			resp, body := preview(t, "source_branch=orphan&target_branch=main")
+		t.Run("unrelated histories need allow_unrelated_histories", func(t *testing.T) {
+			resp, raw := wmDo(t, srv, "GET", "/api/v1/repos/merge/preview?source_branch=orphan&target_branch=main", fx.token, nil)
+			if resp.StatusCode != http.StatusPreconditionFailed {
+				t.Fatalf("status = %d, body %s, want 412", resp.StatusCode, raw)
+			}
+			if msg := requireEnvelope(t, resp, raw); msg != "refusing to merge unrelated histories (set allow_unrelated_histories)" {
+				t.Fatalf("error = %q", msg)
+			}
+			resp, body := preview(t, "source_branch=orphan&target_branch=main&allow_unrelated_histories=true")
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, body %v", resp.StatusCode, body)
 			}
@@ -1314,6 +1400,134 @@ func TestMergePreview(t *testing.T) {
 				t.Fatalf("ephemeral source: status = %d, body %s", resp.StatusCode, raw)
 			}
 		})
+	})
+}
+
+// TestMergePreviewMatchesMerge pins #805 (spec 5d8e1801): merge/preview
+// reads strategy, squash and allow_unrelated_histories, and its answer is
+// the answer that POST /merge gives for the same options on the same
+// tips. Every case runs the preview, then the real merge on a fresh
+// target branch at the main tip.
+func TestMergePreviewMatchesMerge(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wmServer(t, e)
+		fx := wmSeedFixture(t, e)
+		ctx := context.Background()
+
+		type answer struct {
+			status        int
+			result        string // 200 only
+			previewStatus string // preview 200 only: clean or conflicted
+			detail        string // non-200 only
+			conflictPaths []any
+		}
+		read := func(t *testing.T, resp *http.Response, raw []byte) answer {
+			t.Helper()
+			body := wmDecode(t, raw)
+			a := answer{status: resp.StatusCode}
+			if resp.StatusCode == http.StatusOK {
+				a.result, _ = body["result"].(string)
+				a.previewStatus, _ = body["status"].(string)
+				a.conflictPaths, _ = body["conflict_paths"].([]any)
+				return a
+			}
+			a.detail, _ = body["error"].(string)
+			a.conflictPaths, _ = body["conflict_paths"].([]any)
+			return a
+		}
+
+		sources := []string{"feature", "ffsrc", "conflict", "orphan", "main"}
+		strategies := []string{"", "merge", "ff_only", "ff_prefer"}
+		n := 0
+		for _, source := range sources {
+			for _, strategy := range strategies {
+				for _, squash := range []bool{false, true} {
+					for _, allow := range []bool{false, true} {
+						n++
+						name := fmt.Sprintf("%s/strategy=%s/squash=%t/allow=%t", source, strategy, squash, allow)
+						query := fmt.Sprintf("source_branch=%s&target_branch=main&squash=%t&allow_unrelated_histories=%t", source, squash, allow)
+						if strategy != "" {
+							query += "&strategy=" + strategy
+						}
+						resp, raw := wmDo(t, srv, "GET", "/api/v1/repos/merge/preview?"+query, fx.token, nil)
+						got := read(t, resp, raw)
+
+						// POST /merge has no default strategy; the preview's is ff_prefer.
+						mergeStrategy := strategy
+						if mergeStrategy == "" {
+							mergeStrategy = "ff_prefer"
+						}
+						target := fmt.Sprintf("t-match-%d", n)
+						if _, err := e.refStore.CASRef(ctx, fx.repoID, "refs/heads/"+target, ref.ZeroSHA, fx.c2); err != nil {
+							t.Fatal(err)
+						}
+						resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, wmMergeBody(source, target, mergeStrategy, map[string]any{
+							"squash": squash, "allow_unrelated_histories": allow,
+							"author": wmTestAuthor, "commit_message": "match " + target,
+						}))
+						merged := read(t, resp, raw)
+						// The merge names its own target; the preview's is main.
+						merged.detail = strings.ReplaceAll(merged.detail, target, "main")
+
+						var want answer
+						switch {
+						case merged.status == http.StatusOK:
+							want = answer{status: http.StatusOK, result: merged.result, previewStatus: "clean", conflictPaths: []any{}}
+						case merged.status == http.StatusConflict:
+							want = answer{status: http.StatusOK, result: "merge_commit", previewStatus: "conflicted", conflictPaths: merged.conflictPaths}
+							if squash {
+								want.result = "squash"
+							}
+						case merged.status == http.StatusPreconditionFailed && strings.HasSuffix(merged.detail, "is not a fast-forward"):
+							want = answer{status: http.StatusOK, result: "rejected", previewStatus: "clean", conflictPaths: []any{}}
+						default:
+							want = answer{status: merged.status, detail: merged.detail}
+						}
+						if !reflect.DeepEqual(got, want) {
+							t.Errorf("%s: preview %+v, merge %+v: want preview %+v", name, got, merged, want)
+						}
+					}
+				}
+			}
+		}
+
+		// The live findings of the 2026-11-12 audit, pinned on their own so
+		// the preview and the merge cannot drift together.
+		for query, want := range map[string]string{
+			"source_branch=ffsrc&target_branch=main&strategy=merge":                              "200 merge_commit clean",
+			"source_branch=ffsrc&target_branch=main&squash=true":                                 "200 squash clean",
+			"source_branch=feature&target_branch=main&strategy=ff_only":                          "200 rejected clean",
+			"source_branch=orphan&target_branch=main":                                            "412",
+			"source_branch=orphan&target_branch=main&allow_unrelated_histories=true":             "200 merge_commit clean",
+			"source_branch=conflict&target_branch=main&squash=true&strategy=ff_prefer":           "200 squash conflicted",
+			"source_branch=main&target_branch=ffsrc&strategy=ff_only":                            "200 no_op clean",
+			"source_branch=ffsrc&target_branch=main&strategy=":                                   "200 fast_forward clean",
+			"source_branch=feature&target_branch=main&strategy=ff_only&squash=true":              "400",
+			"source_branch=feature&target_branch=main&strategy=bogus":                            "400",
+			"source_branch=feature&target_branch=main&squash=bogus":                              "400",
+			"source_branch=feature&target_branch=main&allow_unrelated_histories=bogus":           "400",
+			"source_branch=orphan&target_branch=main&strategy=ff_only":                           "200 rejected clean",
+			"source_branch=orphan&target_branch=main&strategy=merge&squash=true":                 "412",
+			"source_branch=orphan&target_branch=main&squash=true&allow_unrelated_histories=true": "200 squash clean",
+		} {
+			resp, raw := wmDo(t, srv, "GET", "/api/v1/repos/merge/preview?"+query, fx.token, nil)
+			got := strconv.Itoa(resp.StatusCode)
+			if resp.StatusCode == http.StatusOK {
+				body := wmDecode(t, raw)
+				got += fmt.Sprintf(" %v %v", body["result"], body["status"])
+			} else {
+				msg := requireEnvelope(t, resp, raw)
+				if resp.StatusCode == http.StatusPreconditionFailed && wmDecode(t, raw)["code"] != "precondition_failed" {
+					t.Errorf("%s: 412 body %s, want code precondition_failed (%s)", query, raw, msg)
+				}
+			}
+			if got != want {
+				t.Errorf("%s: got %s (body %s), want %s", query, got, raw, want)
+			}
+			// The /api/repos/{repo_name} path style reads the same options.
+			aliasRequireIdentical(t, e, "GET", "/api/repos/"+url.PathEscape(fx.url)+"/merge/preview?"+query,
+				"/api/v1/repos/merge/preview?"+query, fx.token, nil)
+		}
 	})
 }
 

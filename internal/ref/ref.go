@@ -926,8 +926,8 @@ func casFence(ctx context.Context, repo string) (syncClaimFence, bool) {
 // explicit transaction whose only other work happens strictly BEFORE it
 // (the base-ledger lock and the purge-fence read below), so the statement
 // remains the single mutation unit and the IdempotentCAS ambiguity
-// classification (idempotent.go) is unchanged: pre-statement failures are
-// tagged notExecuted, and statement failures classify exactly as before. A
+// classification (idempotent.go) is unchanged: pre-statement failures and
+// statement failures are tagged notExecuted (no COMMIT was sent). A
 // COMMIT error of a swap that changed a row is resolved with txid_status
 // (see commitStatus): committed is a win, aborted is definitive, and an
 // outcome PostgreSQL cannot confirm is ambiguous (recovered by the
@@ -1042,7 +1042,11 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		ct, err, tag = c, cerr, "fenced update"
 	}
 	if err != nil {
-		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, err)
+		// The statement ran inside the transaction and no COMMIT was sent,
+		// so it cannot have committed, whatever the error says: a reply lost
+		// here closes the connection and PostgreSQL rolls the transaction
+		// back. Marked so that IdempotentCAS never recovers it into a win.
+		return false, 0, fmt.Errorf("cas %s %s/%s: %w", tag, repo, name, notExecuted(err))
 	}
 	n := ct.RowsAffected()
 	assertf(n == 0 || n == 1, "cas %s %s/%s affected %d rows", tag, repo, name, n)
@@ -1087,16 +1091,20 @@ func (s *PG) casRef(ctx context.Context, repo, name, old, new string, wantGen bo
 		gen = g0 + 1
 	}
 	// A COMMIT error does not say whether the backend committed: the reply
-	// may be lost after the commit. pgx v5.11 even reports that loss as a
-	// request never sent: MultiResultReader.NextResult drops the read error
-	// of peekMessage, which has already closed the connection, so the next
-	// receiveMessage returns connLockError "conn closed", and pgconn's
-	// SafeToRetry is true for it. A swap that changed a row therefore asks
-	// PostgreSQL for the outcome. A swap that changed no row wrote nothing,
-	// so its COMMIT outcome changes nothing, and its error passes through.
+	// may be lost after the commit. Up to pgx v5.12 even that loss was
+	// reported as a request never sent: MultiResultReader.NextResult drops
+	// the read error of peekMessage, which has already closed the
+	// connection, so the next receiveMessage returned connLockError "conn
+	// closed", and pgconn's SafeToRetry was true for it. Since v5.13 pgx
+	// marks it not safe to retry, but only the outcome query tells a commit
+	// that landed from one that did not. A swap that changed a row therefore
+	// asks PostgreSQL for the outcome. A swap that changed no row wrote
+	// nothing, so its COMMIT outcome changes nothing: the error is marked
+	// not executed, whatever tag pgx puts, so that IdempotentCAS never
+	// recovers a duplicate create into a win and a push event.
 	if err := tx.Commit(ctx); err != nil {
 		if n == 0 {
-			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, err)
+			return false, 0, fmt.Errorf("cas %s %s/%s: commit: %w", tag, repo, name, notExecuted(err))
 		}
 		// commitStatus needs a pool slot, and this connection can be the
 		// pool's last one. The transaction is closed, so the deferred

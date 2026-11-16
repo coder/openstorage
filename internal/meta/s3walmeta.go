@@ -1415,8 +1415,7 @@ func (s *S3WAL) ListRepos(ctx context.Context, org string, params ListParams) (L
 		}
 		cursorNanos, cursorID = createdAt.UnixNano(), repoID
 	}
-	assertf(params.Q == strings.TrimSpace(params.Q) && params.Prefix == strings.TrimSpace(params.Prefix),
-		"ListRepos: untrimmed filters q=%q prefix=%q", params.Q, params.Prefix)
+	assertListFilters(params)
 	q, prefix := strings.ToLower(params.Q), strings.ToLower(params.Prefix)
 	rows := make([]Repo, 0, params.Limit+1)
 	for id, r := range doc.Repos {
