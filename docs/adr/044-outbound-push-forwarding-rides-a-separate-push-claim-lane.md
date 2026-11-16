@@ -130,7 +130,7 @@ permanently as configuration. The pull lane's egress predates this ADR;
 [ADR-45](045-sync-egress-policy-is-unified-behind-one-dial-time-guard.md)
 extends the same dial-time guard to it behind the unified
 `OPENSTORAGE_SYNC_ALLOW_PRIVATE` policy (this flag became the deprecated
-push-only spelling).
+push-only variable).
 
 **Failure semantics.** The forward itself is atomic (`git push --atomic`):
 a batch with one refused ref leaves the upstream entirely untouched, so a

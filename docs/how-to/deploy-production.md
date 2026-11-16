@@ -497,7 +497,9 @@ Resolution rules:
 
 Webhook deliveries use a native SSRF guard. By default, every attempt resolves the
 registered hostname at dial time and fails closed unless **every** answer is a public,
-global-unicast address outside the IANA special-purpose registries. The
+global-unicast address outside the IANA special-purpose registries and not a
+[cloud metadata endpoint](../reference/configuration.md#cloud-metadata-endpoints), such
+as Azure's public `168.63.129.16`. The
 [reference](../reference/configuration.md#openstorage_webhook_allow_private) lists the
 denied ranges, including loopback, private, link-local, and cloud metadata targets.
 

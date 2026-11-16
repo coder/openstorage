@@ -1651,7 +1651,7 @@ func TestResolveLFSMaxObjectsPerRepo(t *testing.T) {
 
 // TestLogSyncEgressWarnings covers the boot-warning paths (issue #139):
 // the transitional default announces the future flip, an explicit relaxed
-// policy is loud like the webhook hatch, the deprecated spelling names its
+// policy is loud like the webhook hatch, the deprecated variable names its
 // replacement (and whether it was ignored), and the explicit strict policy
 // boots silently.
 func TestLogSyncEgressWarnings(t *testing.T) {
@@ -1668,11 +1668,11 @@ func TestLogSyncEgressWarnings(t *testing.T) {
 			settings: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true},
 			want:     []string{"sync egress guard relaxed", "shared (RFC 6598)", "never a cloud metadata endpoint", envSyncAllowPrivate},
 		},
-		"deprecated spelling still honored names replacement": {
+		"deprecated variable still honored names replacement": {
 			settings: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},
 			want:     []string{"deprecated env var", envSyncPushAllowPrivate, envSyncAllowPrivate},
 		},
-		"deprecated spelling ignored when unified set": {
+		"deprecated variable ignored when unified set": {
 			settings: syncEgressSettings{legacyPushFlagSet: true},
 			want:     []string{"deprecated env var ignored", envSyncPushAllowPrivate},
 		},

@@ -425,9 +425,10 @@ Controls the native webhook SSRF guard.
 
 - **Default:** `false`. Delivery rejects IANA special-purpose ranges, including loopback,
   RFC 1918, RFC 6598 shared, IPv4/IPv6 link-local, IPv6 ULA, translation/protocol
-  anycast, documentation, benchmarking, reserved, unspecified, multicast, broadcast, and
-  the [cloud metadata endpoints](#cloud-metadata-endpoints). IPv4-mapped IPv6 is
-  normalized first, so `::ffff:10.0.0.1` is private.
+  anycast, documentation, benchmarking, reserved, unspecified, multicast and broadcast,
+  and the [cloud metadata endpoints](#cloud-metadata-endpoints), one of which
+  (`168.63.129.16`) is a public address. IPv4-mapped IPv6 is normalized first, so
+  `::ffff:10.0.0.1` is private.
 - **`true`** (Go boolean; logs a startup warning): admits loopback, RFC 1918, RFC 6598
   shared, link-local, and ULA receivers. Use it only for intentionally internal webhooks.
   It **still blocks** the [cloud metadata endpoints](#cloud-metadata-endpoints) (such

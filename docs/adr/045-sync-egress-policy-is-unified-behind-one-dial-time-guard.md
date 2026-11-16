@@ -58,12 +58,14 @@ on resolution errors, never a substitute for dial-time enforcement. Under
 the transitional default this already rejects cloud metadata and
 special-purpose targets while admitting private forges.
 
-**Cloud metadata stays denied under every setting.** The private classes
-hold the instance-metadata and credential endpoints of the clouds
-(`169.254.169.254` in link-local space, Alibaba Cloud's `100.100.100.200`
-in RFC 6598 shared space, `fd20:ce::254` in ULA space, and more). The guard
+**Cloud metadata stays denied under every setting.** Most of the
+instance-metadata and credential endpoints of the clouds lie in the private
+classes (`169.254.169.254` in link-local space, Alibaba Cloud's
+`100.100.100.200` in RFC 6598 shared space, `fd20:ce::254` in ULA space, and
+more); Azure's WireServer, `168.63.129.16`, is a public address. The guard
 denies each of these single addresses whatever the policy, so admitting a
-private class never admits instance credentials. The list and its sources
+private class never admits instance credentials, and the strict policy
+denies the public one too. The list and its sources
 are in the
 [configuration reference](../reference/configuration.md#cloud-metadata-endpoints).
 

@@ -10,7 +10,7 @@ package sync
 // pioneered (issue #53) cannot be applied in-process; instead every
 // http(s) transfer runs through a short-lived loopback forward proxy
 // whose dials go through TargetGuard.DialContext. The operator escape
-// hatch (OPENSTORAGE_SYNC_ALLOW_PRIVATE; deprecated push-only spelling
+// hatch (OPENSTORAGE_SYNC_ALLOW_PRIVATE; deprecated push-only variable
 // OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE) relaxes only the private receiver
 // classes (loopback, RFC 1918, RFC 6598 shared, link-local, ULA), exactly
 // like the webhook hatch: the cloud metadata endpoints, broadcast, and the
