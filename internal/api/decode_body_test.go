@@ -139,6 +139,18 @@ func TestUnmarshalBodyBounds(t *testing.T) {
 	if got := invalidParamsFor(unmarshalBody([]byte(long), new(decodeBodyReq))); len(got) != 1 || got[0].Name != "paths" {
 		t.Fatalf("a body of %d bytes with a long first member named %+v, want paths only", len(long), got)
 	}
+	// A member that is no field is never the wrong-type value, even when its
+	// name spells the path of one, so nulling it cannot change how many
+	// fields the work bound lets a body name.
+	for _, unknown := range []string{`"K":"` + strings.Repeat("x", 60<<10) + `"`, strings.Repeat(`"K":1,`, 499) + `"K":1`} {
+		named := func(name string) int {
+			body := `{"paths":[` + strings.Repeat("7,", 149) + `7],` + strings.ReplaceAll(unknown, `"K"`, `"`+name+`"`) + `}`
+			return len(invalidParamsFor(unmarshalBody([]byte(body), new(decodeBodyReq))))
+		}
+		if got, want := named("paths.0"), named("paths_0"); got != want {
+			t.Fatalf("with unknown members paths.0 the body named %d items, with paths_0 %d", got, want)
+		}
+	}
 	// The first decode counts too: a body of more than 128 KiB names only
 	// its first wrong-type field, and one of 126 KiB names two.
 	for _, tc := range []struct{ entries, want int }{{70_000, 1}, {63_000, 2}} {
@@ -218,7 +230,8 @@ func TestDecodeError(t *testing.T) {
 // decodePathReq has members that encoding/json names by their JSON
 // Pointer with each "/" written as ".": map keys that hold "." (kept as
 // is), "/" (written ~1) or "~" (written ~0), and members that null does
-// not fix.
+// not fix. It has fields of embedded structs, and a field X in two of them,
+// which encoding/json drops, so that a member "X" is the field x.
 type decodePathReq struct {
 	Decodes decodeCount               `json:"n"`
 	M       map[string]int            `json:"m"`
@@ -226,6 +239,20 @@ type decodePathReq struct {
 	Keys    map[int]int               `json:"keys"`
 	Strict  refusesNull               `json:"strict"`
 	Count   int                       `json:"count"`
+	Dotted  int                       `json:"a.b/c"`
+	Lower   int                       `json:"x"`
+	decodeEmbedded
+	*DecodePtrEmbedded
+}
+
+type decodeEmbedded struct {
+	E int `json:"e"`
+	X int
+}
+
+type DecodePtrEmbedded struct {
+	P int `json:"p"`
+	X int
 }
 
 // decodeCount counts the decodes of the body that holds it.
@@ -245,11 +272,14 @@ func (*refusesNull) UnmarshalJSON(b []byte) error {
 }
 
 // TestUnmarshalBodyPaths: unmarshalBody names each wrong-type field
-// whatever its map keys hold, and decodes the body once for each field it
-// names and once more. When null does not fix a field (a map key that does
-// not decode, an UnmarshalJSON that refuses null), it names that field,
-// with the error of encoding/json as for any lone field, and stops: at
-// once when the field is null already.
+// whatever its member names hold, and decodes the body once for each error
+// of encoding/json and once more. A struct member is the field that
+// encoding/json decodes it into, a map member its exact key; of two values
+// with one path, the wrong one is the one of the type that the error names.
+// When null does not fix a field (a map key that does not decode, an
+// UnmarshalJSON that refuses null), it names that field, with the error of
+// encoding/json as for any lone field, and stops: at once when the field is
+// null already.
 func TestUnmarshalBodyPaths(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
@@ -265,6 +295,15 @@ func TestUnmarshalBodyPaths(t *testing.T) {
 		{"a map key that does not decode", `{"keys":{"x":1}}`, []string{"keys.x"}, 2},
 		{"a map key that does not decode, null already", `{"keys":{"x":null}}`, []string{"keys.x"}, 1},
 		{"an UnmarshalJSON that refuses null", `{"strict":5}`, []string{"strict"}, 2},
+		{"a longer key than the path", `{"m":{"a":"x","a.b":1}}`, []string{"m.a"}, 2},
+		{"a map key with the name of a field", `{"count":"z","m":{"count":"y"}}`, []string{"count", "m.count"}, 3},
+		{"map keys that differ in case", `{"m":{"A":"x","a":"y"}}`, []string{"m.A", "m.a"}, 3},
+		{"a key with a dot in another case", `{"nested":{"A":{"b":{}},"a.b":7}}`, []string{"nested.A.b", "nested.a.b"}, 3},
+		{"a value with the path of a wrong one", `{"nested":{"a":{"b":"x"},"a.b":{"x":"y"}}}`, []string{"nested.a.b", "nested.a.b.x"}, 3},
+		{"two wrong values with one path", `{"nested":{"a":{"b":"x"},"a.b":5},"count":"z"}`, []string{"nested.a.b", "count"}, 4},
+		{"fields of embedded structs", `{"e":"x","p":"y","count":"z"}`, []string{"e", "p", "count"}, 4},
+		{"a field that two embedded structs hide", `{"X":"a","x":"b"}`, []string{"X"}, 2},
+		{"a field name with a dot and a slash", `{"a.b/c":"x","A.B/C":"y","count":"z"}`, []string{"a.b~1c", "count"}, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var dst decodePathReq
