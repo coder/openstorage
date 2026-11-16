@@ -24,7 +24,7 @@ func TestHookObjectChecksKeepNoReplaceObjects(t *testing.T) {
 		kinds, err := objectKinds([]string{id})
 		return err == nil && kinds[id] == "commit"
 	}
-	for name, check := range map[string]func(string) bool{"objectExists": objectExists, "objectInMainStore": objectInMainStore, "objectKinds": objectIsCommit} {
+	for name, check := range map[string]func(string) bool{"objectExists": objectExists, "objectInMainStore": objectInMainStore, "objectKinds": objectIsCommit, "reachesUpdateHook": reachesUpdateHook} {
 		_ = os.Remove(log)
 		if !check(strings.Repeat("a", 40)) {
 			t.Fatalf("%s = false for a git that exits 0", name)

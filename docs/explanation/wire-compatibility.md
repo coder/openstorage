@@ -125,12 +125,17 @@ Beyond the smart-HTTP wire format, the semantics clients depend on match git:
   fail independently, as in git, unless the server declines the whole push. It does so for
   its own limits, such as the pack quota, and in one case for refused refs. Refused refs
   are policy-denied refs, refs hidden on this remote, branches that the push sets to an
-  object that is not a commit, and names that a push cannot create
+  object that is not a commit, refs that git itself refuses before the update hook (the
+  push leaves their objects incomplete, or it is a shallow update that git does not
+  allow), and names that a push cannot create
   or update (for example, a name with only one level under `refs/`, such as `refs/funny`
   or `refs/heads`, another git-invalid name, a name with more than 32 `/`-separated parts,
   a part over 200 bytes, or a name over 900 bytes). When no other ref of the push needs
   the objects that the push sends (only refused refs need them, or the other refs move to
   commits the server already has), the server declines the whole push and stores no pack.
+  The server asks git about at most eight distinct refused targets in one push. A push with
+  more than eight of them, or on a server whose git is older than 2.39, stores its pack as
+  before, and git still refuses each of those refs.
   A push that only deletes refs sends no objects and, within the server's own limits,
   keeps per-ref results.
   - **Documented deviation:** refs advance through per-ref compare-and-swap on the ref
