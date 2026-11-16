@@ -415,30 +415,9 @@ func wmValidateStrategy(strategy string, squash bool) error {
 // Committer defaults are the caller's concern; parents order is
 // [target, source] for merge commits and [target] for squash.
 func wmCommitTree(ctx context.Context, sc *wcScratch, tree string, parents []string, message string, author, committer wcAuthor) (string, error) {
-	assertf(ref.ValidSHA(tree), "wmCommitTree: malformed tree %q", tree)
 	assertf(len(parents) >= 1, "wmCommitTree: no parents")
 	assertf(message != "", "wmCommitTree: empty message")
-	env := []string{
-		"GIT_AUTHOR_NAME=" + author.Name,
-		"GIT_AUTHOR_EMAIL=" + author.Email,
-		"GIT_COMMITTER_NAME=" + committer.Name,
-		"GIT_COMMITTER_EMAIL=" + committer.Email,
-	}
-	args := []string{"commit-tree", "-m", message}
-	for _, p := range parents {
-		assertf(ref.ValidSHA(p), "wmCommitTree: malformed parent %q", p)
-		args = append(args, "-p", p)
-	}
-	args = append(args, tree)
-	out, err := sc.git(ctx, nil, env, args...)
-	if err != nil {
-		return "", err
-	}
-	sha := strings.TrimSpace(out)
-	if !ref.ValidSHA(sha) {
-		return "", fmt.Errorf("commit-tree emitted %q", sha)
-	}
-	return sha, nil
+	return sc.writeCommit(ctx, tree, parents, message, author, committer)
 }
 
 // wmPromotedCommits counts the commits newly reachable from the persistent
@@ -592,7 +571,7 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if req.Squash && req.CommitMessage == "" {
 		errs.add(newFieldError("commit_message", "is required with squash", "commit_message is required with squash"))
 	}
-	// git takes the message as an argument, which cannot hold a NUL.
+	// git refuses a NUL in a commit message.
 	errs.add(invalidTextFields([2]string{"commit_message", req.CommitMessage}))
 	if req.Author != nil {
 		for _, err := range wcAuthorProblems("author", *req.Author) {
@@ -1124,14 +1103,12 @@ func wmBlobMode(mode string) bool {
 // wmLiteralPathspec makes an ls-tree pathspec match its path byte for byte.
 const wmLiteralPathspec = ":(literal)"
 
-// wmMaxPathspecBytes bounds the path bytes of one ls-tree pathspec argument.
-// Linux refuses to exec a program with a single argument of 128 KiB or more,
-// counting its terminating NUL (MAX_ARG_STRLEN: 32 pages of at least 4 KiB,
-// error E2BIG). git stores and merges paths of that size, so a longer path is
-// resolved one chunk at a time. The limit is the longest path that still fits
-// behind wmLiteralPathspec, so that every path which one ls-tree can name
-// still takes one ls-tree and lists nothing.
-const wmMaxPathspecBytes = 128<<10 - len(wmLiteralPathspec) - 1
+// wmMaxPathspecBytes bounds the path bytes of one ls-tree pathspec argument
+// (gitlimit.MaxArgBytes). git stores and merges longer paths, so a longer
+// path is resolved one chunk at a time. The limit is the longest path that
+// still fits behind wmLiteralPathspec, so that every path which one ls-tree
+// can name still takes one ls-tree and lists nothing.
+const wmMaxPathspecBytes = gitlimit.MaxArgBytes - len(wmLiteralPathspec)
 
 // wmTreeListings holds, for each tree that wmTreePathEntry had to list, its
 // entries with names over wmMaxPathspecBytes, by tree oid. A tree is listed

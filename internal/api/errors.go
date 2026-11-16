@@ -6,11 +6,13 @@ import (
 	"encoding"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"reflect"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/githttp"
 	"github.com/coder/openstorage/internal/meta"
@@ -144,6 +146,13 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		assertf(p.Name != "" && p.Reason != "", "writeProblem: incomplete invalid param %+v", p)
 	}
 	assertf(msg != "", "writeProblem called with empty message")
+	msg = boundEcho(msg)
+	if len(params) > 0 {
+		params = slices.Clone(params)
+		for i := range params {
+			params[i].Name = boundEcho(params[i].Name)
+		}
+	}
 	// RFC 9457 `title` is the status text, so only registered statuses are
 	// valid here (499 is never emitted: ADR-26).
 	title := http.StatusText(status)
@@ -168,6 +177,29 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 		Guard:         guard,
 		CurrentSHA:    currentSHA,
 	}
+}
+
+// maxEchoBytes bounds the members of an error body that can repeat request
+// input: `error`, `detail` and an `invalid_params` name. A 1 MiB body that
+// names one 1 MiB value, or holds bytes that %q escapes to four, would
+// otherwise answer with more than 10 MiB. It applies to every status. The
+// limit is far above the message that joins the 100 problems of a body
+// (bodyErrors), so an ordinary answer is not cut: a message of 100 problems
+// that each repeat 125 bytes or more of request text is, and then loses its
+// `and N more` ending.
+const maxEchoBytes = 16384
+
+// boundEcho cuts s to maxEchoBytes at a rune boundary and ends it with an
+// ellipsis. A shorter s comes back unchanged.
+func boundEcho(s string) string {
+	if len(s) <= maxEchoBytes {
+		return s
+	}
+	cut := maxEchoBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
 }
 
 // maxInstanceBytes bounds `instance`, the escaped request path that an error
@@ -265,6 +297,34 @@ func invalidTextEach(fields ...[2]string) []error {
 	var problems []error
 	for _, f := range fields {
 		if err := invalidTextFields(f); err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return problems
+}
+
+// tooLongMsg is the 400 message for a request value longer than max bytes.
+// git would take the value as one argument or one environment entry, which
+// must fit gitlimit.MaxArgBytes with what the server puts around it.
+func tooLongMsg(name string, max int) string {
+	return fmt.Sprintf("invalid %s (want at most %d bytes)", name, max)
+}
+
+// tooLongField returns a fieldError when value, the request field name (a
+// dotted wire path), is longer than max bytes (tooLongMsg), or nil.
+func tooLongField(name, value string, max int) error {
+	if len(value) <= max {
+		return nil
+	}
+	return newFieldError(name, fmt.Sprintf("must be at most %d bytes", max), tooLongMsg(name, max))
+}
+
+// tooLongEach returns tooLongField's problem of each field (dotted wire
+// path -> value), in the order given.
+func tooLongEach(max int, fields ...[2]string) []error {
+	var problems []error
+	for _, f := range fields {
+		if err := tooLongField(f[0], f[1], max); err != nil {
 			problems = append(problems, err)
 		}
 	}

@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/openstorage/internal/auth"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -1059,13 +1060,21 @@ func pathLeavesRepo(p string) bool {
 	return strings.HasPrefix(p, "/") || c == ".." || strings.HasPrefix(c, "../")
 }
 
+// maxGitPathBytes bounds a path of a read request. git gets it as one
+// argument, at most as ":(literal)<path>/" (a files listing), which must
+// fit gitlimit.MaxArgBytes.
+const maxGitPathBytes = gitlimit.MaxArgBytes - len(":(literal)") - len("/")
+
 // readPathOK answers 400 and returns false when a request path holds a
-// NUL byte (exec refuses it, and no path holds one) or names a place
-// outside the repository (pathLeavesRepo).
+// NUL byte (exec refuses it, and no path holds one), is longer than
+// maxGitPathBytes, or names a place outside the repository
+// (pathLeavesRepo).
 func readPathOK(w http.ResponseWriter, p string) bool {
 	switch {
 	case strings.ContainsRune(p, 0):
 		writeErr(w, http.StatusBadRequest, "path must not contain a NUL byte")
+	case len(p) > maxGitPathBytes:
+		writeErr(w, http.StatusBadRequest, tooLongMsg("path", maxGitPathBytes))
 	case pathLeavesRepo(p):
 		writeErr(w, http.StatusBadRequest, "path is outside the repository")
 	default:

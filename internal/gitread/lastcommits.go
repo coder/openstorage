@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -142,7 +143,11 @@ func LastCommits(ctx context.Context, repoPath, rev string, paths []string, maxD
 	// lastCommitWindow requests ahead, plus the one it waits for.
 	d := &diffReader{index: w.index, sections: make(chan diffSection, lastCommitWindow+1)}
 	args := []string{"diff-tree", "--stdin", "--root", "-r", "--raw", "-z", "--no-renames", "--ignore-submodules=none"}
-	if spec := commonPathspec(paths); spec != "" {
+	// The pathspec only narrows the diffs: paths outside it are no
+	// answers. The paths come from the tree, and a path can be longer than
+	// one argument takes, so a spec that does not fit is dropped and the
+	// walk is the same.
+	if spec := commonPathspec(paths); spec != "" && len(":(literal)")+len(spec) <= gitlimit.MaxArgBytes {
 		args = append(args, "--", ":(literal)"+spec)
 	}
 	ran := make(chan error, 1)
