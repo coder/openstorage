@@ -29,17 +29,33 @@ import (
 // type or another path) and this guard, which keeps such a type out of the
 // request types until a person has read what the walk does with it.
 
-// walkEntries are the functions that decode a request body with
-// unmarshalBody, directly or for a caller.
-var walkEntries = []string{"unmarshalBody", "wrefDecodeBody", "wrefDecodeOptionalBody", "gcredDecodeBody"}
-
-// decodeWalkSite is a function that names an entry of walkEntries (a call, or
-// a value as in `decode := unmarshalBody`): the number of such places in it
-// and the request types that it decodes there. A helper whose caller owns the
-// type has none, and its callers have them.
+// decodeWalkSite is a function that names unmarshalBody or a helper of it (a
+// call, or a value as in `decode := unmarshalBody`): the number of such places
+// in it and the request types that it decodes there. A helper that decodes
+// into a value of its caller's type (it takes the destination as a parameter
+// of type any, interface{} or a type parameter) has no types. Its name is
+// scanned for as well, so that its callers are listed with their types.
 type decodeWalkSite struct {
 	places int
 	types  []reflect.Type
+}
+
+// walkEntries returns the names that a decode of a request body starts at:
+// unmarshalBody and every helper in sites (a function without types, by the
+// name that a call uses, without its receiver).
+func walkEntries(sites map[string]decodeWalkSite) []string {
+	entries := []string{"unmarshalBody"}
+	for _, name := range slices.Sorted(maps.Keys(sites)) {
+		site := sites[name]
+		if site.types == nil {
+			_, bare, _ := strings.Cut(name, ".")
+			if bare == "" {
+				bare = name
+			}
+			entries = append(entries, bare)
+		}
+	}
+	return entries
 }
 
 // decodeWalkSites is every function that decodes a request body with the
@@ -153,18 +169,86 @@ func walkProblems(t reflect.Type) []string {
 	return out
 }
 
-// decodeWalkSitesInSource returns, for each function of the package that is
-// not in a test file, as `Recv.Name` or `Name`, how many places in it name an
-// entry of walkEntries. It reads the syntax only, so it does not see the type
-// of the destination.
-func decodeWalkSitesInSource(t *testing.T) map[string]int {
+// walkFound is what the scan finds in one function: the places that name an
+// entry, and whether the function takes its destination as a parameter.
+type walkFound struct {
+	places   int
+	takesDst bool
+}
+
+// scanWalkSites returns, for each function of file, as `Recv.Name` or `Name`,
+// how many places in it name an entry. It reads the syntax only, so it does
+// not see the type of the destination.
+func scanWalkSites(file *ast.File, entries []string) map[string]walkFound {
+	sites := make(map[string]walkFound)
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		name := fn.Name.Name
+		if fn.Recv != nil && len(fn.Recv.List) == 1 {
+			recv := fn.Recv.List[0].Type
+			if star, ok := recv.(*ast.StarExpr); ok {
+				recv = star.X
+			}
+			if id, ok := recv.(*ast.Ident); ok {
+				name = id.Name + "." + name
+			}
+		}
+		found := walkFound{takesDst: takesDestination(fn)}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && slices.Contains(entries, id.Name) {
+				found.places++
+			}
+			return true
+		})
+		if found.places > 0 {
+			sites[name] = found
+		}
+	}
+	return sites
+}
+
+// takesDestination reports whether a parameter of fn has type any,
+// interface{} or one of its type parameters (or holds one), so that fn
+// decodes into a value of its caller's type.
+func takesDestination(fn *ast.FuncDecl) bool {
+	typeParams := make(map[string]bool)
+	if fn.Type.TypeParams != nil {
+		for _, field := range fn.Type.TypeParams.List {
+			for _, id := range field.Names {
+				typeParams[id.Name] = true
+			}
+		}
+	}
+	takes := false
+	for _, param := range fn.Type.Params.List {
+		ast.Inspect(param.Type, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.InterfaceType:
+				takes = true
+			case *ast.Ident:
+				takes = takes || n.Name == "any" || typeParams[n.Name]
+			}
+			return true
+		})
+	}
+	return takes
+}
+
+// decodeWalkSitesInSource scans the files of the package that are not tests.
+func decodeWalkSitesInSource(t *testing.T) map[string]walkFound {
 	t.Helper()
 	files, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sites := make(map[string]int)
-	fset := token.NewFileSet()
+	var (
+		entries = walkEntries(decodeWalkSites)
+		sites   = make(map[string]walkFound)
+		fset    = token.NewFileSet()
+	)
 	for _, e := range files {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
 			continue
@@ -173,28 +257,7 @@ func decodeWalkSitesInSource(t *testing.T) map[string]int {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			name := fn.Name.Name
-			if fn.Recv != nil && len(fn.Recv.List) == 1 {
-				recv := fn.Recv.List[0].Type
-				if star, ok := recv.(*ast.StarExpr); ok {
-					recv = star.X
-				}
-				if id, ok := recv.(*ast.Ident); ok {
-					name = id.Name + "." + name
-				}
-			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if id, ok := n.(*ast.Ident); ok && slices.Contains(walkEntries, id.Name) {
-					sites[name]++
-				}
-				return true
-			})
-		}
+		maps.Copy(sites, scanWalkSites(file, entries))
 	}
 	return sites
 }
@@ -204,19 +267,23 @@ func decodeWalkSitesInSource(t *testing.T) map[string]int {
 // interface, a member name or a tag option outside what the walk handles, or
 // when a function starts to decode a body with the walk without being listed.
 func TestRequestTypesStayInsideTheDecodeWalk(t *testing.T) {
-	const fix = "list the function in decodeWalkSites with the request types it decodes; a type outside the walk needs its own decode, not a change of the walk (see the top of decode_walk_guard_test.go)"
+	const fix = "list it in decodeWalkSites with the request types it decodes; a type outside the walk needs its own decode, not a change of the walk (see the top of decode_walk_guard_test.go)"
 	got := decodeWalkSitesInSource(t)
 	for _, name := range slices.Sorted(maps.Keys(got)) {
-		site, ok := decodeWalkSites[name]
+		site, listed := decodeWalkSites[name]
 		switch {
-		case !ok:
-			t.Errorf("%s names unmarshalBody (or a helper that calls it) %d times and is not in decodeWalkSites: %s", name, got[name], fix)
-		case site.places != got[name]:
-			t.Errorf("%s names unmarshalBody (or a helper that calls it) %d times, decodeWalkSites says %d: %s", name, got[name], site.places, fix)
+		case !listed:
+			t.Errorf("%s names unmarshalBody (or a helper of it) %d times and is not in decodeWalkSites: %s. A function with a destination parameter (any, interface{} or a type parameter) is a helper: list it with no types, and then list its callers", name, got[name].places, fix)
+		case site.places != got[name].places:
+			t.Errorf("%s names unmarshalBody (or a helper of it) %d times, decodeWalkSites says %d: %s", name, got[name].places, site.places, fix)
+		case got[name].takesDst && site.types != nil:
+			t.Errorf("%s takes its destination as a parameter, so it is a helper: list it with no types, and list its callers with theirs", name)
+		case !got[name].takesDst && site.types == nil:
+			t.Errorf("%s takes no destination parameter, so it decodes a type of its own: %s", name, fix)
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(decodeWalkSites)) {
-		if got[name] == 0 {
+		if _, ok := got[name]; !ok {
 			t.Errorf("decodeWalkSites lists %s, which no longer names unmarshalBody: remove it", name)
 		}
 		for _, typ := range decodeWalkSites[name].types {
@@ -224,6 +291,42 @@ func TestRequestTypesStayInsideTheDecodeWalk(t *testing.T) {
 				t.Errorf("%s decodes %s: %s", name, typ, problem)
 			}
 		}
+	}
+}
+
+// TestScanWalkSites: the scan finds a helper, the callers of a helper that
+// is an entry, a decode through a value, and a destination that is a type
+// parameter, and it leaves other functions out.
+func TestScanWalkSites(t *testing.T) {
+	const src = `package p
+
+func handleA(w W, r R)                        { var req T; _ = unmarshalBody(body, &req) }
+func (s *server) handleB(w W, r R)            { decode := unmarshalBody; _ = decode(b, &req); _ = unmarshalBody(b, &req) }
+func decodeAny(w W, r R, dst any) bool        { return unmarshalBody(b, dst) == nil }
+func decodeEmpty(dst interface{ M() }) bool   { return unmarshalBody(b, dst) == nil }
+func decodeGeneric[T any](w W, dst *T) bool   { return unmarshalBody(b, dst) == nil }
+func (s *server) viaHelper(w W, r R)          { var req T; _ = decodeAny(w, r, &req) }
+func other(w W, r R)                          { _ = strictJSON(b, &req) }
+`
+	file, err := parser.ParseFile(token.NewFileSet(), "src.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]walkFound{
+		"handleA": {1, false}, "server.handleB": {2, false}, "decodeAny": {1, true}, "decodeEmpty": {1, true}, "decodeGeneric": {1, true},
+	}
+	if got := scanWalkSites(file, []string{"unmarshalBody"}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("with unmarshalBody only: %+v, want %+v", got, want)
+	}
+	sites := map[string]decodeWalkSite{
+		"decodeAny": {1, nil}, "server.decodeMethod": {1, nil}, "handleA": {1, []reflect.Type{reflect.TypeFor[walkLeaf]()}},
+	}
+	if got, want := walkEntries(sites), []string{"unmarshalBody", "decodeAny", "decodeMethod"}; !slices.Equal(got, want) {
+		t.Fatalf("entries %q, want %q", got, want)
+	}
+	want["server.viaHelper"] = walkFound{1, false}
+	if got := scanWalkSites(file, []string{"unmarshalBody", "decodeAny"}); !reflect.DeepEqual(got, want) {
+		t.Fatalf("with the helper as an entry: %+v, want %+v", got, want)
 	}
 }
 
