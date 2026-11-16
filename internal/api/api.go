@@ -254,7 +254,7 @@ func New(cfg Config) (http.Handler, error) {
 		mux.Handle("/", cfg.Fallback)
 	}
 
-	return withProblemInstance(recoverPanics(logger)(logRequests(logger)(BoundRedirects(mux, http.HandlerFunc(routeNotFound))))), nil
+	return withProblemInstance(recoverPanics(logger)(logRequests(logger)(BoundRedirects(mux, mux, http.HandlerFunc(routeNotFound))))), nil
 }
 
 // apiPrefix is the pattern of unmatchedAPIRoute: every /api/ path that no
@@ -295,21 +295,22 @@ func routeNotFound(w http.ResponseWriter, _ *http.Request) {
 	writeProblem(w, http.StatusNotFound, codeRouteNotFound, "no API route matches the path")
 }
 
-// BoundRedirects serves r with mux, except when mux would redirect r to a
-// Location of more than maxInstanceBytes, the bound of `instance`: then
-// tooLong answers r. ServeMux redirects a path that is not clean (it holds
-// //, /./ or /../) to the clean path, and /api to /api/. The Location
+// BoundRedirects serves r with next, mux or a handler in front of it,
+// except when mux would redirect r to a Location of more than
+// maxInstanceBytes, the bound of `instance`: then tooLong answers r.
+// ServeMux redirects a path that is not clean (it holds //, /./ or /../,
+// or ends in /. or /..) to the clean path, and /api to /api/. The Location
 // repeats the path and the query, and the HTML body of a GET repeats them
 // again with each & written as &amp;, so a path of 1 MiB got an answer of
 // 6 MB.
-func BoundRedirects(mux *http.ServeMux, tooLong http.Handler) http.Handler {
-	assertf(mux != nil && tooLong != nil, "BoundRedirects: nil mux or handler")
+func BoundRedirects(mux *http.ServeMux, next, tooLong http.Handler) http.Handler {
+	assertf(mux != nil && next != nil && tooLong != nil, "BoundRedirects: nil mux or handler")
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if len(muxRedirect(mux, r)) > maxInstanceBytes {
 			tooLong.ServeHTTP(w, r)
 			return
 		}
-		mux.ServeHTTP(w, r)
+		next.ServeHTTP(w, r)
 	})
 }
 
