@@ -58,17 +58,24 @@ func TestRefusalsQuoteRequestTextBounded(t *testing.T) {
 			}
 			refs := `[["*",["` + op + `"]]]`
 			name := "ops-" + randomHex(t, 4)
-			for _, tc := range []struct{ name, method, path, body, what string }{
-				{"sync create", http.MethodPost, "/api/v1/repos", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"forge.example.invalid"}}`, "sync repository create"},
-				{"repository deletion", http.MethodDelete, "/api/v1/repos/delete", "", "repository deletion"},
-				{"default branch change", http.MethodPatch, "/api/v1/repo", `{"default_branch":"main"}`, "changing the default branch"},
+			// Each route checks the policy before it looks the repository
+			// up, so the repository need not exist.
+			for _, tc := range []struct {
+				name, method, path, body, what string
+				scopes                         []string
+			}{
+				{"sync create", http.MethodPost, "/api/v1/repos", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"forge.example.invalid"}}`, "sync repository create", []string{auth.ScopeRepoWrite}},
+				{"repository deletion", http.MethodDelete, "/api/v1/repos/delete", "", "repository deletion", []string{auth.ScopeRepoWrite}},
+				{"default branch change", http.MethodPatch, "/api/v1/repo", `{"default_branch":"main"}`, "changing the default branch", []string{auth.ScopeRepoWrite}},
+				{"pull-upstream", http.MethodPost, "/api/v1/repos/pull-upstream", "", "pull-upstream", []string{auth.ScopeGitWrite}},
+				{"push-upstream", http.MethodPost, "/api/v1/repos/push-upstream", "", "push-upstream", []string{auth.ScopeGitWrite, auth.ScopeGitRead}},
 			} {
 				opName := "a short op"
 				if op == long {
 					opName = "a long op"
 				}
 				t.Run(tc.name+" with "+opName, func(t *testing.T) {
-					tok := e.mint(t, tokenSpec{iss: org, repo: name, scopes: []string{auth.ScopeRepoWrite}, refs: refs})
+					tok := e.mint(t, tokenSpec{iss: org, repo: name, scopes: tc.scopes, refs: refs})
 					var body []byte
 					if tc.body != "" {
 						body = []byte(tc.body)
