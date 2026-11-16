@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -34,7 +35,9 @@ func assertf(cond bool, format string, args ...any) {
 // BlobStore, and CacheDir are required; Logger defaults to slog.Default();
 // Fallback (optional) receives every request outside /api/ that ServeMux
 // does not redirect first (it redirects /api to /api/ and cleans unclean
-// paths): an unmatched /api/ path gets unmatchedAPIRoute's problem body.
+// paths; BoundRedirects answers 404 route_not_found to a redirect that it
+// would make too long): an unmatched /api/ path gets unmatchedAPIRoute's
+// problem body.
 // The serve command does not set it: it mounts this handler at /api/ in
 // its own mux, next to the git smart-HTTP handler.
 type Config struct {
@@ -251,7 +254,7 @@ func New(cfg Config) (http.Handler, error) {
 		mux.Handle("/", cfg.Fallback)
 	}
 
-	return withProblemInstance(recoverPanics(logger)(logRequests(logger)(mux))), nil
+	return withProblemInstance(recoverPanics(logger)(logRequests(logger)(BoundRedirects(mux, http.HandlerFunc(routeNotFound))))), nil
 }
 
 // apiPrefix is the pattern of unmatchedAPIRoute: every /api/ path that no
@@ -283,6 +286,55 @@ func unmatchedAPIRoute(mux *http.ServeMux) http.Handler {
 			writeErr(w, http.StatusMethodNotAllowed, "method "+r.Method+" is not supported for this path")
 			return
 		}
-		writeProblem(w, http.StatusNotFound, codeRouteNotFound, "no API route matches the path")
+		routeNotFound(w, r)
 	})
 }
+
+// routeNotFound answers 404 route_not_found: no API route matches the path.
+func routeNotFound(w http.ResponseWriter, _ *http.Request) {
+	writeProblem(w, http.StatusNotFound, codeRouteNotFound, "no API route matches the path")
+}
+
+// BoundRedirects serves r with mux, except when mux would redirect r to a
+// Location of more than maxInstanceBytes, the bound of `instance`: then
+// tooLong answers r. ServeMux redirects a path that is not clean (it holds
+// //, /./ or /../) to the clean path, and /api to /api/. The Location
+// repeats the path and the query, and the HTML body of a GET repeats them
+// again with each & written as &amp;, so a path of 1 MiB got an answer of
+// 6 MB.
+func BoundRedirects(mux *http.ServeMux, tooLong http.Handler) http.Handler {
+	assertf(mux != nil && tooLong != nil, "BoundRedirects: nil mux or handler")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(muxRedirect(mux, r)) > maxInstanceBytes {
+			tooLong.ServeHTTP(w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// redirectType is the type of the handler that ServeMux.Handler returns
+// for a request that the mux redirects.
+var redirectType = reflect.TypeOf(http.RedirectHandler("/", http.StatusTemporaryRedirect))
+
+// muxRedirect returns the Location of the redirect that mux answers r
+// with, or "" when mux routes r to a handler. It runs the redirect for a
+// HEAD request, which gets no body.
+func muxRedirect(mux *http.ServeMux, r *http.Request) string {
+	h, _ := mux.Handler(r)
+	if reflect.TypeOf(h) != redirectType {
+		return ""
+	}
+	head := r.WithContext(r.Context())
+	head.Method = http.MethodHead
+	w := headerOnly{http.Header{}}
+	h.ServeHTTP(w, head)
+	return w.h.Get("Location")
+}
+
+// headerOnly is a ResponseWriter that keeps the header and drops the body.
+type headerOnly struct{ h http.Header }
+
+func (w headerOnly) Header() http.Header       { return w.h }
+func (headerOnly) Write(p []byte) (int, error) { return len(p), nil }
+func (headerOnly) WriteHeader(int)             {}
