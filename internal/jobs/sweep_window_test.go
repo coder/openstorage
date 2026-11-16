@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -182,100 +183,10 @@ func (p *parker) expect(t *testing.T, step string) {
 	}
 }
 
-// windowState is what a reader sees: the registry row, the blob, and a
-// cold HydratePacks of the repo into a fresh cache.
-type windowState struct {
-	registered, present bool
-	hydrateErr          error
-	hydrateTook         time.Duration
-}
-
-func observeWindow(t *testing.T, f *repackFixture, key string) windowState {
-	t.Helper()
-	ctx := context.Background()
-	var st windowState
-	var err error
-	if st.registered, err = f.store.HasPack(ctx, f.repo, key); err != nil {
-		t.Fatalf("HasPack: %v", err)
-	}
-	st.present = f.blobExists(t, key)
-	repoPath, err := githttp.EnsureCacheRepo(t.TempDir(), f.repo)
-	if err != nil {
-		t.Fatalf("EnsureCacheRepo: %v", err)
-	}
-	start := time.Now()
-	st.hydrateErr = githttp.HydratePacks(ctx, f.store, f.blobs, repoPath, f.repo)
-	st.hydrateTook = time.Since(start)
-	return st
-}
-
-// wantWedged fails unless the registry lists key, its blob is gone, and a
-// cold hydrate fails with ErrPackMissing.
-func wantWedged(t *testing.T, where string, st windowState) {
-	t.Helper()
-	t.Logf("%s: registered=%v present=%v hydrate=%v (in %v)", where, st.registered, st.present, st.hydrateErr, st.hydrateTook)
-	if !st.registered || st.present || !errors.Is(st.hydrateErr, githttp.ErrPackMissing) {
-		t.Fatalf("%s: want registered row, no blob, ErrPackMissing hydrate; got %+v", where, st)
-	}
-}
-
-func wantHealthy(t *testing.T, where string, st windowState) {
-	t.Helper()
-	t.Logf("%s: registered=%v present=%v hydrate=%v", where, st.registered, st.present, st.hydrateErr)
-	if !st.registered || !st.present || st.hydrateErr != nil {
-		t.Fatalf("%s: want registered row, blob present, hydrate ok; got %+v", where, st)
-	}
-}
-
 func windowSweeper(f *repackFixture, key string, stop func(string) error) (*Sweeper, *windowBlobs) {
 	bl := &windowBlobs{BlobStore: f.blobs, key: key, stop: stop}
 	pk := &windowPacks{PackRegistry: f.store, key: key, stop: stop}
 	return NewSweeper(bl, pk, SweepConfig{Threshold: 24 * time.Hour, Delete: true}, slog.New(slog.DiscardHandler)), bl
-}
-
-// Claim B as stated: the writer's whole publishPack (Stat sees the key,
-// RegisterPacks, EnsurePublished sees the key, ref move) lands after classify
-// and before the delete. The delete then removes the bytes of a committed
-// ref's pack. The post-delete recheck sees the row and restores the bytes in
-// the same pass. Between the delete and the end of the restore copy, a cold
-// hydrate of the repo fails with ErrPackMissing.
-func TestSweepWindow_RefCommittedBeforeDeleteIsRestoredInPass(t *testing.T) {
-	f := newRepackFixture(t)
-	f.push(t) // a base commit and pack, so main exists before the writer
-	p := mintOrphanPack(t, f)
-	park := newParker()
-	s, _ := windowSweeper(f, p.key, park.stop)
-
-	var report SweepReport
-	var sweepErr error
-	done := make(chan struct{})
-	go func() { defer close(done); report, sweepErr = s.Sweep(context.Background()) }()
-
-	park.expect(t, "delete") // classify and revalidateOrphan saw K unregistered and aged
-	if !writerStat(t, f, p) {
-		t.Fatal("writer Stat must see the key before the delete")
-	}
-	writerRegister(t, f, p)
-	if writerVerify(t, f, p) {
-		t.Fatal("EnsurePublished must pass without a re-upload before the delete")
-	}
-	writerMoveRef(t, f, p)
-	park.resume <- nil
-
-	park.expect(t, "recheck") // the delete ran
-	wantWedged(t, "after delete, before recheck", observeWindow(t, f, p.key))
-	park.resume <- nil
-
-	park.expect(t, "restore") // the recheck saw the row
-	wantWedged(t, "after recheck, before restore copy", observeWindow(t, f, p.key))
-	park.resume <- nil
-	<-done
-
-	if sweepErr != nil || report.Deleted != 0 {
-		t.Fatalf("sweep = %+v, err %v; want no reap", report, sweepErr)
-	}
-	wantHealthy(t, "after the sweep returns", observeWindow(t, f, p.key))
-	f.checkColdHydrate(t)
 }
 
 // Sweeper.Sweep's doc comment says that a reader racing the restore is
@@ -306,12 +217,35 @@ func TestSweepWindow_ColdHydrateInWindowWaitsForRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureCacheRepo: %v", err)
 	}
+	// The restore waits until the hydration has read the missing pack, so that
+	// the test always enters the window, whatever the scheduler does.
+	seen := &notFoundSignal{BlobStore: f.blobs, seen: make(chan struct{})}
 	hydrated := make(chan error, 1)
-	go func() { hydrated <- githttp.HydratePacks(context.Background(), f.store, f.blobs, repoPath, f.repo) }()
-	time.Sleep(200 * time.Millisecond)
-	park.resume <- nil // the restore copy runs
+	go func() { hydrated <- githttp.HydratePacks(context.Background(), f.store, seen, repoPath, f.repo) }()
+	select {
+	case <-seen.seen:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the hydration never read the missing pack")
+	}
+	time.Sleep(200 * time.Millisecond) // the restore is 200 ms away from the first miss
+	park.resume <- nil                 // the restore copy runs
 	<-done
 	if err := <-hydrated; err != nil {
 		t.Fatalf("cold hydrate that started 200ms before the sweeper's restore: %v", err)
 	}
+}
+
+// notFoundSignal closes seen at the first download that finds no blob.
+type notFoundSignal struct {
+	blob.BlobStore
+	once sync.Once
+	seen chan struct{}
+}
+
+func (n *notFoundSignal) DownloadFile(ctx context.Context, key, path string) error {
+	err := n.BlobStore.DownloadFile(ctx, key, path)
+	if errors.Is(err, blob.ErrNotFound) {
+		n.once.Do(func() { close(n.seen) })
+	}
+	return err
 }

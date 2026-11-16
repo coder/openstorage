@@ -706,6 +706,23 @@ func shortenHydrateWait(t *testing.T) {
 	t.Cleanup(func() { hydrateMissingWait, hydrateMissingWaitMax = oldWait, oldMax })
 }
 
+// timedRestoreStore lists one pack, and starts a timer at the first listing that
+// brings the pack's blob back: a sweeper that restores the pack's bytes.
+type timedRestoreStore struct {
+	ref.RefStore
+	pack  ref.Pack
+	after time.Duration
+	back  func()
+	calls int
+}
+
+func (s *timedRestoreStore) ListPacks(context.Context, string) ([]ref.Pack, error) {
+	if s.calls++; s.calls == 1 {
+		time.AfterFunc(s.after, s.back)
+	}
+	return []ref.Pack{s.pack}, nil
+}
+
 // A pack that is listed and missing on consecutive listings is no fold race:
 // the sweeper can have deleted the bytes of a pack that a writer registered, and
 // restores them within one pass. The hydration waits between the listings for
@@ -722,17 +739,14 @@ func TestHydratePacks_WaitsForAPackThatStaysMissing(t *testing.T) {
 	oldWait, oldMax := hydrateMissingWait, hydrateMissingWaitMax
 	hydrateMissingWait, hydrateMissingWaitMax = 100*time.Millisecond, 100*time.Millisecond
 	defer func() { hydrateMissingWait, hydrateMissingWaitMax = oldWait, oldMax }()
-	// The blob comes back 250 ms after the first listing.
 	packFile := buildTestPack(t)
-	go func() {
-		time.Sleep(250 * time.Millisecond)
-		_ = bl.UploadFile(ctx, back.Key, packFile)
-	}()
-	st := &scriptedPacks{lists: [][]ref.Pack{{back}}}
 	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
 	if err != nil {
 		t.Fatalf("EnsureCacheRepo: %v", err)
 	}
+	// The blob comes back 250 ms after the first listing: more than the 8
+	// listings take without a wait, less than the waits cover.
+	st := &timedRestoreStore{pack: back, after: 250 * time.Millisecond, back: func() { _ = bl.UploadFile(ctx, back.Key, packFile) }}
 	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil {
 		t.Fatalf("hydrate of a pack that comes back within the wait: %v", err)
 	}
@@ -749,6 +763,35 @@ func TestHydratePacks_WaitsForAPackThatStaysMissing(t *testing.T) {
 	err = HydratePacks(cctx, &scriptedPacks{lists: [][]ref.Pack{{gone}}}, bl, repoPath, repo)
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
 		t.Fatalf("hydrate with a context that ends = %v after %v, want the context error soon", err, time.Since(start))
+	}
+}
+
+// A fold race retries at once: the second listing carries the replacement, so
+// the missing pack differs and the hydration does not wait.
+func TestHydratePacks_FoldRaceRetriesWithoutWaiting(t *testing.T) {
+	const repo = "t-hydrate-fold-fast"
+	bl, err := blob.OpenFile("file://" + t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer bl.Close()
+	replacement := ref.Pack{ID: "new", Key: blob.PackKey(repo, "new")}
+	if err := bl.UploadFile(context.Background(), replacement.Key, buildTestPack(t)); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+	folded := ref.Pack{ID: "old", Key: blob.PackKey(repo, "old")}
+	oldWait, oldMax := hydrateMissingWait, hydrateMissingWaitMax
+	hydrateMissingWait, hydrateMissingWaitMax = time.Hour, time.Hour
+	defer func() { hydrateMissingWait, hydrateMissingWaitMax = oldWait, oldMax }()
+	repoPath, err := EnsureCacheRepo(t.TempDir(), repo)
+	if err != nil {
+		t.Fatalf("EnsureCacheRepo: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	st := &scriptedPacks{lists: [][]ref.Pack{{folded}, {replacement}}}
+	if err := HydratePacks(ctx, st, bl, repoPath, repo); err != nil || st.calls != 2 {
+		t.Fatalf("hydrate across a fold = %v after %d listings, want success after 2 with no wait", err, st.calls)
 	}
 }
 
