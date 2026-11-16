@@ -87,7 +87,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `base_repo` and a branch create without `target_branch` refuse an unknown member, put
   it in `detail` (`invalid upstream: unknown field "branch"`) and name no
   `invalid_params` item. A member name of more than 256 bytes is cut there to its
-  first 256 bytes or fewer, at a character, and ends with `…` and its length in bytes:
+  first 256 bytes or fewer, at a character, and ends with `…` and its length in bytes,
+  all counted in the decoded name (an escape counts as the character it stands for, and
+  a byte that is not UTF-8 as the 3 bytes of U+FFFD):
   `unknown field "xx…" (1000000 bytes)`. A
   frame of a `commit-pack` or `diff-commit` stream that has a field of the wrong type
   answers in the same way, in the `message` of its result:
@@ -150,7 +152,8 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
-  /repos/{repo_name}/git-credentials/{git_credential_id}`, answer this way. A `DELETE
+  /repos/{repo_name}/git-credentials/{git_credential_id}` give a body with several
+  invalid fields one item for each of them. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
   adds its message to `detail` and names no field. `PATCH /repo`, the pull-upstream
   routes, `DELETE /repos/tags` and `DELETE /repos/git-credentials` check one body field
@@ -389,9 +392,11 @@ the same scopes, query parameters and responses.
   `default_branch` of its own, because a create uses the first of the two. The
   `default_branch` query parameter is no body field and names none.
 - A token whose `refs` claim does not parse is refused with 403 before the fields of
-  the body are checked, after the body has been read (an unreadable body, and a copy body
-  with an unknown member, answer `400` first). The checks of state answer after
-  the checks of the body fields: the ref policy (403),
+  the body are checked, after the body has been read. Three problems answer `400`
+  first: a `repo` claim that holds a NUL byte (checked before the body is read), an
+  unreadable body, and an unknown member in the `base_repo` of a copy body without
+  `upstream` that is valid JSON with no field of the wrong type. The checks of state
+  answer after the checks of the body fields: the ref policy (403),
   the egress check of the upstream host (it looks the host up), and for a copy or fork
   the source token (403), the source repository (404) and the fork point (400). A
   `default_branch` of the body that is the only invalid field answers after the ref

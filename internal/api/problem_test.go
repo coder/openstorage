@@ -1326,6 +1326,8 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			`invalid base_repo: unknown field "a` + long(127, "é") + `…" (800001 bytes)`, nil},
 		{"branch create unknown field of escaped bytes", http.MethodPost, "/api/v1/repos/branches/create", gitTok, `{"` + long(1_000_000, "<") + `":1}`,
 			`invalid JSON body: unknown field "` + long(256, "<") + `…" (1000000 bytes)`, nil},
+		{"upstream unknown field cut with a quote and a control character", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"\"\u0001` + long(300, "y") + `":1}}`,
+			`invalid upstream: unknown field "\"\x01` + long(254, "y") + `…" (302 bytes)`, nil},
 		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, `invalid JSON body: unknown field ""`, nil},
 		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, "invalid JSON body", nil},
 		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, "invalid JSON body", nil},
