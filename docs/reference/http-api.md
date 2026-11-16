@@ -197,6 +197,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   and so is a path with a NUL byte. The files listings and grep check the path
   without its trailing `/`: there `/` alone names the root of the listing, and
   matches no file in grep.
+- **Values that git takes as one argument** must fit what Linux lets a program take
+  as one argument: 128 KiB (131,072 bytes) with its terminating NUL, so at most
+  131,071 bytes with what the server puts around the value. A longer value answers
+  `400` before git starts, on every platform: a `path` param or grep `paths` entry
+  over 131,060 bytes (git gets it at most as `:(literal)<path>/`), and a blame `range`
+  or grep `query.pattern` over 131,071 bytes. The message names the field and its
+  limit, and grep names the field in `invalid_params`. The limits on idents are with
+  the [commit writes](#commit-messages-and-idents). Linux also limits all arguments
+  and environment entries of one program together, to a quarter of the server's stack
+  limit (2 MiB with the usual 8 MiB). A server started with a stack limit of 2 MiB or
+  less can fail a request whose values each fit, and that answer is a 500.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
@@ -678,11 +689,18 @@ space after their trailing whitespace is removed, and an empty message gives `""
 continuation line keeps its leading whitespace, so `"subj\n  next"` gives `subj   next`.
 Before that spec, both carried the full message.
 
+#### Commit messages and idents
+
 A NUL byte in a `commit_message`, or in the `name` or `email` of an `author` or `committer`,
 answers 400 on `commit-pack`, `diff-commit`, `restore-commit` and `POST /repos/merge`. A NUL
 in the `author` of `POST /repos/notes` (also the deprecated body of `DELETE /repos/notes`)
-answers 400 too. git takes a message as an argument and an ident as an environment value,
-and neither can hold a NUL. `merge` and `notes` name each such field in `invalid_params`.
+answers 400 too. git refuses a NUL in a commit message, and takes an ident as an
+environment value, which cannot hold a NUL. So does a `name` or `email` over 131,051 bytes:
+git gets it as one environment entry such as `GIT_COMMITTER_EMAIL=<email>`, which must fit
+128 KiB with its terminating NUL. The message names the field and the limit. A commit
+message goes to git on standard input, so it has no such limit: the request limits bound
+it, 1 MiB for the body of `merge` and `restore-commit` and 8 MiB for one metadata line of
+`commit-pack` and `diff-commit`. `merge` and `notes` name each such field in `invalid_params`.
 `commit-pack` and `diff-commit` answer the result envelope with `status` `invalid`, as for
 their other invalid metadata, and `restore-commit` answers the plain problem body. A
 `restore-commit` without a `commit_message` gets a default message that names the target,
@@ -901,7 +919,7 @@ On a 300,000-commit linear history, `git log -1 -- <file added in the root commi
 | `files` | `git ls-tree [-r]`; for a recursive call with a `cursor`, `git cat-file --batch` for the folders on the cursor's path and the ones after it, and `git cat-file --batch-check` for the sizes of the page's files, and `git config --type=int --get core.maxTreeDepth` once for a page the walk has filled, then `git ls-tree -r` again when the walk gives way | tree size; for a recursive call with `limit` or `cursor`, the entries of the page and, with a cursor, the folders on its path and the ones after it, each read whole (not the folders before it). A walk that gives way has already paid for the folders it read when the stream starts |
 | `files/metadata` | `git ls-tree -r`; `git rev-list --topo-order --parents` and `git diff-tree --stdin` for the last commit of every file under `path`; `git log --no-walk` for the listed files' commits | tree size; history length; history depth to the oldest last commit |
 | `file` | `git ls-tree`, `git log -1 -- <path>`, `git cat-file blob` | history depth; file size |
-| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git ls-tree` and `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
+| `diff`, `branches/diff` | `git merge-base`, three `git diff` runs, `git cat-file blob` per changed file | history to the merge base; number and size of changed files |
 | `blame` | `git blame` | file length × history depth |
 | `grep` | `git grep` (one thread) | tree size; number of matches |
 | `archive` | `git ls-tree -r`, `git cat-file blob` per file | tree size |

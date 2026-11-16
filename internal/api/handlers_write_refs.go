@@ -1158,6 +1158,11 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}) {
 			errs.add(err)
 		}
+		// git gets the author in GIT_COMMITTER_EMAIL and its siblings.
+		for _, err := range tooLongEach(maxGitIdentBytes,
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}) {
+			errs.add(err)
+		}
 		author = *req.Author
 	}
 	if err := errs.err(); err != nil {
