@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coder/openstorage/internal/auth"
@@ -121,7 +122,32 @@ func gcredDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 // gcredReservedPassword is the problem of a password that the store
 // refuses with meta.ErrReservedSecret.
 func gcredReservedPassword() error {
-	return newFieldError("password", "is a reserved value", "invalid password: "+meta.ErrReservedSecret.Error())
+	return reservedSecretField("password")
+}
+
+// reservedSecretField is the problem of the secret field name whose value
+// the store refuses with meta.ErrReservedSecret.
+func reservedSecretField(name string) error {
+	return newFieldError(name, "is a reserved value", "invalid "+name+": "+meta.ErrReservedSecret.Error())
+}
+
+// credentialValueProblem returns the problem of a value that the sync
+// worker hands to git as a credential (a username, a password, or a
+// base_repo.auth.token), or nil. It must be text the store takes
+// (invalidTextFields), and hold no carriage return or line feed: git's
+// credential helper protocol reads one value per line, and the worker
+// refuses such a stored value (Worker.upstreamAuth). git gets the value in
+// an environment entry of its own, so it must be at most
+// upsync.MaxCredentialBytes. The message never holds the value.
+func credentialValueProblem(name, value string) error {
+	if err := invalidTextFields([2]string{name, value}); err != nil {
+		return err
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return newFieldError(name, "must not contain a carriage return or line feed",
+			"invalid "+name+" (want no carriage return or line feed)")
+	}
+	return tooLongField(name, value, upsync.MaxCredentialBytes)
 }
 
 // gcredValidate names every invalid field of a credential body, in the
@@ -138,17 +164,12 @@ func gcredValidate(withID bool, id, username, password string) error {
 	if withID && id == "" {
 		idErr = newFieldError("id", "is required", "id is required")
 	}
-	// The sync worker hands each value to git in an environment entry of
-	// its own, so each value must be at most upsync.MaxCredentialBytes.
 	if password == "" {
 		passwordErr = newFieldError("password", "is required", "password is required")
-	} else if passwordErr = invalidTextFields([2]string{"password", password}); passwordErr == nil {
-		passwordErr = tooLongField("password", password, upsync.MaxCredentialBytes)
+	} else {
+		passwordErr = credentialValueProblem("password", password)
 	}
-	usernameErr := invalidTextFields([2]string{"username", username})
-	if usernameErr == nil {
-		usernameErr = tooLongField("username", username, upsync.MaxCredentialBytes)
-	}
+	usernameErr := credentialValueProblem("username", username)
 	if passwordErr == nil && (idErr != nil || usernameErr != nil) && meta.ReservedSecret(password) {
 		passwordErr = gcredReservedPassword()
 	}

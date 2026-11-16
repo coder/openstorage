@@ -444,8 +444,9 @@ head -c 32 /dev/urandom | base64
 - **Existing plaintext rows** stay readable and are re-encrypted on their next read
   (webhook deliveries, credential use, list/get API calls). A legacy plaintext value that
   happens to start with `enc:` reads verbatim and migrates too.
-- **Reserved prefix:** the API rejects new webhook secrets and credential passwords
-  starting with `enc:` (HTTP 400), in plaintext mode too.
+- **Reserved prefix:** the API rejects new webhook secrets, credential passwords and
+  sync `base_repo.auth.token` values starting with `enc:` (HTTP 400), in plaintext mode
+  too.
 - **Missing key:** reading a row without the key that wrote it is a request-time error
   naming the row and key fingerprint, never a silent passthrough.
 - **Recovery never needs the lost key.** An undecryptable webhook is listed without its
