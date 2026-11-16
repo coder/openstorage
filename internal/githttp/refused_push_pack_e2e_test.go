@@ -9,6 +9,7 @@ package githttp
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -79,7 +80,7 @@ func TestPackPublication_GitRefusedCommandStoresNothing(t *testing.T) {
 			pack := refusedGit(t, work, bad+"\n"+junk+"\n", "pack-objects", "--stdout", "-q")
 
 			var body bytes.Buffer
-			caps := "\x00report-status"
+			caps := "\x00report-status side-band-64k"
 			if tc.decoy {
 				body.WriteString(pktLine(ref.ZeroSHA + " " + stored + " refs/heads/y" + caps + "\n"))
 				caps = ""
@@ -91,7 +92,34 @@ func TestPackPublication_GitRefusedCommandStoresNothing(t *testing.T) {
 			if !strings.Contains(resp, "ng refs/heads/x") {
 				t.Fatalf("git accepted refs/heads/x:\n%q", resp)
 			}
+			// The pusher reads why nothing was stored when the whole push is refused.
+			if !strings.Contains(resp, "needed only by ref updates that git refuses") {
+				t.Fatalf("the pusher does not read the refusal:\n%q", resp)
+			}
 			assertOnlySetupPack(t, repo, 1)
+		})
+	}
+}
+
+// reachesUpdateHook answers "no" only when git exits 128, the status of a
+// connectivity check that cannot read an object. A git that does not know an
+// option (129), a signal and an out-of-memory kill say nothing about the
+// command, so the gate must not refuse a push on them.
+func TestReachesUpdateHookRefusesOnlyOnExit128(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   bool
+	}{{"0", true}, {"1", true}, {"128", false}, {"129", true}, {"137", true}} {
+		t.Run("exit "+tc.status, func(t *testing.T) {
+			bin := t.TempDir()
+			script := "#!/bin/sh\nexit " + tc.status + "\n"
+			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if got := reachesUpdateHook(strings.Repeat("a", 40)); got != tc.want {
+				t.Fatalf("reachesUpdateHook with a git that exits %s = %v, want %v", tc.status, got, tc.want)
+			}
 		})
 	}
 }

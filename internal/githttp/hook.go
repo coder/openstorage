@@ -1553,7 +1553,7 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 		return nil
 	}
 	if firstErr == nil {
-		return fmt.Errorf("pre-receive: the quarantined pack is needed only by ref updates that git refuses (%s: its objects are incomplete, or the update is a shallow update), refusing pack publication", gitRefused)
+		return refusef("pre-receive: the quarantined pack is needed only by ref updates that git refuses (%s: its objects are incomplete, or the update is a shallow update), refusing pack publication", gitRefused)
 	}
 	return fmt.Errorf("pre-receive: the quarantined pack is needed only by policy-denied ref updates, refusing pack publication (push the allowed updates separately): %w", firstErr)
 }
@@ -2936,8 +2936,12 @@ func objectExists(sha string) bool {
 // pre-receive for a command that fails it ("missing necessary objects", or
 // "shallow update not allowed"), but the update hook never runs for that
 // command, so no ref can ever point into a pack that only it needs. A
-// non-zero exit of git is the answer "no". A git that cannot start is a
-// bug, which fails fast like objectExists.
+// exit of 128 is the answer "no": git cannot read the objects that the command
+// needs. Any other status says nothing about the command (a git without
+// --exclude-hidden, before 2.39, answers 129; a signal or an out-of-memory kill
+// ends it too), so the answer is "yes" and the gate publishes as it did before:
+// a wrong refusal of a push that git accepts is worse than one junk pack. A git
+// that cannot start is a bug, which fails fast like objectExists.
 func reachesUpdateHook(sha string) bool {
 	cmd := exec.Command("git", "rev-list", "--objects", "--stdin", "--not", "--exclude-hidden=receive", "--all", "--quiet", "--alternate-refs")
 	cmd.Stdin = strings.NewReader(sha + "\n")
@@ -2945,8 +2949,8 @@ func reachesUpdateHook(sha string) bool {
 	if err == nil {
 		return true
 	}
-	if _, ok := errors.AsType[*exec.ExitError](err); ok {
-		return false
+	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+		return ee.ExitCode() != 128
 	}
 	panic(fmt.Sprintf("githttp assertion failed: connectivity rev-list %s: %v", sha, err))
 }
