@@ -388,8 +388,8 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 // bytes of each, so it has at most 105,203 bytes and the request path: 100
 // items, each with two messages in `error` and in `detail` (a name in
 // author and the same name at the top level as author.<name>). An answer
-// that names one member keeps its name up to 16384 bytes
-// (TestLongValuesAreCutInAnswers). A name that an earlier item shows after
+// that names one unknown member cuts its name at 256 bytes
+// (TestInvalidParamsOnBodyFailures). A name that an earlier item shows after
 // the cut gives no item of its own and counts in `and N more`. Each object
 // (all copies of author are one) keeps 100 unknown names, and `and N more`
 // counts each member that the answer leaves out once: a repeat, or a member

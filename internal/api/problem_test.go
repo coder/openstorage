@@ -1299,7 +1299,9 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 	type param struct{ name, reason string }
 	// The answer cuts an unknown member name of more than 256 bytes to at
 	// most 256, at a character, and states its length, so it stays small
-	// whatever escapes the name needs.
+	// whatever escapes the name needs: under 5 KiB when a strict route
+	// repeats a name of `<`, six bytes each in JSON, in `error`, `detail`
+	// and the `invalid_params` name.
 	long := func(n int, s string) string { return strings.Repeat(s, n) }
 	for _, tc := range []struct {
 		name, method, path, token string
@@ -1328,14 +1330,22 @@ func testInvalidParamsOnBodyFailures(t *testing.T, e *testEnv) {
 			`invalid JSON body: unknown field "` + long(256, "<") + `…" (1000000 bytes)`, nil},
 		{"upstream unknown field cut with a quote and a control character", http.MethodPost, "/api/v1/repos", freshTok, `{"upstream":{"\"\u0001` + long(300, "y") + `":1}}`,
 			`invalid upstream: unknown field "\"\x01` + long(254, "y") + `…" (302 bytes)`, nil},
+		{"strict unknown field of 256 bytes", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"` + long(256, "y") + `":1}`,
+			`invalid JSON body: unknown field "` + long(256, "y") + `"`, &param{long(256, "y"), "is not a known field"}},
+		{"strict unknown field of escaped bytes", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"` + long(1_000_000, "<") + `":1}`,
+			`invalid JSON body: unknown field "` + long(256, "<") + `…" (1000000 bytes)`, &param{long(256, "<") + "…", "is not a known field"}},
+		{"strict unknown field in author cut at a character", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"author":{"a` + long(400_000, "é") + `":1}}`,
+			`invalid JSON body: unknown field "author.a` + long(127, "é") + `…" (800001 bytes)`, &param{"author.a" + long(127, "é") + "…", "is not a known field"}},
+		{"strict pull unknown field cut with a quote and a control character", http.MethodPost, "/api/repos/" + url + "/upstream/pull", gitTok, `{"\"\u0001` + long(300, "y") + `":1}`,
+			`invalid JSON body: unknown field "\"\x01` + long(254, "y") + `…" (302 bytes)`, &param{"\"\x01" + long(254, "y") + "…", "is not a known field"}},
 		{"strict empty member name", http.MethodPost, "/api/repos/" + url + "/notes/append", gitTok, `{"":1}`, `invalid JSON body: unknown field ""`, nil},
 		{"syntax error", http.MethodPatch, "/api/v1/repo", repoTok, `{`, "invalid JSON body", nil},
 		{"wrong top-level type", http.MethodPatch, "/api/v1/repo", repoTok, `[]`, "invalid JSON body", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, body := e.doReq(t, tc.method, tc.path, tc.token, []byte(tc.body), "")
-			if resp.StatusCode != http.StatusBadRequest || len(body) > 4<<10 {
-				t.Fatalf("status = %d, want 400 of at most 4 KiB (body of %d bytes %.300s)", resp.StatusCode, len(body), body)
+			if resp.StatusCode != http.StatusBadRequest || len(body) > 5<<10 {
+				t.Fatalf("status = %d, want 400 of at most 5 KiB (body of %d bytes %.300s)", resp.StatusCode, len(body), body)
 			}
 			requireEnvelope(t, resp, body)
 			var p problemBody
