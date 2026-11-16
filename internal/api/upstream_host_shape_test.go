@@ -25,6 +25,13 @@ func TestValidUpstreamHost(t *testing.T) {
 		"localhost",
 		"1forge.example",
 		label63 + ".example",
+		"forge." + label63,
+		"1-1",
+		"1_1",
+		"cafe",
+		"0xg.example",
+		// Five labels are no IPv4 address for curl: a name.
+		"0x1.0x2.0x3.0x4.0x5",
 		name253,
 		name253 + ".",
 		"10.0.0.1",
@@ -36,6 +43,8 @@ func TestValidUpstreamHost(t *testing.T) {
 		"http://127.0.0.1:3000",
 		"https://[2001:db8::1]:443/git",
 		"https://forge.example/a%3Fb",
+		"forge.example:",
+		"https://forge.example:/git",
 	} {
 		if !validUpstreamHost(host) {
 			t.Errorf("validUpstreamHost(%q) = false, want true", host)
@@ -54,6 +63,7 @@ func TestValidUpstreamHost(t *testing.T) {
 		"forge.-example",
 		"forge.example-",
 		label63 + "a.example",
+		"forge." + label63 + "a",
 		name253 + "a",
 		name253 + "a.",
 		".",
@@ -63,6 +73,15 @@ func TestValidUpstreamHost(t *testing.T) {
 		"1.2.3",
 		"https://1.2.3",
 		"01.2.3.4",
+		"1.2.3.4.5",
+		// Hexadecimal forms that curl reads as IPv4 too.
+		"0x7f000001",
+		"0x7f.1",
+		"0X7F.0.0.1",
+		"1.2.3.0x4",
+		"0x7f.1.",
+		"0xa9fea9fe",
+		"http://0x7f000001:3000/git",
 		// A zone.
 		"https://1.2.3.4%25eth0",
 		"https://[fe80::1%25eth0]",
@@ -77,6 +96,11 @@ func TestValidUpstreamHost(t *testing.T) {
 		"https://forge.example/git?",
 		"https://forge.example/git?a=b",
 		"https://forge.example/git#x",
+		// A space, which curl refuses, and a scheme that is not lower
+		// case, which GIT_ALLOW_PROTOCOL refuses.
+		"https://forge.example/a b",
+		"HTTPS://forge.example",
+		"Http://forge.example",
 		// Unchanged refusals.
 		":80",
 		"https://:80",
@@ -96,7 +120,7 @@ func TestValidUpstreamHost(t *testing.T) {
 func TestSyncCreateRefusesUndialableHosts(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
-		for _, host := range []string{"<<<.com", "https://1.2.3.4%25eth0", "https://forge.example?", "2130706433", "forge.example:65536"} {
+		for _, host := range []string{"<<<.com", "https://1.2.3.4%25eth0", "https://forge.example?", "2130706433", "0x7f000001", "forge.example:65536", "HTTPS://forge.example"} {
 			for _, field := range []struct{ name, body, msg string }{
 				{"upstream.host", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":%s}}`, "invalid upstream host "},
 				{"base_repo.upstream_host", `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":%s}}`, "invalid base_repo upstream_host "},

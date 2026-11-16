@@ -365,12 +365,14 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 // query/fragment noise must be rejected here, where the attacker-controlled
 // value enters (the worker additionally pins GIT_ALLOW_PROTOCOL).
 //
-// It also refuses what no sync run can use, so the create answers 400
-// instead of storing a link whose every run fails: a hostname that is
-// neither an IP address nor a name the run's resolver looks up
-// (dialableHostname), a port outside 1-65535, and a base URL with a query
-// or a fragment, even an empty one (`https://h?`), which would end the
-// path of every fetch URL.
+// It also refuses hosts that a sync run cannot use as given, so the create
+// answers 400 instead of storing a link that the registration check could
+// not vet: a hostname that is neither an IP address nor a name that the
+// run's resolver asks DNS for (dialableHostname), a port outside 1-65535,
+// and a base URL with a query or a fragment, even an empty one
+// (`https://h?`), which would end the path of every fetch URL, with a
+// space, which curl refuses, or with a scheme that is not lower case
+// (`HTTPS://`), which GIT_ALLOW_PROTOCOL refuses.
 func validUpstreamHost(host string) bool {
 	assertf(host != "", "validUpstreamHost: empty host")
 	if !strings.Contains(host, "://") {
@@ -382,19 +384,23 @@ func validUpstreamHost(host string) bool {
 		return err == nil && u.Host == host && u.User == nil &&
 			u.Path == "" && u.RawQuery == "" && u.Fragment == "" && dialableAuthority(u)
 	}
+	if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+		return false
+	}
 	u, err := neturl.Parse(host)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+	if err != nil {
 		return false
 	}
 	// A path is allowed (sub-path-hosted forges); credentials belong in
 	// the credential store, never in the URL. url.Parse drops an empty
-	// query or fragment, so the bytes are checked.
-	return u.User == nil && !strings.ContainsAny(host, "?#") && dialableAuthority(u)
+	// query or fragment and keeps a space in a path, so the bytes are
+	// checked.
+	return u.User == nil && !strings.ContainsAny(host, "?# ") && dialableAuthority(u)
 }
 
 // dialableAuthority reports whether the host and port of u name something
 // that a sync run can dial: a dialableHostname and, when u has one, a port
-// from 1 to 65535.
+// from 1 to 65535. An empty port (`forge.example:`) is the default one.
 func dialableAuthority(u *neturl.URL) bool {
 	if port := u.Port(); port != "" {
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
@@ -405,21 +411,33 @@ func dialableAuthority(u *neturl.URL) bool {
 }
 
 // dialableHostname reports whether name is an IP address without a zone,
-// or a name that the resolver of a sync run looks up. A run dials through
-// the egress proxy (upsync.startEgressProxy), whose Go resolver refuses any
-// other name before it asks DNS (net.isDomainName, after RFC 1035 and RFC
-// 3696): at most 253 bytes, or 254 with a final dot; labels of 1 to 63
-// letters, digits, '_' and '-' that do not start or end with '-'; and not
-// only digits and dots, which curl reads as an IPv4 address (2130706433 is
-// 127.0.0.1) that the registration check never saw. A name with other
-// letters goes in its ASCII form (xn--bcher-kva.example): curl refuses
-// bücher.example as a bad URL. A zone-scoped address (fe80::1%eth0) is
-// refused: the egress guard refuses it under every policy, and the egress
-// answer would repeat its zone, which only the upstream URL limit bounds.
+// or a name that the resolver of a sync run asks DNS for and that curl
+// does not read as an IPv4 address (curlIPv4Name). A zone-scoped address
+// (fe80::1%eth0) is refused: the egress guard refuses it under every
+// policy, and the egress answer would repeat its zone, which only the
+// upstream URL limit bounds.
 func dialableHostname(name string) bool {
 	if ip, err := netip.ParseAddr(name); err == nil {
 		return ip.Zone() == ""
 	}
+	return resolverName(name) && !curlIPv4Name(name)
+}
+
+// resolverName reports whether the Go resolver of a sync run asks DNS for
+// name. A run dials through the egress proxy (upsync.startEgressProxy),
+// whose resolver refuses any other name (net.isDomainName, after RFC 1035
+// and RFC 3696): at most 253 bytes, or 254 with a final dot; labels of 1 to
+// 63 letters, digits, '_' and '-' that do not start or end with '-'; and
+// not only digits and dots, which curl reads as an IPv4 address
+// (2130706433 is 127.0.0.1) that the registration check never saw. The
+// resolver reads /etc/hosts before it applies the rule, but a name that
+// only /etc/hosts holds is no upstream host.
+//
+// A name with other letters goes in its ASCII form
+// (xn--bcher-kva.example): the registration check cannot look bücher.example
+// up, and whether git and curl convert it depends on the locale that the
+// server's git runs in.
+func resolverName(name string) bool {
 	if name == "" || len(name) > 254 || len(name) == 254 && name[253] != '.' {
 		return false
 	}
@@ -451,6 +469,34 @@ func dialableHostname(name string) bool {
 		prev = c
 	}
 	return prev != '-' && label <= 63 && letters
+}
+
+// curlIPv4Name reports whether curl reads name as an IPv4 address: one to
+// four labels (a final dot aside), each a decimal, octal or hexadecimal
+// (0x) number, such as 0x7f000001, 0x7f.1 or 1.2.3.0x4. curl dials such a
+// name as the address (127.0.0.1, 1.2.3.4), which the registration check,
+// which reads it as a name, never saw.
+func curlIPv4Name(name string) bool {
+	labels := strings.Split(strings.TrimSuffix(name, "."), ".")
+	if len(labels) > 4 {
+		return false
+	}
+	for _, label := range labels {
+		digits, hex := label, false
+		if len(label) >= 2 && label[0] == '0' && (label[1] == 'x' || label[1] == 'X') {
+			digits, hex = label[2:], true
+		}
+		if digits == "" && !hex {
+			return false
+		}
+		for i := 0; i < len(digits); i++ {
+			c := digits[i]
+			if !('0' <= c && c <= '9' || hex && ('a' <= c && c <= 'f' || 'A' <= c && c <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // upstreamHostname extracts the hostname the sync fetch will dial from a
