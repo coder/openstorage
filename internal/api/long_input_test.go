@@ -27,6 +27,24 @@ import (
 	"github.com/coder/openstorage/internal/gitread"
 )
 
+// TestGitArgLimitsAreTheDocumentedNumbers pins the limits that
+// docs/reference/http-api.md states. The other tests take them from the
+// constants, so a limit made too strict would pass them.
+func TestGitArgLimitsAreTheDocumentedNumbers(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		got, want int
+	}{
+		{"gitlimit.MaxArgBytes", gitlimit.MaxArgBytes, 131071},
+		{"maxGitPathBytes", maxGitPathBytes, 131060},
+		{"maxGitIdentBytes", maxGitIdentBytes, 131051},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+}
+
 // gitArgSizes are the lengths a value is sent at, for a field whose longest
 // value is max: max reaches git, and each longer one is a 400.
 func gitArgSizes(max int) []int { return []int{max, max + 1, 128 << 10, 200_000} }

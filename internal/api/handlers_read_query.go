@@ -78,11 +78,11 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 // NULs, none over maxGitPathBytes, none outside the repository.
 func cleanPathParams(paths []string) ([]string, error) {
 	for _, p := range paths {
-		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
-			return nil, fmt.Errorf("invalid path filter %q", p)
-		}
 		if len(p) > maxGitPathBytes {
 			return nil, errors.New(tooLongMsg("path", maxGitPathBytes))
+		}
+		if strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0) {
+			return nil, fmt.Errorf("invalid path filter %q", p)
 		}
 		if pathLeavesRepo(p) {
 			return nil, fmt.Errorf("path filter %q is outside the repository", p)
@@ -499,13 +499,13 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, spec := range ranges {
-		if strings.TrimSpace(spec) == "" || strings.ContainsRune(spec, 0) {
-			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid range %q", spec))
-			return
-		}
 		// git gets each range as an argument of its own.
 		if len(spec) > gitlimit.MaxArgBytes {
 			writeErr(w, http.StatusBadRequest, tooLongMsg("range", gitlimit.MaxArgBytes))
+			return
+		}
+		if strings.TrimSpace(spec) == "" || strings.ContainsRune(spec, 0) {
+			writeErr(w, http.StatusBadRequest, fmt.Sprintf("invalid range %q", spec))
 			return
 		}
 	}
@@ -705,20 +705,20 @@ type grepPosition struct {
 // problem.
 func grepPathProblems(errs *bodyErrors, paths []string) {
 	for i, p := range paths {
-		blank := strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0)
-		long := !blank && len(p) > maxGitPathBytes
+		long := len(p) > maxGitPathBytes
+		blank := !long && (strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0))
 		// git gets the entry without its trailing slash: "/" alone is
 		// no pathspec.
 		trimmed := strings.TrimSuffix(p, "/")
-		outside := !blank && !long && trimmed != "" && pathLeavesRepo(trimmed)
+		outside := !long && !blank && trimmed != "" && pathLeavesRepo(trimmed)
 		switch {
-		case !blank && !long && !outside:
+		case !long && !blank && !outside:
 		case errs.full():
 			errs.skip()
-		case blank:
-			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
 		case long:
 			errs.add(tooLongField("paths."+strconv.Itoa(i), p, maxGitPathBytes))
+		case blank:
+			errs.add(newFieldError("paths."+strconv.Itoa(i), "must be a non-empty path", fmt.Sprintf("invalid paths entry %q", p)))
 		default:
 			errs.add(newFieldError("paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p)))
 		}
