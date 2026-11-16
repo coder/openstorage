@@ -143,8 +143,10 @@ func TestSyncCreateQuotesValuesBounded(t *testing.T) {
 	hugeHost := " " + huge[1:]
 	cutHost := " " + cut[1:]
 	// A zone-scoped IPv6 address is not a valid host: the egress guard
-	// refuses it under every policy, and its zone can be any text.
-	zoneHost := "https://[fe80::1%25" + huge[:900_000-20] + "]"
+	// refuses it under every policy, and its zone can be any text. At
+	// 100,000 bytes the upstream URL is under its limit, so the host
+	// check is what refuses it.
+	zoneHost := "https://[fe80::1%25" + huge[:100_000-20] + "]"
 	cutZone := zoneHost[:256] + "…"
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
@@ -170,9 +172,9 @@ func TestSyncCreateQuotesValuesBounded(t *testing.T) {
 			{"upstream host one byte over", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"` + hugeHost[:257] + `"}}`,
 				`invalid upstream host "` + cutHost + `" (257 bytes)`},
 			{"upstream host with a long zone", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"` + zoneHost + `"}}`,
-				`invalid upstream host "` + cutZone + `" (900000 bytes)`},
+				`invalid upstream host "` + cutZone + `" (100000 bytes)`},
 			{"base_repo upstream_host with a long zone", `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"` + zoneHost + `"}}`,
-				`invalid base_repo upstream_host "` + cutZone + `" (900000 bytes)`},
+				`invalid base_repo upstream_host "` + cutZone + `" (100000 bytes)`},
 			{"upstream host with a zone", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"https://[fe80::1%25eth0]"}}`,
 				`invalid upstream host "https://[fe80::1%25eth0]"`},
 			{"bare upstream host with a zone", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"[fe80::1%25eth0]:443"}}`,

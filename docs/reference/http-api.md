@@ -426,11 +426,11 @@ the same scopes, query parameters and responses.
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
-- A `base_repo.auth.token` with a carriage return or line feed → 400 `bad_request`
-  naming it (`must not contain a carriage return or line feed`), and nothing is stored:
-  the sync worker hands the token to git through a credential helper that reads one
-  value per line, and every run would fail such a link as a configuration error. A
-  token that starts with `enc:` → 400 naming it (`is a reserved value`), the answer of
+- A sync create with a `base_repo.auth.token` that holds a carriage return or line feed
+  → 400 `bad_request` naming it (`must not contain a carriage return or line feed`), and
+  nothing is stored: the sync worker hands the token to git through a credential helper
+  that reads one value per line, and every run would fail such a link as a configuration
+  error. A token that starts with `enc:` → 400 naming it (`is a reserved value`), the answer of
   the [credential routes](#git-credentials-generic-https-upstreams), because the
   credential store refuses that prefix. Here it is a check of the body, named with the
   other invalid fields. A token gets one problem: a NUL first, then a line break, then
