@@ -138,8 +138,8 @@ func gcredValidate(withID bool, id, username, password string) error {
 	if withID && id == "" {
 		idErr = newFieldError("id", "is required", "id is required")
 	}
-	// The sync worker hands each value to git in an environment entry,
-	// which must fit upsync.MaxCredentialBytes.
+	// The sync worker hands each value to git in an environment entry of
+	// its own, so each value must be at most upsync.MaxCredentialBytes.
 	if password == "" {
 		passwordErr = newFieldError("password", "is required", "password is required")
 	} else if passwordErr = invalidTextFields([2]string{"password", password}); passwordErr == nil {
