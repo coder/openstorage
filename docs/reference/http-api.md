@@ -80,10 +80,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   reason`, as upstream's example does (`default_branch must be a string`), and a body
   that is not valid JSON, or whose top-level value has the wrong type, as `invalid JSON
   body`. Three cases keep their own message. The two strictly decoded routes answer with
-  `invalid JSON body: ` and the problem that their member check found: `body must be a
-  JSON object`, `unknown field "x"`, `duplicate field "x"`, `x must not be null` or `x
-  must be a JSON object`. `restore-commit` answers every body that does not decode with
-  `body must be {"metadata": {...}}`. The `upstream` member, the copy form of
+  `invalid JSON body: ` and the problems that their member check found: `body must be a
+  JSON object`, or one or more of `unknown field "x"`, `duplicate field "x"`, `x must not
+  be null` and `x must be a JSON object`. `restore-commit` answers every body that does
+  not decode with `body must be {"metadata": {...}}`.
+  The `upstream` member, the copy form of
   `base_repo` and a branch create without `target_branch` refuse an unknown member, put
   it in `detail` (`invalid upstream: unknown field "branch"`) and name no
   `invalid_params` item. A member name of more than 256 bytes is cut there to its
@@ -107,13 +108,37 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `author`) runs after the checks of the body, except where this paragraph or the notes
   on `POST /repos` below say otherwise. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
-  /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
-  of the body, and the check stops at the first problem: the answer names the first
-  member that is unknown, repeated or `null`, or that must be an object and is not (an
-  empty member name names no field), and none of the other problems. When the check reaches a JSON syntax error or trailing
-  data before it finds a bad member, the answer names no member. The other checks run
-  only when the members are fine, and then the decoder of a strictly decoded body names
-  only the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
+  /api/repos/{repo_name}/upstream/pull`) is checked for its members first: the answer
+  names each member that is unknown, repeated or `null`, or that must be an object and
+  is not (an empty member name adds its message and names no field), and none of the
+  other problems. The members of the route's request body come
+  first, in its order in this document (the problem of an object member before the
+  problems of the members inside it), then the unknown members in the order of the
+  request. A member that the request repeats is named once, for its first problem. The
+  copies of an `author` object that the request repeats are one object: each copy is
+  checked for its own members (a name that one copy holds twice is repeated), and a bad
+  member of any copy is named once, in the order above. Two members with one dotted path
+  (an unknown member called `author.name`, and the `name` of an `author` object) give
+  one item with both messages, or with one message when they say the same (an unknown
+  member called `author.`, and an empty member name in `author`). When the check reaches
+  a JSON syntax error or trailing data, the answer names the members that it found
+  before that point, and when there are none it is `body must be a JSON object`. An
+  answer that names more than one member cuts each unknown member name, which is request
+  text, at 32 bytes and ends it with `…`. Such an answer names at most 100 fields: one
+  item each in `invalid_params`, and in `error` and in `detail` at most two messages
+  each (for an unknown name in `author` sent again at the top level as `author.<name>`).
+  JSON escapes each byte of a cut name to at most six bytes, so the answer has at most
+  105,203 bytes and the request path in `instance`. Two unknown names that are the same
+  in their first 32 bytes give one item, for the first of them, and `and N more` counts
+  the others, so that a name appears once in `invalid_params`. The body and `author`
+  each keep their first 100 unknown member names, and `and N more` counts the others. N
+  counts each member that the answer leaves out once: a member that the request repeats,
+  or that has the dotted path of a member named or counted already, adds nothing. Past
+  the 100 names of an object the count compares 64-bit hashes of the names, so two of
+  them count as one in about one body of 1 MiB in a billion. An answer that names one
+  member keeps its name up to the cut of 16384 bytes above. The other checks run only
+  when the members are fine, and then the decoder of a strictly decoded body names only
+  the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
   `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
   way. The pull-upstream routes that are not strict, `POST /repos/pull-upstream` and its
   deprecated path form, name both `ref` and `after` when both have the wrong type. On
@@ -164,13 +189,14 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   routes can hide the checks after it. Every route that decodes its body as one JSON
   object names each field of the wrong type, as above, with these exceptions: the two
   strictly decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name
-  the first bad member or the first field of the wrong type, the `upstream` member of
-  `POST /repos` does the same, and `commit-pack`, `diff-commit` and `restore-commit`
-  follow their own rules. `POST /repos` decodes `upstream` and `base_repo` on their own
-  (see its body below), and only when the fields of the body itself (`repo_name`,
-  `default_branch`) have the right types: `{"default_branch":7,"base_repo":{"owner":1}}`
-  names only `default_branch`. When those fields are fine, a body with several fields of
-  the wrong type inside `base_repo` names each of them.
+  each bad member, or else the first field of the wrong type, the `upstream` member of
+  `POST /repos` names the first bad member or the first field of the wrong type, and
+  `commit-pack`, `diff-commit` and `restore-commit` follow their own rules. `POST
+  /repos` decodes `upstream` and `base_repo` on their own (see its body below), and only
+  when the fields of the body itself (`repo_name`, `default_branch`) have the right
+  types: `{"default_branch":7,"base_repo":{"owner":1}}` names only `default_branch`.
+  When those fields are fine, a body with several fields of the wrong type inside
+  `base_repo` names each of them.
   These bodies have `Content-Type: application/problem+json`, the type upstream documents
   for problem details, whatever the request's `Accept` header says. Before
   [#352](https://github.com/coder/openstorage/issues/352) item 5 they were
