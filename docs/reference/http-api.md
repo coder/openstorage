@@ -375,7 +375,8 @@ the same scopes, query parameters and responses.
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
 - A sync create whose values git cannot take → 400 `bad_request`, and nothing is
-  stored. An upstream URL (`https://{host}/{owner}/{name}.git`) over 131,070 bytes
+  stored. An upstream URL over 131,070 bytes (`https://{host}/{owner}/{name}.git`; a
+  host given with `http://` or `https://` is used as is, without its trailing `/`)
   names the `owner`, the `name`, and the host field when the body sent one
   (`upstream.host`, `base_repo.upstream_host`), each with the reason `must keep the
   upstream URL at most 131070 bytes` (message `invalid upstream URL (want at most
@@ -517,7 +518,8 @@ or NUL fails the sync as a configuration error. So does one over 131,042 bytes, 
 git gets it: git takes it as one environment entry, such as
 `OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
 The credential routes and `POST /repos` refuse such a long value, so only a value
-stored before they did reaches this check.
+stored without that check (before it, or by an older server during an upgrade) reaches
+this one.
 
 ### Files & trees (`git:read`)
 
@@ -838,16 +840,18 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /api/repos/{repo_name}/upstream/pull` | git:write | Path style only (spec 2026-10-05). Same handler, scope, ref-policy check and responses as `POST /repos/pull-upstream`. The optional, deprecated body `{ref?, after?}` is decoded strictly: an unknown field or a `null` → 400. Its fields are ignored |
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
-A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is over
-131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
-as one argument, and its HTTP transport hands it on with a `/` added, which must fit
-128 KiB with its terminating NUL. `POST /repos` refuses such a link with `400`
-([Repository lifecycle](#repository-lifecycle-repowrite--orgread)), so only a link
-registered before it did reaches this check. A stored credential that git cannot take fails the same
-way ([Git credentials](#git-credentials-generic-https-upstreams)). Values that each fit
-can still pass the total limit together: one git start can carry the URL twice and both
-credential entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB
-or less can fail such a run as a failed fetch or push.
+A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`, or the host
+as given when it has a scheme, without its trailing `/`) is over 131,070 bytes fails as
+`repository configuration error` before git starts. git gets the URL as one argument,
+and its HTTP transport hands it on with a `/` added, which must fit 128 KiB with its
+terminating NUL. `POST /repos` refuses such a link with `400` ([Repository
+lifecycle](#repository-lifecycle-repowrite--orgread)), so only a link stored without
+that check (before it, or by an older server during an upgrade) reaches this one. A
+stored credential that git cannot take fails the same way ([Git
+credentials](#git-credentials-generic-https-upstreams)). Values that each fit can still
+pass the total limit together: one git start can carry the URL twice and both credential
+entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB or less
+can fail such a run as a failed fetch or push.
 
 #### Deprecation header
 

@@ -51,10 +51,17 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 		}
 		return body(map[string]any{"upstream": cfg})
 	}
-	baseRepo := func(o, token string) string {
-		return body(map[string]any{"base_repo": map[string]any{
-			"provider": "gitea", "owner": o, "name": "n", "upstream_host": host, "auth": map[string]any{"token": token}}})
+	baseRepo := func(o, token string, extra ...map[string]any) string {
+		spec := map[string]any{"provider": "gitea", "owner": o, "name": "n", "upstream_host": host, "auth": map[string]any{"token": token}}
+		for _, e := range extra {
+			for k, v := range e {
+				spec[k] = v
+			}
+		}
+		return body(map[string]any{"base_repo": spec})
 	}
+	// A host with a scheme is used as is, without its trailing "/".
+	pathHost := "https://" + host + "/sub/"
 	if got := len(upsync.Upstream{Owner: owner(hostBase, "n", urlMax), Name: "n", UpstreamHost: host}.CloneURL()); got != urlMax {
 		t.Fatalf("the URL at the limit is %d bytes, want %d", got, urlMax)
 	}
@@ -79,9 +86,18 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 				urlMsg+`; invalid upstream access "x"`,
 				ipParam{"upstream.owner", urlWhy}, ipParam{"upstream.name", urlWhy},
 				ipParam{"upstream.access", "must be app or public"}, ipParam{"upstream.host", urlWhy}),
-			// A host with a problem of its own makes no URL.
-			post("upstream bad host is not a URL problem", upstream(over, map[string]any{"host": "bad host"}),
+			post("upstream URL over the limit with a host that has a path", upstream(owner(pathHost, "n", urlMax+1), map[string]any{"host": pathHost}),
+				urlMsg, ipParam{"upstream.owner", urlWhy}, ipParam{"upstream.name", urlWhy}, ipParam{"upstream.host", urlWhy}),
+			// A field with a problem of its own makes no URL, even when
+			// the URL would be over the limit.
+			post("upstream bad host is not a URL problem",
+				upstream(owner("https://bad host/", "n", urlMax+1), map[string]any{"host": "bad host"}),
 				`invalid upstream host "bad host"`, ipParam{"upstream.host", "is not a valid host"}),
+			post("upstream owner with a NUL is not a URL problem", upstream(over+"\x00", nil),
+				"invalid upstream.owner (want UTF-8 text without NUL)", ipParam{"upstream.owner", ipcNulReason}),
+			post("upstream name with a NUL is not a URL problem",
+				upstream("o", map[string]any{"name": strings.Repeat("n", urlMax) + "\x00"}),
+				"invalid upstream.name (want UTF-8 text without NUL)", ipParam{"upstream.name", ipcNulReason}),
 			post("base_repo URL one byte over", baseRepo(over, "t"), urlMsg,
 				ipParam{"base_repo.owner", urlWhy}, ipParam{"base_repo.name", urlWhy}, ipParam{"base_repo.upstream_host", urlWhy}),
 			post("base_repo token one byte over", baseRepo("o", strings.Repeat("t", credMax+1)),
@@ -90,13 +106,28 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 				urlMsg+"; invalid base_repo.auth.token (want at most 131042 bytes)",
 				ipParam{"base_repo.owner", urlWhy}, ipParam{"base_repo.name", urlWhy},
 				ipParam{"base_repo.auth.token", credWhy}, ipParam{"base_repo.upstream_host", urlWhy}),
+			// auth.token and default_branch lie between name and
+			// upstream_host in the docs: their items stay there.
+			post("base_repo URL, token and default branch",
+				baseRepo(over, strings.Repeat("t", credMax+1), map[string]any{"default_branch": "bad..name"}),
+				urlMsg+"; invalid base_repo.auth.token (want at most 131042 bytes); invalid default_branch",
+				ipParam{"base_repo.owner", urlWhy}, ipParam{"base_repo.name", urlWhy}, ipParam{"base_repo.auth.token", credWhy},
+				ipParam{"base_repo.default_branch", "is not a valid branch name"}, ipParam{"base_repo.upstream_host", urlWhy}),
+			post("base_repo URL over the limit with the default host",
+				body(map[string]any{"base_repo": map[string]any{"provider": "github", "owner": owner(githubBase, "n", urlMax+1), "name": "n"}}),
+				urlMsg, ipParam{"base_repo.owner", urlWhy}, ipParam{"base_repo.name", urlWhy}),
+			// A value over the limit that also holds a NUL is one problem.
+			post("base_repo token over with a NUL", baseRepo("o", strings.Repeat("t", credMax+1)+"\x00"),
+				"invalid base_repo.auth.token (want UTF-8 text without NUL)", ipParam{"base_repo.auth.token", ipcNulReason}),
 		})
 
 		// At the limits the link and its credential are stored.
 		atURL := createRepo(t, e, org, "lim-url-"+randomHex(t, 4), []byte(upstream(owner(hostBase, "n", urlMax), nil)), http.StatusCreated)
+		atPath := createRepo(t, e, org, "lim-path-"+randomHex(t, 4),
+			[]byte(upstream(owner(pathHost, "n", urlMax), map[string]any{"host": pathHost})), http.StatusCreated)
 		atBase := createRepo(t, e, org, "lim-base-"+randomHex(t, 4),
 			[]byte(baseRepo(owner(hostBase, "n", urlMax), strings.Repeat("t", credMax))), http.StatusCreated)
-		for _, created := range []createRepoResponse{atURL, atBase} {
+		for _, created := range []createRepoResponse{atURL, atPath, atBase} {
 			link, err := e.store.(meta.EventingStore).GetRepoUpstream(context.Background(), created.RepoID)
 			if err != nil {
 				t.Fatalf("upstream of %s: %v", created.RepoID, err)
@@ -138,6 +169,9 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 			{name: "POST username over with a NUL", method: http.MethodPost, path: v1, token: repoTok,
 				body: `{"username":"` + long + `\u0000","password":"p"}`, wantError: "invalid username (want UTF-8 text without NUL)",
 				want: []ipParam{{"username", ipcNulReason}}},
+			{name: "POST password over with a NUL", method: http.MethodPost, path: v1, token: repoTok,
+				body: `{"password":"` + long + `\u0000"}`, wantError: "invalid password (want UTF-8 text without NUL)",
+				want: []ipParam{{"password", ipcNulReason}}},
 		})
 		fresh, err := e.store.CreateRepo(context.Background(), org, "https://example.com/"+org+"/lim-fresh-"+randomHex(t, 4), "main")
 		if err != nil {
