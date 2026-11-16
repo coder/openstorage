@@ -136,6 +136,12 @@ Beyond the smart-HTTP wire format, the semantics clients depend on match git:
   The server asks git about at most eight distinct refused targets in one push. A push with
   more than eight of them, or on a server whose git is older than 2.39, stores its pack as
   before, and git still refuses each of those refs.
+  The server also declines the whole push when a ref would move to an object that the node's
+  cache holds and no registered pack of the repository holds (the cache was copied or edited
+  out of band, or the registry was rolled back). Every other node hydrates from the registered
+  packs alone and could not hold a ref at that object. A push that carries the object in its
+  pack is accepted. The check reads the object that the ref names, not the objects that it
+  refers to.
   A push that only deletes refs sends no objects and, within the server's own limits,
   keeps per-ref results.
   - **Documented deviation:** refs advance through per-ref compare-and-swap on the ref

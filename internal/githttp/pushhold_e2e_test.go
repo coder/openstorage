@@ -1604,7 +1604,10 @@ func TestPreReceive_PostReservationDenialReleasesHold(t *testing.T) {
 	// before reserving; run the hook from a work repo that has a commit.
 	work := initWorkRepo(t)
 	newSHA := revParse(t, work, "HEAD")
-	t.Chdir(work)
+	// A stored commit is held by a registered pack on a real node, and git
+	// runs hooks in the repository.
+	registerStoredCommits(t, laneStore, repo, work)
+	t.Chdir(filepath.Join(work, ".git"))
 
 	holdPath := filepath.Join(t.TempDir(), pushHoldDir, "push-prereceive")
 	if err := os.MkdirAll(filepath.Dir(holdPath), 0o755); err != nil {
