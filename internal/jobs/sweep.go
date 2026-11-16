@@ -322,8 +322,11 @@ func NewSweeper(blobs blob.BlobStore, packs PackRegistry, cfg SweepConfig, logge
 //     assumptions (see EnsurePublished's ordering proof).
 //
 // Any residual exposure (e.g. a reader racing the restore itself) is
-// transient, not data loss — hydration's bounded missing-pack retry
-// absorbs it — and the next sweep's heal pass remains the crash backstop.
+// transient, not data loss: a registered pack has no bytes until the restore
+// lands (one registry read plus one server-side copy), and a hydration that
+// finds the same pack missing on consecutive listings waits between them
+// (githttp.hydrateMissingWait) for that restore. The next sweep's heal pass
+// remains the backstop when the restore fails or the sweeper dies.
 func (s *Sweeper) Sweep(ctx context.Context) (SweepReport, error) {
 	report, err := s.sweep(ctx)
 	// ADR-48: one outcome per execution, on the choke point both queue
