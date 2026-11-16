@@ -993,8 +993,8 @@ func strictJSON(body []byte, dst any) error {
 // `detail`. 100 names of 32 bytes, each in those three members, take at
 // most 57,600 bytes of the answer, even when JSON escapes each byte to
 // six. No field name in upstream's spec has more than 25 bytes. An answer
-// that names one member keeps its whole name, as before (maxEchoBytes cuts
-// it).
+// that names one member keeps its whole name, as before (errtext.MaxBytes
+// cuts it).
 const maxListedNameBytes = 32
 
 // checkStrictObject verifies raw is a JSON object whose member names are
