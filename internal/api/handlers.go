@@ -616,7 +616,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// against refs/heads/HEAD must match. The pseudoref itself is checked
 	// separately inside the helper.
 	if op, denied := policyDeniesDefaultBranchChange(policies, target); denied {
-		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies changing the default branch")
+		writeErr(w, http.StatusForbidden, refPolicyOpDenies(op, "changing the default branch"))
 		return
 	}
 	// ADR-21: the repo claim carries the url or the repo_id; resolve either
@@ -788,7 +788,7 @@ func (s *server) handleDeleteRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if op, denied := policyDeniesRepoDelete(policies); denied {
-		writeErr(w, http.StatusForbidden, "ref policy op "+strconv.Quote(op)+" denies repository deletion")
+		writeErr(w, http.StatusForbidden, refPolicyOpDenies(op, "repository deletion"))
 		return
 	}
 	repo, err := s.store.SoftDeleteRepo(r.Context(), claims.Iss, claims.Repo)
