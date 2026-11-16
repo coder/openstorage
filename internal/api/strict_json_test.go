@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -31,6 +32,30 @@ func TestStrictJSONRejectsDuplicateMembers(t *testing.T) {
 	}
 	if dst.Note != "x" || dst.Author == nil || dst.Author.Name != "a" {
 		t.Fatalf("decoded %+v", dst)
+	}
+}
+
+// TestStrictJSONKeepsNoNamePastTheBound: a body of 1 MiB can hold 80,000
+// unknown members. The walk keeps the names of the first maxInvalidParams
+// of them and only counts the rest, so a member past the bound costs the
+// walk about two allocations (its name token). Keeping each member's
+// problem costs ten, and 48 MB for such a body.
+func TestStrictJSONKeepsNoNamePastTheBound(t *testing.T) {
+	const n = 20000
+	var b strings.Builder
+	b.WriteByte('{')
+	for i := range n {
+		fmt.Fprintf(&b, `"m%06d":1,`, i)
+	}
+	b.WriteString(`"note":"n"}`)
+	body := []byte(b.String())
+	allocs := testing.AllocsPerRun(1, func() {
+		if strictJSON(body, new(wrefNoteAppendRequest)) == nil {
+			t.Fatal("strictJSON succeeded")
+		}
+	})
+	if perMember := allocs / n; perMember > 3 {
+		t.Fatalf("%.1f allocations for each unknown member, want about 2", perMember)
 	}
 }
 

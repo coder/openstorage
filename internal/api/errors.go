@@ -188,13 +188,16 @@ func newProblem(w http.ResponseWriter, status int, code, msg string, params []in
 // `and N more` ending.
 const maxEchoBytes = 16384
 
-// boundEcho cuts s to maxEchoBytes at a rune boundary and ends it with an
+// boundEcho cuts s to maxEchoBytes (cutText).
+func boundEcho(s string) string { return cutText(s, maxEchoBytes) }
+
+// cutText cuts s to limit bytes at a rune boundary and ends it with an
 // ellipsis. A shorter s comes back unchanged.
-func boundEcho(s string) string {
-	if len(s) <= maxEchoBytes {
+func cutText(s string, limit int) string {
+	if len(s) <= limit {
 		return s
 	}
-	cut := maxEchoBytes
+	cut := limit
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}

@@ -1,7 +1,9 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
@@ -199,41 +201,126 @@ func TestNotesNameEveryInvalidField(t *testing.T) {
 	})
 }
 
-// TestNotesAppendNamesTheFirstBadMember: the strict decoder of POST
-// .../notes/append (not changed by this PR) stops at the first problem: the
-// first unknown, duplicate or null member, or member that must be an
-// object, in the order of the body. The field checks run only when the
-// members are fine.
-func TestNotesAppendNamesTheFirstBadMember(t *testing.T) {
+// TestStrictBodiesNameEveryBadMember: the strict decoders of POST
+// .../notes/append and POST .../upstream/pull name each unknown, duplicate
+// or null member, and each member that must be an object: the known members
+// in the order of the docs body (a member's own problem before those below
+// it), then the unknown ones in the order of the request. A body with one
+// bad member answers as before. The field checks run only when the members
+// are fine.
+func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
-		path := "/api/repos/" + fx.url + "/notes/append"
+		path, pull := "/api/repos/"+fx.url+"/notes/append", "/api/repos/"+fx.url+"/upstream/pull"
 		const prefix = "invalid JSON body: "
-		known := func(name, reason string) []ipParam { return []ipParam{{name, reason}} }
+		var (
+			null    = func(name string) ipParam { return ipParam{name, "must not be null"} }
+			unknown = func(name string) ipParam { return ipParam{name, "is not a known field"} }
+			twice   = func(name string) ipParam { return ipParam{name, "appears more than once"} }
+		)
 		ipRun(t, e, []ipCase{
+			// Several bad members.
+			{
+				name: "every kind, in the reverse of the docs order", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"zeta":1,"author":{"x":1,"name":null},"expected_ref_sha":null,"note":null,` +
+					`"sha":"a","sha":"b","object_ref":null,"alpha":2,"":3}`,
+				wantError: prefix + `object_ref must not be null; duplicate field "sha"; note must not be null` +
+					`; expected_ref_sha must not be null; author.name must not be null; unknown field "author.x"` +
+					`; unknown field "zeta"; unknown field "alpha"; unknown field ""`,
+				want: []ipParam{null("object_ref"), twice("sha"), null("note"), null("expected_ref_sha"), null("author.name"),
+					unknown("author.x"), unknown("zeta"), unknown("alpha")},
+			},
+			{
+				name: "an unknown member before a null one", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"zeta":1,"note":null}`, wantError: prefix + `note must not be null; unknown field "zeta"`,
+				want: []ipParam{null("note"), unknown("zeta")},
+			},
+			{
+				name: "a repeated object names its own problem first", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":{"x":1},"author":{}}`, wantError: prefix + `duplicate field "author"; unknown field "author.x"`,
+				want: []ipParam{twice("author"), unknown("author.x")},
+			},
+			{
+				name: "a member that must be an object", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":3,"bogus":1}`, wantError: prefix + `author must be a JSON object; unknown field "bogus"`,
+				want: []ipParam{{"author", "must be an object"}, unknown("bogus")},
+			},
+			{
+				name: "bad members before a syntax error", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"bogus":1,"note":null,`, wantError: prefix + `note must not be null; unknown field "bogus"`,
+				want: []ipParam{null("note"), unknown("bogus")},
+			},
+			{
+				name: "bad members before trailing data", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"bogus":1,"note":null} {}`, wantError: prefix + `note must not be null; unknown field "bogus"`,
+				want: []ipParam{null("note"), unknown("bogus")},
+			},
+			// A member named "author.name" and the name of an author object
+			// have one dotted path: one item, both messages.
+			{
+				name: "two members with one dotted path", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":{"name":null},"author.name":"v"}`, wantError: prefix + `author.name must not be null; unknown field "author.name"`,
+				want: []ipParam{null("author.name")},
+			},
+			{
+				name: "empty member names add their message only", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"":1,"bogus":1,"author":{"":1}}`, wantError: prefix + `unknown field "author."; unknown field ""; unknown field "bogus"`,
+				want: []ipParam{unknown("bogus")},
+			},
+			{
+				name: "pull: every kind", method: http.MethodPost, path: pull, token: fx.gitTok,
+				body: `{"x":1,"after":null,"ref":"a","ref":"b"}`, wantError: prefix + `duplicate field "ref"; after must not be null; unknown field "x"`,
+				want: []ipParam{twice("ref"), null("after"), unknown("x")},
+			},
+			// One bad member answers as before.
 			{
 				name: "one unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"sha":"main","note":"n","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: known("bogus", "is not a known field"),
+				body: `{"sha":"main","note":"n","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{unknown("bogus")},
 			},
 			{
 				name: "one dotted unknown member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"author.name":"v"}`, wantError: prefix + `unknown field "author.name"`, want: known("author.name", "is not a known field"),
+				body: `{"author.name":"v"}`, wantError: prefix + `unknown field "author.name"`, want: []ipParam{unknown("author.name")},
+			},
+			{
+				name: "one unknown member sent twice", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"bogus":1,"note":"n","bogus":2}`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{unknown("bogus")},
+			},
+			{
+				name: "one long unknown member keeps its whole name", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"` + strings.Repeat("x", 40) + `":1}`, wantError: prefix + `unknown field "` + strings.Repeat("x", 40) + `"`,
+				want: []ipParam{unknown(strings.Repeat("x", 40))},
+			},
+			{
+				name: "one null member sent again", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"note":null,"note":"n"}`, wantError: prefix + "note must not be null", want: []ipParam{null("note")},
 			},
 			{
 				name: "one duplicate member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"sha":"main","note":"n","note":"m"}`, wantError: prefix + `duplicate field "note"`, want: known("note", "appears more than once"),
+				body: `{"sha":"main","note":"n","note":"m"}`, wantError: prefix + `duplicate field "note"`, want: []ipParam{twice("note")},
 			},
 			{
 				name: "one null member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"sha":"main","note":"n","notes_ref":null}`, wantError: prefix + "notes_ref must not be null", want: known("notes_ref", "must not be null"),
+				body: `{"sha":"main","note":"n","notes_ref":null}`, wantError: prefix + "notes_ref must not be null", want: []ipParam{null("notes_ref")},
 			},
 			{
 				name: "one member that must be an object", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"author":3}`, wantError: prefix + "author must be a JSON object", want: known("author", "must be an object"),
+				body: `{"author":3}`, wantError: prefix + "author must be a JSON object", want: []ipParam{{"author", "must be an object"}},
 			},
 			{
 				name: "one empty member name", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"":1}`, wantError: prefix + `unknown field ""`,
+			},
+			{
+				name: "one empty member name sent twice", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"":1,"":2}`, wantError: prefix + `unknown field ""`,
+			},
+			{
+				name: "one bad member before a syntax error", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"bogus":1,"note":`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{unknown("bogus")},
+			},
+			{
+				name: "pull: one unknown member", method: http.MethodPost, path: pull, token: fx.gitTok,
+				body: `{"refs":"main"}`, wantError: prefix + `unknown field "refs"`, want: []ipParam{unknown("refs")},
 			},
 			{
 				name: "not an object", method: http.MethodPost, path: path, token: fx.gitTok,
@@ -243,27 +330,10 @@ func TestNotesAppendNamesTheFirstBadMember(t *testing.T) {
 				name: "trailing data", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"note":"n"} {}`, wantError: prefix + "body must be a JSON object",
 			},
-			// Several bad members: the first one in the order of the body.
-			{
-				name: "an unknown member before a null one", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"zeta":1,"note":null}`, wantError: prefix + `unknown field "zeta"`, want: known("zeta", "is not a known field"),
-			},
-			{
-				name: "a null member before an unknown one", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"note":null,"zeta":1}`, wantError: prefix + "note must not be null", want: known("note", "must not be null"),
-			},
-			{
-				name: "a member of an object, then a later member", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"author":{"x":1,"name":null},"bogus":1}`, wantError: prefix + `unknown field "author.x"`, want: known("author.x", "is not a known field"),
-			},
-			{
-				name: "a bad member before a syntax error", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"bogus":1,"note":`, wantError: prefix + `unknown field "bogus"`, want: known("bogus", "is not a known field"),
-			},
 			// A bad member answers before the field checks.
 			{
 				name: "a bad member and bad fields", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"note":"","notes_ref":"bad..name","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: known("bogus", "is not a known field"),
+				body: `{"note":"","notes_ref":"bad..name","bogus":1}`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{unknown("bogus")},
 			},
 			{
 				name: "fine members and bad fields", method: http.MethodPost, path: path, token: fx.gitTok,
@@ -272,5 +342,66 @@ func TestNotesAppendNamesTheFirstBadMember(t *testing.T) {
 				want:      []ipParam{{"object_ref", "is required"}, {"note", "is required"}, {"notes_ref", "must be a valid notes ref"}},
 			},
 		})
+	})
+}
+
+// TestStrictBodiesBoundTheNamesTheyRepeat: an unknown member name is request
+// text. An answer that names several members repeats at most 32 bytes of
+// each, so a 1 MiB body of long names answers with less than 70,000 bytes.
+// An answer that names one member keeps its name up to 16384 bytes
+// (TestLongValuesAreCutInAnswers).
+func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
+	// name is the i-th member name of 8,600 bytes of <, > and &, which JSON
+	// escapes to six bytes each. The names differ in their first 32 bytes.
+	name := func(i int) string {
+		b := make([]byte, 8600)
+		for k, x := 0, i; k < len(b); k, x = k+1, x/3 {
+			b[k] = "<>&"[x%3]
+		}
+		return string(b)
+	}
+	var names strings.Builder
+	var cut []ipParam
+	for i := range 120 {
+		names.WriteString(`"` + name(i) + `":1,`)
+		if i < 99 {
+			cut = append(cut, ipParam{name(i)[:32] + "…", "is not a known field"})
+		}
+	}
+	long := strings.Repeat("<", 20000)
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := ipNewFixture(t, e)
+		for _, tc := range []struct {
+			name, path, body, tail string
+			want                   []ipParam
+		}{
+			{"append: 120 long names", "/notes/append", "{" + names.String() + `"note":null}`, "; and 21 more",
+				append([]ipParam{{"note", "must not be null"}}, cut...)},
+			{"pull: 120 long names", "/upstream/pull", "{" + names.String() + `"after":null}`, "; and 21 more",
+				append([]ipParam{{"after", "must not be null"}}, cut...)},
+			{"append: a long name and a null member", "/notes/append", `{"` + long + `":1,"note":null}`,
+				`note must not be null; unknown field "` + long[:32] + `…"`,
+				[]ipParam{{"note", "must not be null"}, {long[:32] + "…", "is not a known field"}}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resp, body := e.doReq(t, http.MethodPost, "/api/repos/"+fx.url+tc.path, fx.gitTok, []byte(tc.body), "")
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400 (body %.300s)", resp.StatusCode, body)
+				}
+				msg := requireEnvelope(t, resp, body)
+				var p problemBody
+				if err := json.Unmarshal(body, &p); err != nil {
+					t.Fatal(err)
+				}
+				var got []ipParam
+				for _, ip := range p.InvalidParams {
+					got = append(got, ipParam{ip.Name, ip.Reason})
+				}
+				if len(body) >= 70_000 || !strings.HasSuffix(msg, tc.tail) || !slices.Equal(got, tc.want) {
+					t.Fatalf("%d bytes, message ends %q, %d items; want under 70,000 bytes, the end %q, %d items",
+						len(body), msg[max(0, len(msg)-60):], len(got), tc.tail, len(tc.want))
+				}
+			})
+		}
 	})
 }

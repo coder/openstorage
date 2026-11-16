@@ -76,10 +76,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   reason`, as upstream's example does (`default_branch must be a string`), and a body
   that is not valid JSON, or whose top-level value has the wrong type, as `invalid JSON
   body`. Three cases keep their own message. The two strictly decoded routes answer with
-  `invalid JSON body: ` and the problem that their member check found: `body must be a
-  JSON object`, `unknown field "x"`, `duplicate field "x"`, `x must not be null` or `x
-  must be a JSON object`. `restore-commit` answers every body that does not decode with
-  `body must be {"metadata": {...}}`. The `upstream` member, the copy form of
+  `invalid JSON body: ` and the problems that their member check found: `body must be a
+  JSON object`, or one or more of `unknown field "x"`, `duplicate field "x"`, `x must not
+  be null` and `x must be a JSON object`. `restore-commit` answers every body that does
+  not decode with `body must be {"metadata": {...}}`.
+  The `upstream` member, the copy form of
   `base_repo` and a branch create without `target_branch` refuse an unknown member, put
   it in `detail` (`invalid upstream: unknown field "branch"`) and name no
   `invalid_params` item. A
@@ -97,13 +98,22 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   state (for example, that a merge creates a commit and so needs an `author`) runs after
   the checks of the body. A strictly decoded
   body (`POST /api/repos/{repo_name}/notes/append` and `POST
-  /api/repos/{repo_name}/upstream/pull`) is checked for its members first, in the order
-  of the body, and the check stops at the first problem: the answer names the first
-  member that is unknown, repeated or `null`, or that must be an object and is not, and
-  none of the other problems. When the check reaches a JSON syntax error or trailing
-  data before it finds a bad member, the answer names no member. The other checks run
-  only when the members are fine, and then the decoder of a strictly decoded body names
-  only the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
+  /api/repos/{repo_name}/upstream/pull`) is checked for its members first: the answer
+  names each member that is unknown, repeated or `null`, or that must be an object and
+  is not, and none of the other problems. The members of the route's request body come
+  first, in its order in this document (the problem of an object member before the
+  problems of the members inside it), then the unknown members in the order of the
+  request. A member that the request repeats is named once, and two members with one
+  dotted path (an unknown member called `author.name`, and the `name` of an `author`
+  object) give one item with both messages. When the check reaches a JSON syntax error
+  or trailing data, the answer names the members that it found before that point, and
+  when there are none it is `body must be a JSON object`. An answer that names more than
+  one member cuts each unknown member name, which is request text, at 32 bytes and ends
+  it with `…`, so that a body of 1 MiB full of long names gets an answer of about 69,000
+  bytes. An answer that names one member keeps its name up to the cut of 16384 bytes
+  above. The other checks run only when the members are fine, and then the decoder of a
+  strictly decoded body names only the first field of the wrong type
+  (`{"note":1,"object_ref":2}` names `note`).
   `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
   way. The pull-upstream routes that are not strict, `POST /repos/pull-upstream` and its
   deprecated path form, name both `ref` and `after` when both have the wrong type. On
@@ -142,10 +152,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   The other routes with a request body do not collect problems yet: a check there can
   hide the checks after it. Every route that decodes its body as one JSON object names
   each field of the wrong type, as above, with these exceptions: the two strictly
-  decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name the first
-  bad member or the first field of the wrong type, the `upstream` member of `POST /repos`
-  does the same, and `commit-pack`, `diff-commit` and `restore-commit` follow their own
-  rules. `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
+  decoded bodies (`POST .../notes/append` and `POST .../upstream/pull`) name each bad
+  member, or else the first field of the wrong type, the `upstream` member of `POST
+  /repos` names the first bad member or the first field of the wrong type, and
+  `commit-pack`, `diff-commit` and `restore-commit` follow their own rules.
+  `POST /repos` decodes `upstream` and `base_repo` on their own (see its body
   below), and only when the fields of the body itself (`repo_name`, `default_branch`)
   have the right types: `{"default_branch":7,"base_repo":{"owner":1}}` names only
   `default_branch`. When those fields are fine, a body with several fields of the wrong
