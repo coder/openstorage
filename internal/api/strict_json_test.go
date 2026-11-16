@@ -37,9 +37,9 @@ func TestStrictJSONRejectsDuplicateMembers(t *testing.T) {
 
 // TestStrictJSONKeepsNoNamePastTheBound: a body of 1 MiB can hold 80,000
 // unknown members. The walk keeps the names of the first maxInvalidParams
-// of them and only counts the rest, so a member past the bound costs the
-// walk about two allocations (its name token). Keeping each member's
-// problem costs ten, and 48 MB for such a body.
+// of them and a hash of each of the others, so a member past the bound
+// costs the walk about two allocations (its name token). Keeping each
+// member's problem costs ten, and 48 MB for such a body.
 func TestStrictJSONKeepsNoNamePastTheBound(t *testing.T) {
 	const n = 20000
 	var b strings.Builder

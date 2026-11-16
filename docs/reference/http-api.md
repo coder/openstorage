@@ -119,10 +119,17 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   when there are none it is `body must be a JSON object`. An answer that names more than
   one member cuts each unknown member name, which is request text, at 32 bytes and ends
   it with `…`, so that a body of 1 MiB full of long names gets an answer of about 69,000
-  bytes. An answer that names one member keeps its name up to the cut of 16384 bytes
-  above. The other checks run only when the members are fine, and then the decoder of a
-  strictly decoded body names only the first field of the wrong type
-  (`{"note":1,"object_ref":2}` names `note`).
+  bytes. Two unknown names that are the same in their first 32 bytes give one item, for
+  the first of them, and `and N more` counts the others, so that a name appears once in
+  `invalid_params`. The body and `author` each keep their first 100 unknown member
+  names, and `and N more` counts the others. N counts each member that the answer
+  leaves out once: a member that the request repeats, or that has the dotted path of a
+  member named or counted already, adds nothing. Past the 100 names of an object the
+  count compares 64-bit hashes of the names, so two of them count as one in about one
+  body of 1 MiB in a billion. An answer that names one member keeps its name up to the
+  cut of 16384 bytes above. The other checks run only when the members are fine, and
+  then the decoder of a strictly decoded body names only the first field of the wrong
+  type (`{"note":1,"object_ref":2}` names `note`).
   `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same
   way. The pull-upstream routes that are not strict, `POST /repos/pull-upstream` and its
   deprecated path form, name both `ref` and `after` when both have the wrong type. On

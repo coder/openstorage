@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -263,6 +264,17 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 				want: []ipParam{null("author.name")},
 			},
 			{
+				name: "one dotted path with one message twice", method: http.MethodPost, path: path, token: fx.gitTok,
+				body: `{"author":{"x":1},"author.x":1,"note":null}`, wantError: prefix + `note must not be null; unknown field "author.x"`,
+				want: []ipParam{null("note"), unknown("author.x")},
+			},
+			{
+				name: "one dotted path cut to two names", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"author":{"` + strings.Repeat("x", 40) + `":1},"author.` + strings.Repeat("x", 40) + `":1}`,
+				wantError: prefix + `unknown field "author.` + strings.Repeat("x", 32) + `…"; unknown field "author.` + strings.Repeat("x", 25) + `…"`,
+				want:      []ipParam{unknown("author." + strings.Repeat("x", 32) + "…")},
+			},
+			{
 				name: "empty member names add their message only", method: http.MethodPost, path: path, token: fx.gitTok,
 				body: `{"":1,"bogus":1,"author":{"":1}}`, wantError: prefix + `unknown field "author."; unknown field ""; unknown field "bogus"`,
 				want: []ipParam{unknown("bogus")},
@@ -282,8 +294,9 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 				body: `{"author.name":"v"}`, wantError: prefix + `unknown field "author.name"`, want: []ipParam{unknown("author.name")},
 			},
 			{
-				name: "one unknown member sent twice", method: http.MethodPost, path: path, token: fx.gitTok,
-				body: `{"bogus":1,"note":"n","bogus":2}`, wantError: prefix + `unknown field "bogus"`, want: []ipParam{unknown("bogus")},
+				name: "one long unknown member sent twice", method: http.MethodPost, path: path, token: fx.gitTok,
+				body:      `{"` + strings.Repeat("x", 40) + `":1,"note":"n","` + strings.Repeat("x", 40) + `":2}`,
+				wantError: prefix + `unknown field "` + strings.Repeat("x", 40) + `"`, want: []ipParam{unknown(strings.Repeat("x", 40))},
 			},
 			{
 				name: "one long unknown member keeps its whole name", method: http.MethodPost, path: path, token: fx.gitTok,
@@ -349,7 +362,11 @@ func TestStrictBodiesNameEveryBadMember(t *testing.T) {
 // text. An answer that names several members repeats at most 32 bytes of
 // each, so a 1 MiB body of long names answers with less than 70,000 bytes.
 // An answer that names one member keeps its name up to 16384 bytes
-// (TestLongValuesAreCutInAnswers).
+// (TestLongValuesAreCutInAnswers). A name that an earlier item shows after
+// the cut gives no item of its own and counts in `and N more`. Each object
+// keeps 100 unknown names, and `and N more` counts each member that the
+// answer leaves out once: a repeat, or a member with the dotted path of a
+// named or counted one, adds nothing.
 func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 	// name is the i-th member name of 8,600 bytes of <, > and &, which JSON
 	// escapes to six bytes each. The names differ in their first 32 bytes.
@@ -369,6 +386,27 @@ func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 		}
 	}
 	long := strings.Repeat("<", 20000)
+	// members is n members called prefix0, prefix1, ..., and unknown the
+	// items that name the first n of them below the dotted path path.
+	members := func(prefix string, n int) string {
+		var b strings.Builder
+		for i := range n {
+			fmt.Fprintf(&b, `"%s%d":1,`, prefix, i)
+		}
+		return b.String()
+	}
+	unknown := func(path string, n int) []ipParam {
+		var items []ipParam
+		for i := range n {
+			items = append(items, ipParam{fmt.Sprintf("%s%d", path, i), "is not a known field"})
+		}
+		return items
+	}
+	var alike strings.Builder // 150 names with one first 32 bytes
+	for i := range 150 {
+		fmt.Fprintf(&alike, `"%s%03d":1,`, strings.Repeat("p", 32), i)
+	}
+	nullNote, nullName := []ipParam{{"note", "must not be null"}}, []ipParam{{"author.name", "must not be null"}}
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := ipNewFixture(t, e)
 		for _, tc := range []struct {
@@ -382,6 +420,18 @@ func TestStrictBodiesBoundTheNamesTheyRepeat(t *testing.T) {
 			{"append: a long name and a null member", "/notes/append", `{"` + long + `":1,"note":null}`,
 				`note must not be null; unknown field "` + long[:32] + `…"`,
 				[]ipParam{{"note", "must not be null"}, {long[:32] + "…", "is not a known field"}}},
+			{"append: names cut to one text", "/notes/append", "{" + alike.String() + `"note":null}`,
+				`; unknown field "` + strings.Repeat("p", 32) + `…"; and 149 more`,
+				append(nullNote, ipParam{strings.Repeat("p", 32) + "…", "is not a known field"})},
+			{"append: repeats of left-out names", "/notes/append",
+				"{" + members("u", 100) + strings.Repeat(`"zz":1,"yy":1,`, 500) + `"note":"n"}`, "; and 2 more", unknown("u", 100)},
+			{"append: 120 names in author", "/notes/append", `{"note":null,"author":{` + strings.TrimSuffix(members("n", 120), ",") + "}}",
+				"; and 21 more", append(nullNote, unknown("author.n", 99)...)},
+			{"append: a counted field named twice", "/notes/append",
+				`{"author":{"name":null,` + members("u", 100) + `"q":1},"author.u99":1,"author.q":1}`, "; and 2 more", append(nullName, unknown("author.u", 99)...)},
+			{"append: a left-out name that an item names", "/notes/append",
+				`{"author":{"x":1},` + members("t", 100) + `"author.x":1}`, "; and 1 more",
+				append([]ipParam{{"author.x", "is not a known field"}}, unknown("t", 99)...)},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, body := e.doReq(t, http.MethodPost, "/api/repos/"+fx.url+tc.path, fx.gitTok, []byte(tc.body), "")

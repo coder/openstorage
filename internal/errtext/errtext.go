@@ -10,13 +10,16 @@ import "unicode/utf8"
 // escapes to six, would otherwise make an answer of several MiB.
 const MaxBytes = 16384
 
-// Bound cuts s to MaxBytes at a rune boundary and ends it with an
+// Bound cuts s to MaxBytes (Cut).
+func Bound(s string) string { return Cut(s, MaxBytes) }
+
+// Cut cuts s to limit bytes at a rune boundary and ends it with an
 // ellipsis. A shorter s comes back unchanged.
-func Bound(s string) string {
-	if len(s) <= MaxBytes {
+func Cut(s string, limit int) string {
+	if len(s) <= limit {
 		return s
 	}
-	cut := MaxBytes
+	cut := limit
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
