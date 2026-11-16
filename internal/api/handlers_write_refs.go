@@ -386,27 +386,19 @@ func wrefValidateCreateBranch(req *wrefCreateBranchRequest) (target string, allo
 	return target, allocate, guard, errs.err()
 }
 
-// wrefResolveHeld is gitread.ResolveRef for a write that stores the commit in a
-// ref. The commit must also be in a pack that the registry lists for the
-// repository: the node's cache can hold objects that no registered pack holds
-// (a cache that was copied or edited out of band, or a registry that was rolled
-// back), and a ref at such an object wedges every other node and this node
+// wrefHeldCommit reports whether a pack that the registry lists for the
+// repository holds the commit sha. A write that stores the commit in a ref
+// must ask: the node's cache can hold objects that no registered pack holds (a
+// cache that was copied or edited out of band, or a registry that was rolled
+// back), and a ref at such an object wedges every other node, and this node
 // after its cache is gone, because they hydrate from the registered packs
-// alone. A commit that no registered pack holds answers like one that does not
-// exist.
-func (s *server) wrefResolveHeld(ctx context.Context, repoID, repoPath, spec string, ephemeral bool) (string, error) {
-	sha, err := gitread.ResolveRef(ctx, repoPath, spec, ephemeral)
-	if err != nil {
-		return "", err
-	}
+// alone.
+func (s *server) wrefHeldCommit(ctx context.Context, repoID, repoPath, sha string) (bool, error) {
 	kinds, err := gitread.RegisteredKinds(ctx, s.refStore, s.blobStore, repoPath, repoID, []string{sha})
 	if err != nil {
-		return "", fmt.Errorf("check that a registered pack holds %s: %w", sha, err)
+		return false, err
 	}
-	if kinds[sha] != "commit" {
-		return "", gitread.ErrNotFound
-	}
-	return sha, nil
+	return kinds[sha] == "commit", nil
 }
 
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
@@ -457,127 +449,139 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	baseSHA := ""
-	if base != "" {
-		sha, err := s.wrefResolveHeld(ctx, repo.RepoID, repoPath, base, req.BaseIsEphemeral)
-		switch {
-		case errors.Is(err, gitread.ErrNotFound):
-			// Fall through to preferred_base below (when given). An
-			// unreadable base is an error below, never a fallback.
-		case err != nil:
-			s.internalErr(w, r, "resolve base ref", err)
-			return
-		default:
-			baseSHA = sha
-		}
-	}
-	if baseSHA == "" && req.PreferredBase != "" {
-		sha, err := s.wrefResolveHeld(ctx, repo.RepoID, repoPath, req.PreferredBase, req.BaseIsEphemeral)
-		switch {
-		case errors.Is(err, gitread.ErrNotFound):
-			// Report below with the primary-base message.
-		case err != nil:
-			s.internalErr(w, r, "resolve preferred base ref", err)
-			return
-		default:
-			baseSHA = sha
-		}
-	}
-	if baseSHA == "" {
-		writeProblem(w, http.StatusNotFound, codeRefNotFound, "base ref not found")
-		return
-	}
-	attempts := 1
-	if allocate {
-		attempts = 8
-	}
-	for range attempts {
+	// create runs the creation at one resolved base. It returns false, with no
+	// response written, when no registered pack holds the base commit: the
+	// node's cache can hold objects that no registered pack holds (a cache that
+	// was copied or edited out of band, or a registry that was rolled back), and
+	// a ref at such an object wedges every other node, and this node after its
+	// cache is gone, because they hydrate from the registered packs alone. The
+	// registry is read only for a request that is about to write: a denied
+	// request, and one that leaves the branch where it is, never read it.
+	create := func(baseSHA string) bool {
+		held := false
+		attempts := 1
 		if allocate {
-			targetBranch = rand.Text()
-			assertf(wrefValidNewBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
+			attempts = 8
 		}
-		targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
-		// The CAS precondition: zero for plain create, the tip read above
-		// when force re-creates an existing branch or a guard moves it.
-		oldSHA := current
-		// Without force, a guarded move only fast-forwards (upstream's 412
-		// for "a branch creation whose target cannot be fast-forwarded").
-		if !req.Force && oldSHA != ref.ZeroSHA {
-			ff, err := wrefIsAncestor(ctx, repoPath, nil, oldSHA, baseSHA)
-			if err != nil {
-				s.internalErr(w, r, "check fast-forward", err)
-				return
-			}
-			if !ff {
-				writeErr(w, http.StatusPreconditionFailed,
-					"branch "+targetBranch+" cannot be fast-forwarded to "+baseSHA+" without force")
-				return
-			}
-		}
-		deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
-			return wrefIsAncestor(ctx, repoPath, nil, a, b)
-		})
-		if err != nil {
-			s.internalErr(w, r, "evaluate ref policy", err)
-			return
-		}
-		if deny != "" {
-			writeErr(w, http.StatusForbidden, deny)
-			return
-		}
-		// The branch is already at the base: no ref write, so no
-		// generation bump, webhook or sync poke for an unchanged ref. The
-		// tip was read before the base resolved, so read it again, as the
-		// CAS would have checked it.
-		if oldSHA != ref.ZeroSHA && oldSHA == baseSHA {
-			now, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
-			switch {
-			case !ok:
-			case now == oldSHA:
-				wrefCreateBranchOK(w, "branch updated", targetBranch, req.TargetIsEphemeral, baseSHA)
-			case guard != "":
-				wrefFailTargetGuard(w, guard, now)
-			default:
-				writeErr(w, http.StatusConflict, "branch moved concurrently")
-			}
-			return
-		}
-		won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
-		if err != nil {
-			s.internalErr(w, r, "create branch ref", err)
-			return
-		}
-		if !won {
+		for range attempts {
 			if allocate {
-				continue
+				targetBranch = rand.Text()
+				assertf(wrefValidNewBranchInput(targetBranch), "invalid allocated branch name %q", targetBranch)
 			}
-			// The tip moved after the guard check: report the guard when the
-			// new tip fails it.
-			if guard != "" {
-				current, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+			targetRef := wrefRefName(targetBranch, req.TargetIsEphemeral)
+			// The CAS precondition: zero for plain create, the tip read above
+			// when force re-creates an existing branch or a guard moves it.
+			oldSHA := current
+			// Without force, a guarded move only fast-forwards (upstream's 412
+			// for "a branch creation whose target cannot be fast-forwarded").
+			if !req.Force && oldSHA != ref.ZeroSHA {
+				ff, err := wrefIsAncestor(ctx, repoPath, nil, oldSHA, baseSHA)
+				if err != nil {
+					s.internalErr(w, r, "check fast-forward", err)
+					return true
+				}
+				if !ff {
+					writeErr(w, http.StatusPreconditionFailed,
+						"branch "+targetBranch+" cannot be fast-forwarded to "+baseSHA+" without force")
+					return true
+				}
+			}
+			deny, err := wrefPolicyCheck(mustClaims(r), targetRef, oldSHA, baseSHA, func(a, b string) (bool, error) {
+				return wrefIsAncestor(ctx, repoPath, nil, a, b)
+			})
+			if err != nil {
+				s.internalErr(w, r, "evaluate ref policy", err)
+				return true
+			}
+			if deny != "" {
+				writeErr(w, http.StatusForbidden, deny)
+				return true
+			}
+			// The branch is already at the base: no ref write, so no
+			// generation bump, webhook or sync poke for an unchanged ref. The
+			// tip was read before the base resolved, so read it again, as the
+			// CAS would have checked it.
+			if oldSHA != ref.ZeroSHA && oldSHA == baseSHA {
+				now, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+				switch {
+				case !ok:
+				case now == oldSHA:
+					wrefCreateBranchOK(w, "branch updated", targetBranch, req.TargetIsEphemeral, baseSHA)
+				case guard != "":
+					wrefFailTargetGuard(w, guard, now)
+				default:
+					writeErr(w, http.StatusConflict, "branch moved concurrently")
+				}
+				return true
+			}
+			if !held {
+				ok, err := s.wrefHeldCommit(ctx, repo.RepoID, repoPath, baseSHA)
+				if err != nil {
+					s.internalErr(w, r, "check that a registered pack holds the base", err)
+					return true
+				}
 				if !ok {
-					return
+					return false
 				}
-				if current != guard {
-					wrefFailTargetGuard(w, guard, current)
-					return
+				held = true
+			}
+			won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
+			if err != nil {
+				s.internalErr(w, r, "create branch ref", err)
+				return true
+			}
+			if !won {
+				if allocate {
+					continue
 				}
+				// The tip moved after the guard check: report the guard when the
+				// new tip fails it.
+				if guard != "" {
+					current, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+					if !ok {
+						return true
+					}
+					if current != guard {
+						wrefFailTargetGuard(w, guard, current)
+						return true
+					}
+				}
+				if req.Force || oldSHA != ref.ZeroSHA {
+					writeErr(w, http.StatusConflict, "branch moved concurrently")
+					return true
+				}
+				writeErr(w, http.StatusConflict, "branch already exists")
+				return true
 			}
-			if req.Force || oldSHA != ref.ZeroSHA {
-				writeErr(w, http.StatusConflict, "branch moved concurrently")
-				return
+			message := "branch created"
+			if oldSHA != ref.ZeroSHA {
+				message = "branch updated"
 			}
-			writeErr(w, http.StatusConflict, "branch already exists")
+			wrefCreateBranchOK(w, message, targetBranch, req.TargetIsEphemeral, baseSHA)
+			return true
+		}
+		writeErr(w, http.StatusConflict, "could not allocate an unused branch name")
+		return true
+	}
+	for _, c := range []struct{ spec, what string }{{base, "resolve base ref"}, {req.PreferredBase, "resolve preferred base ref"}} {
+		if c.spec == "" {
+			continue
+		}
+		sha, err := gitread.ResolveRef(ctx, repoPath, c.spec, req.BaseIsEphemeral)
+		switch {
+		case errors.Is(err, gitread.ErrNotFound):
+			// Fall through to preferred_base (when given). An unreadable base is
+			// an error, never a fallback.
+			continue
+		case err != nil:
+			s.internalErr(w, r, c.what, err)
 			return
 		}
-		message := "branch created"
-		if oldSHA != ref.ZeroSHA {
-			message = "branch updated"
+		if create(sha) {
+			return
 		}
-		wrefCreateBranchOK(w, message, targetBranch, req.TargetIsEphemeral, baseSHA)
-		return
 	}
-	writeErr(w, http.StatusConflict, "could not allocate an unused branch name")
+	writeProblem(w, http.StatusNotFound, codeRefNotFound, "base ref not found")
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +779,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	sha, err := s.wrefResolveHeld(r.Context(), repo.RepoID, repoPath, target, false)
+	sha, err := gitread.ResolveRef(r.Context(), repoPath, target, false)
 	switch {
 	case errors.Is(err, gitread.ErrNotFound):
 		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref does not resolve to a commit")
@@ -792,6 +796,25 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 	}
 	if deny != "" {
 		writeErr(w, http.StatusForbidden, deny)
+		return
+	}
+	// The registry is read only for a request that is about to write: a denied
+	// request, and one for a tag that exists, never read it.
+	cur, ok := s.wrefTip(w, r, repo.RepoID, refName)
+	if !ok {
+		return
+	}
+	if cur != ref.ZeroSHA {
+		writeErr(w, http.StatusConflict, "tag already exists")
+		return
+	}
+	held, err := s.wrefHeldCommit(r.Context(), repo.RepoID, repoPath, sha)
+	switch {
+	case err != nil:
+		s.internalErr(w, r, "check that a registered pack holds the tag target", err)
+		return
+	case !held:
+		writeProblem(w, http.StatusNotFound, codeRefNotFound, "ref does not resolve to a commit")
 		return
 	}
 	won, err := s.refStore.CASRef(r.Context(), repo.RepoID, refName, ref.ZeroSHA, sha)

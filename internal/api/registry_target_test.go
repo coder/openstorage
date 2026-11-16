@@ -12,9 +12,12 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // plantCacheOnlyCommit writes a commit (a child of parent, with a new blob) as
@@ -101,6 +104,89 @@ func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
 					t.Fatalf("%s = %q, want %s", tc.ref, got, fx.c1)
 				}
 			})
+		}
+	})
+}
+
+// countsPackListings counts the listings of the registry's packs.
+type countsPackListings struct {
+	ref.Store
+	n atomic.Int64
+}
+
+func (c *countsPackListings) ListPacks(ctx context.Context, repo string) ([]ref.Pack, error) {
+	c.n.Add(1)
+	return c.Store.ListPacks(ctx, repo)
+}
+
+// The registry is read only for a request that is about to write a ref. A
+// writer with a token can send the same request again and again, and a request
+// that the ref policy denies, that names a tag that exists, or that leaves a
+// branch where it is, must not cost a registry read and a view of the cache.
+func TestRefWritesReadTheRegistryOnlyBeforeAWrite(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		if _, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main"); err != nil {
+			t.Fatal(err)
+		}
+		counter := &countsPackListings{Store: e.refStore}
+		e.refStore = counter
+		srv := newWrefServer(t, e)
+		denyAll := e.mint(t, tokenSpec{iss: fx.org, repo: fx.url,
+			scopes: []string{auth.ScopeGitRead, auth.ScopeGitWrite}, refs: `[["refs/*", ["no-push"]]]`})
+
+		for _, tc := range []struct {
+			name   string
+			path   string
+			token  string
+			body   map[string]any
+			status int
+		}{
+			{"policy denies a branch", "/api/v1/repos/branches/create", denyAll, map[string]any{"target_branch": "denied", "base_ref": fx.c1}, http.StatusForbidden},
+			{"policy denies a tag", "/api/v1/repos/tags", denyAll, map[string]any{"name": "denied", "ref": fx.c1}, http.StatusForbidden},
+			{"the tag exists", "/api/v1/repos/tags", fx.token, map[string]any{"name": "annot", "ref": fx.c1}, http.StatusConflict},
+			{"the branch is already at the base", "/api/v1/repos/branches/create", fx.token, map[string]any{"target_branch": "feature", "base_ref": fx.c1, "force": true}, http.StatusOK},
+		} {
+			before := counter.n.Load()
+			resp, body := wrefDo(t, srv, http.MethodPost, tc.path, tc.token, tc.body)
+			if resp.StatusCode != tc.status {
+				t.Fatalf("%s: status %d, want %d, body %v", tc.name, resp.StatusCode, tc.status, body)
+			}
+			if got := counter.n.Load() - before; got != 0 {
+				t.Errorf("%s: the request listed the registry's packs %d times, want 0", tc.name, got)
+			}
+		}
+
+		// A request that writes asks the registry.
+		before := counter.n.Load()
+		resp, body := wrefDo(t, srv, http.MethodPost, "/api/v1/repos/tags", fx.token, map[string]any{"name": "fresh", "ref": fx.c1})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("a new tag: status %d, body %v", resp.StatusCode, body)
+		}
+		if counter.n.Load() == before {
+			t.Error("a request that writes a ref did not ask the registry")
+		}
+	})
+}
+
+// A base that only the cache holds names no usable commit, so a registered
+// preferred_base is still the fallback.
+func TestBranchCreateFallsBackToPreferredBaseWhenTheBaseIsOnlyInTheCache(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		planted := plantCacheOnlyCommit(t, repoPath, fx.c2)
+		srv := newWrefServer(t, e)
+		resp, body := wrefDo(t, srv, http.MethodPost, "/api/v1/repos/branches/create", fx.token,
+			map[string]any{"target_branch": "fallback", "base_ref": planted, "preferred_base": fx.c1})
+		if resp.StatusCode != http.StatusOK || body["commit_sha"] != fx.c1 {
+			t.Fatalf("status %d, body %v, want 200 at the registered preferred_base %s", resp.StatusCode, body, fx.c1)
+		}
+		if got := wrefRefs(t, e, fx.repoID)["refs/heads/fallback"]; got != fx.c1 {
+			t.Fatalf("refs/heads/fallback = %q, want %s", got, fx.c1)
 		}
 	})
 }
