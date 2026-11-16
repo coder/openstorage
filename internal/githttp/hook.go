@@ -1481,8 +1481,11 @@ func atomicPushDFCheck(commands []refCommand) error {
 // containing any denied command, or any command that git refuses before the
 // update hook (reachesUpdateHook), whose other commands all target
 // already-stored objects is refused whole —
-// its pack could only serve the denied refs (round-7 decoy) — with a
-// message telling the client to push the allowed updates separately. It
+// its pack could only serve the denied refs (round-7 decoy) — and a policy
+// denial's message tells the client to push the allowed updates separately.
+// The checks of reachesUpdateHook are asked once for each distinct target and
+// at most maxGitRefusedProbes times for targets that fail (gitRefusalProbe), so
+// a push with many incomplete commands costs a bounded number of git children. It
 // reuses the shared verdicts (enforceRefPolicy, plus the refusals of hidden
 // refs and of names the server cannot store) — the quarantine is visible to
 // pre-receive via git's alternates, so is-ancestor and verify-sig checks
@@ -1526,6 +1529,7 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 	// The first command that git refuses before the update hook runs (see
 	// reachesUpdateHook): it can never land, so its pack is no reason to publish.
 	gitRefused := ""
+	probe := newGitRefusalProbe(reachesUpdateHook)
 	for i, c := range commands {
 		// Verdicts are the caller's single shared policy evaluation
 		// (Codex round-4 P2 on #173: re-evaluating here double-charged
@@ -1544,7 +1548,7 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 		if c.new != ref.ZeroSHA && !objectInMainStore(c.new) {
 			switch {
 			case needsPack:
-			case reachesUpdateHook(c.new):
+			case probe.reaches(c.new):
 				needsPack = true
 			case gitRefused == "":
 				gitRefused = c.ref
@@ -2931,6 +2935,44 @@ func objectExists(sha string) bool {
 	panic(fmt.Sprintf("githttp assertion failed: cat-file -e %s: %v", sha, err))
 }
 
+// maxGitRefusedProbes bounds the connectivity checks that one push may spend
+// on commands that fail them. Each check walks the new objects of one command,
+// and a writer can send a push with hundreds of commands that name incomplete
+// histories. A push that has more distinct failing targets than this publishes
+// its pack as it did before the check existed (see gitRefusalProbe).
+const maxGitRefusedProbes = 8
+
+// gitRefusalProbe asks reach once for each distinct target, and stops asking
+// once maxGitRefusedProbes targets have failed. A target that it did not ask
+// about reads as reaching the update hook: the gate then publishes, as it did
+// before the check, because a quota-counted junk pack costs less than a wrong
+// refusal of a push that git accepts. The gate stops asking at the first target
+// that passes, so one push spends at most maxGitRefusedProbes+1 checks.
+type gitRefusalProbe struct {
+	reach   func(sha string) bool
+	known   map[string]bool
+	refused int
+}
+
+func newGitRefusalProbe(reach func(sha string) bool) *gitRefusalProbe {
+	return &gitRefusalProbe{reach: reach, known: map[string]bool{}}
+}
+
+func (p *gitRefusalProbe) reaches(sha string) bool {
+	if r, ok := p.known[sha]; ok {
+		return r
+	}
+	if p.refused >= maxGitRefusedProbes {
+		return true
+	}
+	r := p.reach(sha)
+	p.known[sha] = r
+	if !r {
+		p.refused++
+	}
+	return r
+}
+
 // reachesUpdateHook reports whether git's own connectivity check passes for sha.
 // receive-pack runs one such check over all commands before it runs any hook
 // (rev-list --objects --stdin --not --all, with the hidden refs excluded, over
@@ -2940,11 +2982,12 @@ func objectExists(sha string) bool {
 // it lacks the parents of its commits, so this check fails for it as well. git
 // still runs pre-receive for such a command, but the update hook never runs for
 // it, so no ref can ever point into a pack that only it needs. An exit of 128
-// is the answer "no": git cannot read the objects that the command needs. Any other status says nothing about the command (a git without
-// --exclude-hidden, before 2.39, answers 129; a signal or an out-of-memory kill
-// ends it too), so the answer is "yes" and the gate publishes as it did before:
-// a wrong refusal of a push that git accepts is worse than one junk pack. A git
-// that cannot start is a bug, which fails fast like objectExists.
+// is the answer "no": git cannot read the objects that the command needs. Any
+// other status says nothing about the command (a git without --exclude-hidden,
+// before 2.39, answers 129; a signal or an out-of-memory kill ends it too), so
+// the answer is "yes" and the gate publishes as it did before: a wrong refusal
+// of a push that git accepts is worse than one junk pack. A git that cannot
+// start is a bug, which fails fast like objectExists.
 func reachesUpdateHook(sha string) bool {
 	cmd := exec.Command("git", "rev-list", "--objects", "--stdin", "--not", "--exclude-hidden=receive", "--all", "--quiet", "--alternate-refs")
 	cmd.Stdin = strings.NewReader(sha + "\n")
