@@ -28,6 +28,7 @@ var cloudMetadataAddrs = []string{
 	"fd00:a9fe:a9fe::1",  // Akamai (Linode) IPv6
 	"fe80::a9fe:a9fe",    // OpenStack, Hetzner and Akamai IPv6
 	"fd00:c1::a9fe:a9fe", // Oracle Cloud IPv6
+	"168.63.129.16",      // Azure WireServer
 	"192.0.0.192",        // Oracle Cloud Infrastructure Classic
 }
 
@@ -123,5 +124,14 @@ func TestTargetGuardMetadataNeighborsKeepTheirClass(t *testing.T) {
 				t.Fatalf("strict: deniedReason = %q, want the reason of its private class", got)
 			}
 		})
+	}
+	// Azure's WireServer is a public address: its neighbours are admitted
+	// under every policy.
+	for _, raw := range []string{"168.63.129.15", "168.63.129.17"} {
+		for _, allow := range []bool{false, true} {
+			if got := (TargetGuard{AllowPrivate: allow}).deniedReason(netip.MustParseAddr(raw)); got != "" {
+				t.Errorf("%s (AllowPrivate %v): deniedReason = %q, want admitted", raw, allow, got)
+			}
+		}
 	}
 }

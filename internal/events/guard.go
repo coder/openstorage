@@ -98,12 +98,18 @@ const dialTimeout = 10 * time.Second
 //   - fd00:a9fe:a9fe::1: Akamai (Linode) metadata over IPv6
 //     (techdocs.akamai.com/cloud-computing/docs/metadata-service-api).
 //   - fe80::a9fe:a9fe: OpenStack, Hetzner and Akamai metadata over IPv6
-//     (docs.openstack.org/nova/latest/user/metadata.html).
+//     (docs.openstack.org/nova/latest/user/metadata.html,
+//     docs.hetzner.com/cloud/technical-details/hcnet/).
 //   - fd00:c1::a9fe:a9fe: Oracle Cloud metadata and instance-principal
 //     credentials over IPv6, which Oracle's own SDK uses
 //     (github.com/oracle/oci-python-sdk,
 //     src/oci/auth/signers/instance_principals_security_token_signer.py:
 //     IMDS_IPV6_HOST), as does cloud-init (DataSourceOracle.py).
+//   - 168.63.129.16: Azure's WireServer, which Microsoft lists with the
+//     Instance Metadata Service as serving metadata and bootstrapping VM
+//     credentials
+//     (learn.microsoft.com/azure/virtual-machines/metadata-security-protocol/overview).
+//     It is a public address, so the guard denied it under no policy.
 //   - 192.0.0.192: Oracle Cloud Infrastructure Classic metadata
 //     (docs.oracle.com/en/cloud/iaas-classic/compute-iaas-cloud/stcsg/retrieving-instance-metadata.html),
 //     inside 192.0.0.0/24, which specialUsePrefixes denies too.
@@ -123,6 +129,7 @@ var metadataAddrs = []netip.Addr{
 	netip.MustParseAddr("fd00:a9fe:a9fe::1"),
 	netip.MustParseAddr("fe80::a9fe:a9fe"),
 	netip.MustParseAddr("fd00:c1::a9fe:a9fe"),
+	netip.MustParseAddr("168.63.129.16"),
 	netip.MustParseAddr("192.0.0.192"),
 }
 

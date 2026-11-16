@@ -339,7 +339,8 @@ Both egress guards, for webhook deliveries and for sync transfers, deny these
 instance-metadata and credential endpoints under every policy, also with
 `OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE=true` or `OPENSTORAGE_SYNC_ALLOW_PRIVATE=true`. Each
 entry is one address. Most lie inside a private class (link-local, RFC 6598 shared,
-ULA), and the rest of that class stays admitted when the policy admits it. An IPv4
+ULA), and the rest of that class stays admitted when the policy admits it.
+`168.63.129.16` is a public address, so the strict policy denies it too. An IPv4
 address is denied in its IPv4-mapped IPv6 form too, and a DNS name is denied when it
 resolves to one of them, as `metadata.google.internal` does.
 
@@ -357,6 +358,7 @@ resolves to one of them, as `metadata.google.internal` does.
 | `fd00:a9fe:a9fe::1` | Akamai (Linode) (IPv6) |
 | `fe80::a9fe:a9fe` | OpenStack, Hetzner, Akamai (Linode) (IPv6) |
 | `fd00:c1::a9fe:a9fe` | Oracle Cloud (IPv6) |
+| `168.63.129.16` | Azure WireServer (metadata and VM credential bootstrap) |
 | `192.0.0.192` | Oracle Cloud Infrastructure Classic |
 
 `internal/events/guard.go` (`metadataAddrs`) cites a source of each: the provider's
