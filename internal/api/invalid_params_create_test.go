@@ -38,6 +38,20 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			post("upstream one required error names each empty field", `{"upstream":{}}`,
 				"upstream provider, owner, and name are required",
 				ipParam{"upstream.provider", "is required"}, ipParam{"upstream.owner", "is required"}, ipParam{"upstream.name", "is required"}),
+			// A host needs a hostname: ":80" and "http://:80" once reached an
+			// assertion and answered 500.
+			post("upstream host with a port and no name", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":":80"}}`,
+				`invalid upstream host ":80"`, ipParam{"upstream.host", "is not a valid host"}),
+			post("upstream host that is only a colon", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":":"}}`,
+				`invalid upstream host ":"`, ipParam{"upstream.host", "is not a valid host"}),
+			post("upstream url host with a port and no name", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"http://:80"}}`,
+				`invalid upstream host "http://:80"`, ipParam{"upstream.host", "is not a valid host"}),
+			post("upstream url with a path and no host name", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"https://:8080/forge"}}`,
+				`invalid upstream host "https://:8080/forge"`, ipParam{"upstream.host", "is not a valid host"}),
+			post("base_repo host with a port and no name", `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":":80"}}`,
+				`invalid base_repo upstream_host ":80"`, ipParam{"base_repo.upstream_host", "is not a valid host"}),
+			post("base_repo url host with a port and no name", `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"http://:80"}}`,
+				`invalid base_repo upstream_host "http://:80"`, ipParam{"base_repo.upstream_host", "is not a valid host"}),
 			post("upstream github defaults to app access and fails its host", `{"upstream":{"provider":"github","owner":"","name":"n","host":"bad host"}}`,
 				"upstream provider, owner, and name are required; "+upstreamAppAccessMsg+`; invalid upstream host "bad host"`,
 				ipParam{"upstream.owner", "is required"}, ipParam{"upstream.access", "must be public"}, ipParam{"upstream.host", "is not a valid host"}),
@@ -107,15 +121,15 @@ func TestCreateNamesEveryInvalidField(t *testing.T) {
 			// A member that fails to decode answers alone, as any decode
 			// failure does: no other check of the body runs.
 			post("upstream wrong type hides the other problems", `{"default_branch":"bad..name","upstream":{"provider":"svn","owner":1}}`,
-				"invalid upstream: json: cannot unmarshal number into Go struct field upstreamConfig.owner of type string",
+				"upstream.owner must be a string",
 				ipParam{"upstream.owner", "must be a string"}),
 			post("upstream unknown field hides the other problems", `{"default_branch":"bad..name","upstream":{"provider":"svn","x":1}}`,
-				`invalid upstream: json: unknown field "x"`),
+				`invalid upstream: unknown field "x"`),
 			post("base_repo wrong type hides the other problems", `{"default_branch":"bad..name","base_repo":{"provider":"svn","auth":3}}`,
-				"invalid base_repo: json: cannot unmarshal number into Go struct field usyncBaseRepo.auth of type api.usyncBaseRepoAuth",
+				"base_repo.auth must be an object",
 				ipParam{"base_repo.auth", "must be an object"}),
 			post("body wrong type hides the other problems", `{"default_branch":5,"upstream":{"provider":"svn"}}`,
-				"invalid JSON body: json: cannot unmarshal number into Go struct field createRepoRequest.default_branch of type string",
+				"default_branch must be a string",
 				ipParam{"default_branch", "must be a string"}),
 
 			// Rules across fields add their message and no item.
@@ -312,6 +326,18 @@ func TestRepoUpdateAndPullNameTheirOneField(t *testing.T) {
 			},
 			{
 				name: "patch invalid", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":"bad..name"}`,
+				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
+			},
+			{
+				name: "patch a name with a space", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":"a b"}`,
+				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
+			},
+			{
+				name: "patch a name that is only a space", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":" "}`,
+				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
+			},
+			{
+				name: "patch a name with a tab and a newline", method: http.MethodPatch, path: "/api/v1/repo", token: fx.repoTok, body: `{"default_branch":"a\tb\nc"}`,
 				wantError: "invalid default_branch", want: []ipParam{ipcBranchItem},
 			},
 			{

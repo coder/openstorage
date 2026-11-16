@@ -228,7 +228,7 @@ func parseUpstreamConfig(raw json.RawMessage) (cfg upstreamConfig, err error) {
 	// a branch) would silently change what the link syncs.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return upstreamConfig{}, fieldErrorUnder("upstream", "invalid upstream: "+err.Error(), err)
+		return upstreamConfig{}, decodeError("upstream", err)
 	}
 	return cfg, nil
 }
@@ -272,7 +272,9 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 }
 
 // validUpstreamHost accepts the two documented upstream_host shapes — a
-// bare hostname[:port] or an http(s):// base URL — and nothing else.
+// bare hostname[:port] or an http(s):// base URL — and nothing else. Both
+// need a hostname: upstreamHostname asserts one, so a host such as ":80"
+// must be refused here and not reach it.
 // upsync.CloneURL uses the value verbatim as the base of a git fetch URL,
 // so file://, ssh://, transport helpers (ext::), embedded credentials, and
 // query/fragment noise must be rejected here, where the attacker-controlled
@@ -283,7 +285,7 @@ func validUpstreamHost(host string) bool {
 		// Bare host[:port]: must round-trip as exactly the authority
 		// component (no path, userinfo, or control characters).
 		u, err := neturl.Parse("https://" + host)
-		return err == nil && u.Host == host && u.User == nil &&
+		return err == nil && u.Host == host && u.Hostname() != "" && u.User == nil &&
 			u.Path == "" && u.RawQuery == "" && u.Fragment == ""
 	}
 	u, err := neturl.Parse(host)
@@ -292,7 +294,7 @@ func validUpstreamHost(host string) bool {
 	}
 	// A path is allowed (sub-path-hosted forges); credentials belong in
 	// the credential store, never in the URL.
-	return u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+	return u.Hostname() != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
 }
 
 // upstreamHostname extracts the hostname the sync fetch will dial from a
@@ -338,8 +340,8 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createRepoRequest
 	if len(body) > 0 {
-		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		if err := unmarshalBody(body, &req); err != nil {
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -369,8 +371,8 @@ func (s *syncServer) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 		hostField, hostPath = "upstream host", "upstream.host"
 	case jsonPresent(req.BaseRepo):
 		spec = &usyncBaseRepo{}
-		if err := json.Unmarshal(req.BaseRepo, spec); err != nil {
-			fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
+		if err := unmarshalBody(req.BaseRepo, spec); err != nil {
+			fe := decodeError("base_repo", err)
 			writeInvalid(w, fe.Error(), fe)
 			return
 		}
@@ -765,7 +767,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if len(body) > 0 {
-		decode := json.Unmarshal
+		decode := unmarshalBody
 		if isStrictPullBody(r.Context()) {
 			// POST .../upstream/pull (issue #378): ReposUpstreamPullRequest
 			// is additionalProperties false, so a typo such as "refs" must
@@ -774,7 +776,7 @@ func (s *syncServer) handlePullUpstream(w http.ResponseWriter, r *http.Request) 
 			decode = strictJSON
 		}
 		if err := decode(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -897,7 +899,7 @@ func (s *syncServer) handlePushUpstream(w http.ResponseWriter, r *http.Request) 
 	}
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}

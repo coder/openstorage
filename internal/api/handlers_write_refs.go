@@ -78,8 +78,8 @@ func wrefDecodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		writeErr(w, http.StatusBadRequest, "missing request body")
 		return false
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, dst); err != nil {
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -98,8 +98,8 @@ func wrefDecodeOptionalBody(w http.ResponseWriter, r *http.Request, dst any) boo
 	if len(body) == 0 {
 		return true
 	}
-	if err := json.Unmarshal(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, dst); err != nil {
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -974,14 +974,14 @@ func strictJSON(body []byte, dst any) error {
 	t := reflect.TypeOf(dst)
 	assertf(t != nil && t.Kind() == reflect.Pointer && t.Elem().Kind() == reflect.Struct, "strictJSON: dst %T is not a struct pointer", dst)
 	if err := checkStrictObject(body, t.Elem(), ""); err != nil {
-		return err
+		return strictError{err}
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return errors.New("trailing data")
+		return strictError{errors.New("trailing data")}
 	}
 	return nil
 }
@@ -1077,7 +1077,7 @@ func wrefDecodeStrictBody(w http.ResponseWriter, r *http.Request, dst any) bool 
 		return false
 	}
 	if err := strictJSON(body, dst); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		writeInvalidBody(w, err)
 		return false
 	}
 	return true
@@ -1195,6 +1195,10 @@ func (s *server) wrefHandleNote(w http.ResponseWriter, r *http.Request, deleteNo
 	if req.Author != nil {
 		errs.add(requiredFields("author name and email are required when author is provided",
 			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}))
+		for _, err := range invalidTextEach(
+			[2]string{"author.name", req.Author.Name}, [2]string{"author.email", req.Author.Email}) {
+			errs.add(err)
+		}
 		author = *req.Author
 	}
 	if err := errs.err(); err != nil {

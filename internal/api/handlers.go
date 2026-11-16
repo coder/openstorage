@@ -113,13 +113,19 @@ func mustClaims(r *http.Request) *auth.Claims {
 // refPolicies parses the token's ref-policy claims the same way the git
 // update hook does (docs/reference/authentication.md): the ordered `refs` tuples with the deprecated
 // repo-wide `ops` claim folded in exactly once. Malformed claims fail
-// closed — callers must map the error to 403.
+// closed — callers must map the error to 403. The error is an
+// *auth.MalformedError, whose text a caller may show a client. The
+// decoder's text goes to the log here: a registered key signed the claim,
+// so the operator who minted the token can fix it.
 func refPolicies(claims *auth.Claims) ([]auth.RefPolicy, error) {
 	var policies []auth.RefPolicy
 	if len(claims.Refs) > 0 {
 		var err error
 		policies, err = auth.ParseRefPolicies(string(claims.Refs))
 		if err != nil {
+			var bad *auth.MalformedError
+			assertf(errors.As(err, &bad), "ParseRefPolicies returned %T, not *auth.MalformedError", err)
+			slog.Warn("token refs claim does not parse", "iss", claims.Iss, "repo", claims.Repo, "err", bad.Err)
 			return nil, err
 		}
 	}
@@ -384,7 +390,7 @@ func (s *server) handleCreateRepo(w http.ResponseWriter, r *http.Request) {
 	var req createRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -565,7 +571,7 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	var req patchRepoRequest
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+			writeInvalidBody(w, err)
 			return
 		}
 	}
@@ -588,9 +594,12 @@ func (s *server) handlePatchRepo(w http.ResponseWriter, r *http.Request) {
 	// HEAD <target>` on every node, and a persisted target git rejects
 	// would break the repo's git/read surface until another PATCH repairs
 	// the row.
-	target := githttp.HeadTarget(branch)
 	valid := validDefaultBranch(branch)
+	var target string
 	if valid {
+		// HeadTarget asserts that the name has no whitespace, so it runs
+		// only for a name that validDefaultBranch accepted.
+		target = githttp.HeadTarget(branch)
 		var err error
 		if valid, err = validRefFormat(r.Context(), target); err != nil {
 			s.internalErr(w, r, "check default_branch with git", err)

@@ -184,6 +184,28 @@ func TestWriteRefsBranches(t *testing.T) {
 			}
 		})
 
+		t.Run("create from a base that is no commit stores no branch", func(t *testing.T) {
+			// A branch must point at a commit, as git itself requires:
+			// a blob or a tree never peels to one.
+			repoPath, err := gitread.Materialize(context.Background(), e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for name, base := range map[string]string{
+				"blob": strings.TrimSpace(coreGit(t, repoPath, "rev-parse", fx.c2+":a.txt")),
+				"tree": strings.TrimSpace(coreGit(t, repoPath, "rev-parse", fx.c2+"^{tree}")),
+			} {
+				resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
+					map[string]any{"target_branch": "from-" + name, "base_ref": base})
+				if resp.StatusCode != http.StatusNotFound {
+					t.Errorf("%s base: status = %d, want 404", name, resp.StatusCode)
+				}
+				if got, ok := wrefRefs(t, e, fx.repoID)["refs/heads/from-"+name]; ok {
+					t.Errorf("%s base stored refs/heads/from-%s = %s", name, name, got)
+				}
+			}
+		})
+
 		t.Run("create existing branch conflicts", func(t *testing.T) {
 			resp, _ := wrefDo(t, srv, "POST", "/api/v1/repos/branches/create", fx.token,
 				map[string]any{"target_branch": "feature", "base_branch": "main"})
@@ -1755,6 +1777,30 @@ func TestWriteRefsPolicies(t *testing.T) {
 				map[string]any{"target_branch": "bad-claim", "base_branch": "main"})
 			if resp.StatusCode != http.StatusForbidden {
 				t.Fatalf("status = %d, want 403", resp.StatusCode)
+			}
+		})
+
+		// Issue #841: the answer is the fixed text, never the decoder's.
+		t.Run("malformed refs claim answers fixed text", func(t *testing.T) {
+			tok := mintWith(`[[5,[]]]`, nil)
+			for _, r := range []struct {
+				name, method, path string
+				body               map[string]any
+			}{
+				{"branch create", "POST", "/api/v1/repos/branches/create", map[string]any{"target_branch": "bad-claim", "base_branch": "main"}},
+				{"branch delete", "DELETE", "/api/v1/repos/branches", map[string]any{"name": "feature"}},
+				{"tag create", "POST", "/api/v1/repos/tags", map[string]any{"name": "bad-claim", "target": fx.c1}},
+				{"note add", "POST", "/api/v1/repos/notes", map[string]any{"sha": fx.c1, "note": "n"}},
+			} {
+				resp, body := wrefDo(t, srv, r.method, r.path, tok, r.body)
+				if resp.StatusCode != http.StatusForbidden {
+					t.Fatalf("%s: status = %d, want 403 (body %v)", r.name, resp.StatusCode, body)
+				}
+				raw, err := json.Marshal(body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tcdRequireFixed(t, r.name, raw, "malformed refs claim")
 			}
 		})
 	})

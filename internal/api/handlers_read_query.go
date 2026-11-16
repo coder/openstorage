@@ -11,7 +11,6 @@ package api
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -740,8 +739,8 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body grepRequestBody
-	if err := json.Unmarshal(raw, &body); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(raw, &body); err != nil {
+		writeInvalidBody(w, err)
 		return
 	}
 	// Every invalid body field is named, in the order of the docs table
@@ -750,6 +749,9 @@ func (s *server) handleGrep(w http.ResponseWriter, r *http.Request) {
 	pattern := body.Query.Pattern
 	if strings.TrimSpace(pattern) == "" {
 		errs.add(newFieldError("query.pattern", "is required", "query.pattern is required"))
+	} else {
+		// git takes the pattern as an argument, which cannot hold a NUL.
+		errs.add(invalidTextFields([2]string{"query.pattern", pattern}))
 	}
 	caseSensitive := true
 	if body.Query.CaseSensitive != nil {
@@ -1009,8 +1011,8 @@ func (s *server) handleArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	var body archiveRequestBody
 	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &body); err != nil {
-			writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+		if err := unmarshalBody(raw, &body); err != nil {
+			writeInvalidBody(w, err)
 			return
 		}
 	}

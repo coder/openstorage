@@ -97,7 +97,7 @@ func (s *server) forkAwareCreateRepo(verifier auth.Verifier, fallback http.Handl
 			dec := json.NewDecoder(bytes.NewReader(req.BaseRepo))
 			dec.DisallowUnknownFields()
 			if err := dec.Decode(&usyncBaseRepo{}); err != nil {
-				fe := fieldErrorUnder("base_repo", "invalid base_repo: "+err.Error(), err)
+				fe := decodeError("base_repo", err)
 				writeInvalid(w, fe.Error(), fe)
 				return
 			}
@@ -198,6 +198,9 @@ func (s *server) handleForkRepo(w http.ResponseWriter, r *http.Request, verifier
 		return
 	}
 	srcClaims, err := verifier.Verify(r.Context(), spec.Auth.Token)
+	if err != nil {
+		keyFailures.Report(r.Context(), err)
+	}
 	if keyStoreFailed(err) {
 		writeProblem(w, http.StatusForbidden, codeAuthenticationUnavailable, "cannot verify base_repo.auth.token now, retry")
 		return

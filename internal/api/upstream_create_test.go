@@ -131,8 +131,8 @@ func TestCreateRepoUpstreamValidation(t *testing.T) {
 			{"gitea needs host", `{"upstream":{"provider":"gitea","owner":"o","name":"n"}}`, `upstream host is required for provider "gitea"`},
 			{"file host", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"file:///srv/git"}}`, `invalid upstream host "file:///srv/git"`},
 			{"metadata host", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"169.254.169.254"}}`, "upstream host denied by sync egress policy: egress target 169.254.169.254 denied: cloud metadata address"},
-			{"unknown field", `{"upstream":{"provider":"gitlab","owner":"o","name":"n","branch":"main"}}`, `invalid upstream: json: unknown field "branch"`},
-			{"not an object", `{"upstream":"github"}`, "invalid upstream: json: cannot unmarshal string into Go value of type api.upstreamConfig"},
+			{"unknown field", `{"upstream":{"provider":"gitlab","owner":"o","name":"n","branch":"main"}}`, `invalid upstream: unknown field "branch"`},
+			{"not an object", `{"upstream":"github"}`, "upstream must be an object"},
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {
@@ -359,8 +359,8 @@ func TestCreateRepoBaseRepoCopy(t *testing.T) {
 				base    map[string]any
 				wantMsg string
 			}{
-				{map[string]any{"name": src.url, "reff": "feature", "auth": tok}, `invalid base_repo: json: unknown field "reff"`},
-				{map[string]any{"name": src.url, "auth": map[string]any{"token": srcReadTok, "user": "x"}}, `invalid base_repo: json: unknown field "user"`},
+				{map[string]any{"name": src.url, "reff": "feature", "auth": tok}, `invalid base_repo: unknown field "reff"`},
+				{map[string]any{"name": src.url, "auth": map[string]any{"token": srcReadTok, "user": "x"}}, `invalid base_repo: unknown field "user"`},
 				{map[string]any{"name": src.url, "owner": "o", "auth": tok}, copySyncFieldsMsg},
 				{map[string]any{"name": src.url, "upstream_host": "github.com", "auth": tok}, copySyncFieldsMsg},
 				{map[string]any{"name": src.url, "forward_pushes": true, "auth": tok}, copySyncFieldsMsg},

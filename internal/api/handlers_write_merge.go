@@ -592,6 +592,8 @@ func wmValidateMergeRequest(req *wmMergeRequest) error {
 	if req.Squash && req.CommitMessage == "" {
 		errs.add(newFieldError("commit_message", "is required with squash", "commit_message is required with squash"))
 	}
+	// git takes the message as an argument, which cannot hold a NUL.
+	errs.add(invalidTextFields([2]string{"commit_message", req.CommitMessage}))
 	if req.Author != nil {
 		for _, err := range wcAuthorProblems("author", *req.Author) {
 			errs.add(err)
@@ -626,8 +628,8 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing request body")
 		return
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeInvalid(w, "invalid JSON body: "+err.Error(), err)
+	if err := unmarshalBody(body, &req); err != nil {
+		writeInvalidBody(w, err)
 		return
 	}
 	if err := wmValidateMergeRequest(&req); err != nil {
