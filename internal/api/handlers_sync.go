@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	neturl "net/url"
@@ -140,19 +141,75 @@ func validateSyncBaseRepo(spec *usyncBaseRepo, branchErr error, errs *bodyErrors
 	if spec.Auth != nil {
 		token = spec.Auth.Token
 	}
-	errs.add(invalidTextFields([2]string{"base_repo.auth.token", token}))
-	errs.add(branchErr)
+	// The token is stored as the link's git credential.
+	tokenErr := invalidTextFields([2]string{"base_repo.auth.token", token})
+	if tokenErr == nil {
+		tokenErr = tooLongField("base_repo.auth.token", token, upsync.MaxCredentialBytes)
+	}
+	var hostErr error
 	host = spec.UpstreamHost
 	switch {
 	case host != "" && !validUpstreamHost(host):
-		errs.add(newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+strconv.Quote(spec.UpstreamHost)))
+		hostErr = newFieldError("base_repo.upstream_host", "is not a valid host", "invalid base_repo upstream_host "+strconv.Quote(spec.UpstreamHost))
 	case host == "" && known:
 		if host = defaultHost; host == "" {
-			errs.add(newFieldError("base_repo.upstream_host", "is required for this provider",
-				"base_repo upstream_host is required for provider "+strconv.Quote(spec.Provider)))
+			hostErr = newFieldError("base_repo.upstream_host", "is required for this provider",
+				"base_repo upstream_host is required for provider "+strconv.Quote(spec.Provider))
 		}
 	}
+	urlErr := upstreamURLProblem("base_repo", spec.Owner, spec.Name, host, hostErr, sentHost(spec.UpstreamHost, "base_repo.upstream_host"), tokenErr, branchErr)
+	if urlErr != nil {
+		errs.add(urlErr)
+		return host
+	}
+	errs.add(tokenErr)
+	errs.add(branchErr)
+	errs.add(hostErr)
 	return host
+}
+
+// upstreamURLProblem returns the problem of a sync link whose upstream URL
+// (upsync.Upstream.CloneURL) is longer than git takes
+// (upsync.MaxUpstreamURLBytes), or nil. prefix is the body object
+// (upstream or base_repo). The URL is made of the owner, the name and the
+// host, so the problem names prefix.owner, prefix.name, and hostPath, the
+// host field, when the body sent the host (sentHost). The URL needs all of
+// them: an owner or name with a problem of its own, or a host with a
+// problem (hostErr), leaves it unchecked. between holds the problems of the
+// fields that lie between the name and the host in the docs. They join the
+// problem, so that its items keep the order of the fields, as addFields
+// does. The message never holds the URL.
+func upstreamURLProblem(prefix, owner, name, host string, hostErr error, hostPath string, between ...error) error {
+	if owner == "" || name == "" || host == "" || hostErr != nil ||
+		textField(prefix+".owner", owner) != nil || textField(prefix+".name", name) != nil {
+		return nil
+	}
+	url := upsync.Upstream{Owner: owner, Name: name, UpstreamHost: host}.CloneURL()
+	if len(url) <= upsync.MaxUpstreamURLBytes {
+		return nil
+	}
+	reason := fmt.Sprintf("must keep the upstream URL at most %d bytes", upsync.MaxUpstreamURLBytes)
+	params := []invalidParam{{Name: prefix + ".owner", Reason: reason}, {Name: prefix + ".name", Reason: reason}}
+	msgs := []string{tooLongMsg("upstream URL", upsync.MaxUpstreamURLBytes)}
+	for _, e := range between {
+		if e != nil {
+			params = append(params, invalidParamsFor(e)...)
+			msgs = append(msgs, e.Error())
+		}
+	}
+	if hostPath != "" {
+		params = append(params, invalidParam{Name: hostPath, Reason: reason})
+	}
+	return newFieldErrors(strings.Join(msgs, "; "), params...)
+}
+
+// sentHost is path, the wire path of a host field, when the body sent the
+// host (value), and "" when the host is the provider's default.
+func sentHost(value, path string) string {
+	if value == "" {
+		return ""
+	}
+	return path
 }
 
 // addFields adds the problem of each of fields (dotted wire path -> value),
@@ -251,23 +308,30 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 			}
 			return textField(name, value)
 		})
+	var accessErr, hostErr error
 	switch {
 	case cfg.Access != "" && cfg.Access != "app" && cfg.Access != "public":
-		errs.add(newFieldError("upstream.access", "must be app or public", "invalid upstream access "+strconv.Quote(cfg.Access)))
+		accessErr = newFieldError("upstream.access", "must be app or public", "invalid upstream access "+strconv.Quote(cfg.Access))
 	case known && cfg.Provider != "github" && cfg.Access != "":
-		errs.add(newFieldError("upstream.access", "applies to provider github only", "upstream access applies to provider github only"))
+		accessErr = newFieldError("upstream.access", "applies to provider github only", "upstream access applies to provider github only")
 	case known && cfg.Provider == "github" && cfg.Access != "public":
-		errs.add(newFieldError("upstream.access", "must be public", upstreamAppAccessMsg))
+		accessErr = newFieldError("upstream.access", "must be public", upstreamAppAccessMsg)
 	}
 	host = cfg.Host
 	switch {
 	case host != "" && !validUpstreamHost(host):
-		errs.add(newFieldError("upstream.host", "is not a valid host", "invalid upstream host "+strconv.Quote(cfg.Host)))
+		hostErr = newFieldError("upstream.host", "is not a valid host", "invalid upstream host "+strconv.Quote(cfg.Host))
 	case host == "" && known:
 		if host = defaultHost; host == "" {
-			errs.add(newFieldError("upstream.host", "is required for this provider", "upstream host is required for provider "+strconv.Quote(cfg.Provider)))
+			hostErr = newFieldError("upstream.host", "is required for this provider", "upstream host is required for provider "+strconv.Quote(cfg.Provider))
 		}
 	}
+	if urlErr := upstreamURLProblem("upstream", cfg.Owner, cfg.Name, host, hostErr, sentHost(cfg.Host, "upstream.host"), accessErr); urlErr != nil {
+		errs.add(urlErr)
+		return host
+	}
+	errs.add(accessErr)
+	errs.add(hostErr)
 	return host
 }
 

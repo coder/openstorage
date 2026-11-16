@@ -1027,21 +1027,25 @@ func hermeticGitEnv(allowProtocol string) []string {
 	)
 }
 
-// maxCredentialBytes bounds a stored username or password: git gets it as
+// MaxCredentialBytes bounds a stored username or password: git gets it as
 // one environment entry, OPENSTORAGE_ASKPASS_PASSWORD=<password> (or the
-// username entry, as long), which must fit gitlimit.MaxArgBytes.
-const maxCredentialBytes = gitlimit.MaxArgBytes - len("OPENSTORAGE_ASKPASS_PASSWORD=")
+// username entry, as long), which must fit gitlimit.MaxArgBytes. The API
+// refuses a longer value when it is stored; the run checks it again for
+// values stored before.
+const MaxCredentialBytes = gitlimit.MaxArgBytes - len("OPENSTORAGE_ASKPASS_PASSWORD=")
 
-// maxUpstreamURLBytes bounds an upstream URL. git gets it as one argument,
-// and its HTTP transport hands it on to send-pack and fetch-pack with a
-// "/" added, which must fit gitlimit.MaxArgBytes.
-const maxUpstreamURLBytes = gitlimit.MaxArgBytes - len("/")
+// MaxUpstreamURLBytes bounds an upstream URL (Upstream.CloneURL). git gets
+// it as one argument, and its HTTP transport hands it on to send-pack and
+// fetch-pack with a "/" added, which must fit gitlimit.MaxArgBytes. The
+// API refuses a link with a longer URL when it is registered; the run
+// checks it again for links registered before.
+const MaxUpstreamURLBytes = gitlimit.MaxArgBytes - len("/")
 
 // upstreamURLFailure fails a run whose upstream URL is over
-// maxUpstreamURLBytes, before any git starts: such a link fails the same
+// MaxUpstreamURLBytes, before any git starts: such a link fails the same
 // way on every run, so it is configuration. The error never names the URL.
 func upstreamURLFailure(up Upstream) *syncFailure {
-	if len(up.CloneURL()) <= maxUpstreamURLBytes {
+	if len(up.CloneURL()) <= MaxUpstreamURLBytes {
 		return nil
 	}
 	return &syncFailure{code: FailConfig, cause: errors.New("upstream URL is longer than git takes as one argument")}
@@ -1053,7 +1057,7 @@ func upstreamURLFailure(up Upstream) *syncFailure {
 // either). The pair travels through git's line-based credential-helper
 // protocol, so a stored value with CR, LF or NUL fails the run as
 // configuration instead of injecting helper attributes. So does a value
-// over maxCredentialBytes, which git cannot take in its environment. The
+// over MaxCredentialBytes, which git cannot take in its environment. The
 // error never names the value.
 func (w *Worker) upstreamAuth(ctx context.Context, repoID, provider string) (username, password string, fail *syncFailure) {
 	cred, err := w.Credentials.CredentialForRepo(ctx, repoID)
@@ -1066,7 +1070,7 @@ func (w *Worker) upstreamAuth(ctx context.Context, repoID, provider string) (use
 		return "", "", nil
 	case strings.ContainsAny(cred.Username+cred.Password, "\r\n\x00"):
 		return "", "", &syncFailure{code: FailConfig, cause: errors.New("stored git credential contains CR, LF or NUL")}
-	case max(len(cred.Username), len(cred.Password)) > maxCredentialBytes:
+	case max(len(cred.Username), len(cred.Password)) > MaxCredentialBytes:
 		return "", "", &syncFailure{code: FailConfig, cause: errors.New("stored git credential is longer than git takes in its environment")}
 	}
 	username, password = credentialAuth(provider, cred.Username, cred.Password)
