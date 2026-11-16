@@ -74,8 +74,27 @@ func (s *server) resolveQueryRepo(w http.ResponseWriter, r *http.Request) (meta.
 // Boolean query params are parsed via coreBoolParam (handlers_read_core.go)
 // — one literal "true"/"false" dialect for the whole read surface.
 
+// listTooLong reports whether values, a list that git takes as arguments
+// of their own, pass gitlimit.MaxArgListBytes together. Each value that
+// fits on its own can still make the list pass the total that exec takes.
+func listTooLong(values []string) bool {
+	return gitlimit.ArgListBytes(values) > gitlimit.MaxArgListBytes
+}
+
+// listTooLongMsg is the 400 message for a list of request values, the
+// field name, that passes listTooLong.
+func listTooLongMsg(name string) string {
+	return fmt.Sprintf("invalid %s (want at most %d bytes for all entries, each counting %d more)",
+		name, gitlimit.MaxArgListBytes, gitlimit.ArgListEntryBytes)
+}
+
+// listTooLongReason is the invalid_params reason of listTooLongMsg.
+var listTooLongReason = fmt.Sprintf("must total at most %d bytes, each entry counting %d more",
+	gitlimit.MaxArgListBytes, gitlimit.ArgListEntryBytes)
+
 // cleanPathParams validates repeatable `path` filters: no empties, no
-// NULs, none over maxGitPathBytes, none outside the repository.
+// NULs, none over maxGitPathBytes, none outside the repository, and not
+// more than listTooLong takes together.
 func cleanPathParams(paths []string) ([]string, error) {
 	for _, p := range paths {
 		if len(p) > maxGitPathBytes {
@@ -87,6 +106,9 @@ func cleanPathParams(paths []string) ([]string, error) {
 		if pathLeavesRepo(p) {
 			return nil, fmt.Errorf("path filter %q is outside the repository", p)
 		}
+	}
+	if listTooLong(paths) {
+		return nil, errors.New(listTooLongMsg("path params"))
 	}
 	return paths, nil
 }
@@ -509,6 +531,10 @@ func (s *server) handleBlame(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if listTooLong(ranges) {
+		writeErr(w, http.StatusBadRequest, listTooLongMsg("range params"))
+		return
+	}
 
 	repo, repoPath, ok := s.resolveQueryRepo(w, r)
 	if !ok {
@@ -702,8 +728,10 @@ type grepPosition struct {
 // body that is not a path inside the repository: one problem for each
 // entry, named paths.N. A body of bad entries costs one answer of bounded
 // size: once the collector is full, an entry is counted and builds no
-// problem.
+// problem. When every entry is good, a list that passes listTooLong is one
+// problem named paths.
 func grepPathProblems(errs *bodyErrors, paths []string) {
+	bad := false
 	for i, p := range paths {
 		long := len(p) > maxGitPathBytes
 		blank := !long && (strings.TrimSpace(p) == "" || strings.ContainsRune(p, 0))
@@ -711,6 +739,7 @@ func grepPathProblems(errs *bodyErrors, paths []string) {
 		// no pathspec.
 		trimmed := strings.TrimSuffix(p, "/")
 		outside := !long && !blank && trimmed != "" && pathLeavesRepo(trimmed)
+		bad = bad || long || blank || outside
 		switch {
 		case !long && !blank && !outside:
 		case errs.full():
@@ -722,6 +751,9 @@ func grepPathProblems(errs *bodyErrors, paths []string) {
 		default:
 			errs.add(newFieldError("paths."+strconv.Itoa(i), "is outside the repository", fmt.Sprintf("paths entry %q is outside the repository", p)))
 		}
+	}
+	if !bad && listTooLong(paths) {
+		errs.add(newFieldError("paths", listTooLongReason, listTooLongMsg("paths")))
 	}
 }
 

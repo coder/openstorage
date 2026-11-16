@@ -175,19 +175,20 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   missing repository is `404` first. A grep `query.pattern` that git refuses is found
   when git runs the search, after the checks of the body and the lookups of the
   repository and the ref, so it is named alone and a missing repository or ref is `404`
-  first. `POST /repos/merge`, `POST /repos/branches/create`, `DELETE /repos/branches`
-  (for a name that comes from the body: an `ephemeral` query parameter that is not valid
-  answers first and names no field), `POST /repos/tags`, `POST /repos`,
-  `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`, `DELETE /repos/notes`,
-  `POST /api/repos/{repo_name}/notes/append` (when its members
+  first. `POST /repos/merge`, `POST /repos/branches/create`, `POST /repos/tags`,
+  `POST /repos`, `POST /repos/grep`, `POST /repos/archive`, `POST /repos/notes`,
+  `DELETE /repos/notes`, `POST /api/repos/{repo_name}/notes/append` (when its members
   and types are fine), `POST` and `PUT` on `/repos/git-credentials` and on
   `/repos/{repo_name}/git-credentials`, and `PUT
   /repos/{repo_name}/git-credentials/{git_credential_id}` give a body with several
   invalid fields one item for each of them. A `DELETE
   /repos/notes` problem with a query parameter, or with a missing or empty `object_ref`,
   adds its message to `detail` and names no field. `PATCH /repo`, the pull-upstream
-  routes, `DELETE /repos/tags` and `DELETE /repos/git-credentials` check one body field
-  each (`default_branch`, `ref`, `name`, `id`), so they name that field. The commit
+  routes, `DELETE /repos/branches`, `DELETE /repos/tags` and `DELETE
+  /repos/git-credentials` check one body field each (`default_branch`, `ref`,
+  `target_branch` or its alias `name`, `name`, `id`), so they name that field
+  (`DELETE /repos/branches` for a name that comes from the body: an `ephemeral` query
+  parameter that is not valid answers first and names no field). The commit
   write routes (`commit-pack`, `diff-commit`, `restore-commit`) answer with upstream's
   `CommitWriteResponse` or `ProblemDetails`, which have no `invalid_params`, and the
   webhook routes and `push-upstream` are not part of upstream's API. A check on these
@@ -257,11 +258,28 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   check it without its trailing `/`), and a blame `range` or grep `query.pattern` over
   131,071 bytes. The message names the field and its limit, and grep names the field
   in `invalid_params`. The limits on idents are with the
-  [commit writes](#commit-messages-and-idents). Linux also limits all arguments and
-  environment entries of one program together: a quarter of the server's stack limit,
-  at most 6 MiB (2 MiB with the usual 8 MiB stack limit). A request with many values
-  whose sizes each fit, such as a grep with many short `paths`, or a server with a low
-  stack limit, can pass that total, and that answer is a `500`.
+  [commit writes](#commit-messages-and-idents).
+- **Lists of such values** have a limit for all their entries together. Linux limits all
+  arguments and environment entries of one program together, their pointers included: a
+  quarter of the server's stack limit, at most 6 MiB (2 MiB with the usual 8 MiB stack
+  limit), and 128 KiB (131,072 bytes) for a stack limit from 144 KiB to 512 KiB
+  (measured with 4 KiB pages). A smaller stack limit holds less. macOS allows 1 MiB. So
+  the grep `paths`, the `path` params of a diff, and the blame `range` params may hold
+  at most 65,536 bytes together, half of those 128 KiB, where each entry counts its
+  length plus 32 bytes (what git gets around it: `:(literal)` or `-L`, the terminating
+  NULs and the argument pointers). The other half is for the server's environment, which
+  git inherits, and git's own arguments. A longer list answers `400` before git starts,
+  once each of its entries is valid, so one entry over 65,504 bytes already answers
+  `400` although its own limit is higher. The message names the list and the limit
+  (`invalid paths (want at most 65536 bytes for all entries, each counting 32 more)`;
+  `path params` and `range params` on the query routes), and grep names `paths` in
+  `invalid_params`. These limits do not make every request fit. Values that each fit can
+  still pass the total, and that answer is a `500`: a single value near its own limit
+  with a stack limit of about 512 KiB or less, a value over about 64 KiB next to a list
+  near the budget with a stack limit below about 1 MiB, or a large server environment.
+  git also needs stack of its own: with a stack limit below about 176 KiB it can start
+  and then crash, and that answer is a `422`. Below that, even a list within the budget
+  can fail with a `422` or a `500`.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
@@ -291,13 +309,16 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   archive and grep globs match it only through a wildcard (`a?b`, `a*`), which can
   match other names too. Upstream documents no path encoding, so the siblings are an
   extension ([#587](https://github.com/coder/openstorage/issues/587)).
-- **Paths that are not clean**: a path that holds `//`, `/./` or `/../` gets a `307` to
-  the clean path, and `/api` gets a `307` to `/api/`. `Location` keeps the query string,
+- **Paths that are not clean**: except on a `CONNECT` request, a path that holds `//`,
+  `/./` or `/../`, or ends in `/.` or `/..`, gets a `307` to the clean path, and an
+  absolute request target with no path (`http://host?q`) gets a `307` to `/`. `/api`
+  gets a `307` to `/api/`. `Location` keeps the query string,
   and a `GET` also gets a short HTML body that links to it. When that `Location` would
-  be longer than 16384 bytes, the server answers `404` instead of the redirect: the
+  be longer than 16384 bytes (also for `/api` with a long query), the server answers
+  `404` instead of the redirect: the
   `route_not_found` problem body (with `instance` cut as above) when the `Location`
-  starts with `/api/`, else the git surface's `{"error":"not a smart-http path"}`.
-  Send clean paths.
+  starts with `/api/`, else the git surface's `{"error":"not a smart-http path"}` (a
+  `Location` of `/healthz` too). Send clean paths.
 - **No client retries**: no SDK retries; every error surfaces immediately. Python
   client-side timeouts: 30s default, 60s diff/grep, 180s
   branch-create/merge/merge-preview/commit/tag/restore-commit.
@@ -1021,7 +1042,7 @@ Other limits and gaps:
 | 400 | invalid input, a `diff-commit` patch over 262144000 bytes among them ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 401 | no `Authorization` header, or a scheme other than `Bearer` (`Authentication required`) |
 | 403 | a token that fails verification (`Invalid or expired token`); permission or ref-policy denied; `authentication_unavailable` when the key store fails (retry) ([failure mapping](authentication.md#failure-mapping)) |
-| 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`); a path that is not clean, when its redirect `Location` would be longer than 16384 bytes |
+| 404 | repo/object/branch not found; unborn-branch file metadata; no API route matches the path (`route_not_found`); a path that is not clean, or `/api`, when its redirect `Location` would be longer than 16384 bytes ([paths that are not clean](#conventions)) |
 | 405 | the path has routes, but not for this method (`Allow` lists them) |
 | 409 | repo exists, repo already deleted, credential exists, merge conflict, failed ref guard (`expected_target_sha`, `expected_source_sha`, `expected_notes_ref_sha`), CAS conflict, a `diff-commit` patch that does not apply to the base ([streaming protocols](../explanation/streaming-commit-protocols.md)) |
 | 412 | a failed `restore-commit` `base_ref` precondition; a merge that is not a fast-forward under `ff_only`, or a merge or merge preview of unrelated histories without `allow_unrelated_histories` (a preview with `ff_only` answers `rejected` instead); a `commit-pack` or `diff-commit` that changes nothing (`no changes to commit`) or whose stream ends before an `eof` chunk ([streaming protocols](../explanation/streaming-commit-protocols.md)); a `branches/create` move guarded by `expected_target_sha` without `force` that is not a fast-forward ([details](#guarded-branch-create-and-move)) |

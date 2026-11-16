@@ -373,18 +373,21 @@ func cmdServe(ctx context.Context, args []string) error {
 	// context), so work admitted before the signal completes normally
 	// within the bounded drain.
 	// A mux redirect repeats the path and the query: a Location past the
-	// bound gets the 404 of the surface it leads to instead (the API's own
-	// BoundRedirects answers route_not_found). Instrument the whole mux
-	// (ADR-48) so its own redirects and those 404s count too.
+	// bound gets a 404 instead, counted under the surface whose 404 it is:
+	// the API's route_not_found (its own BoundRedirects) for a Location
+	// under /api/, else the git one, /healthz included, which has no 404.
+	// Instrument the whole mux (ADR-48) so its own redirects count too.
+	apiTooLong := metrics.InstrumentHTTP(metrics.SurfaceAPI, apiHandler)
+	gitTooLong := metrics.InstrumentHTTP(metrics.SurfaceGit, http.HandlerFunc(githttp.NotFound))
 	tooLong := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, pattern := mux.Handler(r); pattern == "/api/" {
-			apiHandler.ServeHTTP(w, r)
+			apiTooLong.ServeHTTP(w, r)
 			return
 		}
-		githttp.NotFound(w, r)
+		gitTooLong.ServeHTTP(w, r)
 	})
 	active := newActiveRequests()
-	httpSrv := &http.Server{Handler: active.wrap(metrics.InstrumentMux(mux, api.BoundRedirects(mux, tooLong), metricsSurface))}
+	httpSrv := &http.Server{Handler: active.wrap(api.BoundRedirects(mux, metrics.InstrumentMux(mux, metricsSurface), tooLong))}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- httpSrv.Serve(ln) }()
 	select {
