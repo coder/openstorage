@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	neturl "net/url"
 	"strconv"
 	"strings"
@@ -363,17 +364,26 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 // so file://, ssh://, transport helpers (ext::), embedded credentials, and
 // query/fragment noise must be rejected here, where the attacker-controlled
 // value enters (the worker additionally pins GIT_ALLOW_PROTOCOL).
+//
+// A zone-scoped IPv6 address (fe80::1%25eth0) is refused too. The egress
+// guard refuses it under every policy, so no run could use it, and the
+// egress answer repeats the hostname, whose zone can be any length.
 func validUpstreamHost(host string) bool {
 	assertf(host != "", "validUpstreamHost: empty host")
 	if !strings.Contains(host, "://") {
 		// Bare host[:port]: must round-trip as exactly the authority
-		// component (no path, userinfo, or control characters).
+		// component (no path, userinfo, or control characters). A zone
+		// is written %25, which the parse decodes, so it never
+		// round-trips.
 		u, err := neturl.Parse("https://" + host)
 		return err == nil && u.Host == host && u.Hostname() != "" && u.User == nil &&
 			u.Path == "" && u.RawQuery == "" && u.Fragment == ""
 	}
 	u, err := neturl.Parse(host)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	if ip, err := netip.ParseAddr(u.Hostname()); err == nil && ip.Zone() != "" {
 		return false
 	}
 	// A path is allowed (sub-path-hosted forges); credentials belong in

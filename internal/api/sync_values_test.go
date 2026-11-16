@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -66,6 +67,30 @@ func TestSyncValuesTheRunRefusesAtRegistration(t *testing.T) {
 				ipParam{"base_repo.auth.token", "is a reserved value"}, ipParam{"base_repo.upstream_host", "is not a valid host"}),
 		})
 
+		// The tracked create (CreateLinkedRepo) refuses the same tokens
+		// before it stores a row, and a repeat create of a linked repo
+		// checks its body first too.
+		s := newPendingSyncStack(t, e, true)
+		linked := "val-linked-" + randomHex(t, 4)
+		if code, _, msg := s.create(t, linked, baseRepo("token")); code != http.StatusCreated {
+			t.Fatalf("tracked create = %d %q, want 201", code, msg)
+		}
+		for _, tc := range []struct{ token, want string }{
+			{"to\nken", "invalid base_repo.auth.token (want no carriage return or line feed)"},
+			{"enc:token", reserved},
+		} {
+			name := "val-tracked-" + randomHex(t, 4)
+			if code, _, msg := s.create(t, name, baseRepo(tc.token)); code != http.StatusBadRequest || msg != tc.want {
+				t.Fatalf("tracked create with token %q = %d %q, want 400 %q", tc.token, code, msg, tc.want)
+			}
+			if r, err := e.store.GetRepoByURL(ctx, s.org, name); !errors.Is(err, meta.ErrNotFound) {
+				t.Fatalf("repo after a refused tracked create = %+v, %v; want not found", r, err)
+			}
+			if code, _, msg := s.create(t, linked, baseRepo(tc.token)); code != http.StatusBadRequest || msg != tc.want {
+				t.Fatalf("repeat create with token %q = %d %q, want 400 %q", tc.token, code, msg, tc.want)
+			}
+		}
+
 		repo, err := e.store.CreateRepo(ctx, org, "https://example.com/"+org+"/val-cred-"+randomHex(t, 4), "main")
 		if err != nil {
 			t.Fatalf("create repo: %v", err)
@@ -108,13 +133,19 @@ func TestSyncValuesTheRunRefusesAtRegistration(t *testing.T) {
 // TestSyncCreateQuotesValuesBounded: a sync create quotes a provider, an
 // operation, an access or a host it refuses. A value of up to 256 bytes is
 // quoted whole; a longer one is cut at 256 bytes, ends with an ellipsis and
-// names its length, so the answer stays small whatever the body holds.
+// names its length, so the answer stays small whatever the body holds. A
+// zone-scoped IPv6 host is not a valid host, so the egress answer, which
+// repeats a hostname whole, never gets its zone.
 func TestSyncCreateQuotesValuesBounded(t *testing.T) {
 	huge := strings.Repeat("<", 900_000) // JSON escapes each to six bytes
 	cut := strings.Repeat("<", 256) + "…"
 	// A space makes the host invalid.
 	hugeHost := " " + huge[1:]
 	cutHost := " " + cut[1:]
+	// A zone-scoped IPv6 address is not a valid host: the egress guard
+	// refuses it under every policy, and its zone can be any text.
+	zoneHost := "https://[fe80::1%25" + huge[:900_000-20] + "]"
+	cutZone := zoneHost[:256] + "…"
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		org := e.newOrg(t)
 		tok := e.mint(t, tokenSpec{iss: org, repo: "quote-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
@@ -138,6 +169,14 @@ func TestSyncCreateQuotesValuesBounded(t *testing.T) {
 				`invalid upstream host "` + hugeHost[:256] + `"`},
 			{"upstream host one byte over", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"` + hugeHost[:257] + `"}}`,
 				`invalid upstream host "` + cutHost + `" (257 bytes)`},
+			{"upstream host with a long zone", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"` + zoneHost + `"}}`,
+				`invalid upstream host "` + cutZone + `" (900000 bytes)`},
+			{"base_repo upstream_host with a long zone", `{"base_repo":{"provider":"gitea","owner":"o","name":"n","upstream_host":"` + zoneHost + `"}}`,
+				`invalid base_repo upstream_host "` + cutZone + `" (900000 bytes)`},
+			{"upstream host with a zone", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"https://[fe80::1%25eth0]"}}`,
+				`invalid upstream host "https://[fe80::1%25eth0]"`},
+			{"bare upstream host with a zone", `{"upstream":{"provider":"gitea","owner":"o","name":"n","host":"[fe80::1%25eth0]:443"}}`,
+				`invalid upstream host "[fe80::1%25eth0]:443"`},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				resp, out := e.doReq(t, http.MethodPost, "/api/v1/repos", tok, []byte(tc.body), "")
