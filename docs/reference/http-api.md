@@ -136,7 +136,12 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   or that has the dotted path of a member named or counted already, adds nothing. Past
   the 100 names of an object the count compares 64-bit hashes of the names, so two of
   them count as one in about one body of 1 MiB in a billion. An answer that names one
-  member keeps its name up to the cut of 16384 bytes above. The other checks run only
+  unknown member cuts a name of more than 256 bytes as the other bodies above do, to its
+  first 256 bytes or fewer at a character, and ends it with `…`: `error` and `detail`
+  add the length in bytes of the member name, without `author.`
+  (`unknown field "author.xx…" (1000000 bytes)`), and the `invalid_params` `name` ends
+  with `…` only, as at 32 bytes. Such an answer has at most 4,923 bytes and the request
+  path in `instance`. The other checks run only
   when the members are fine, and then the decoder of a strictly decoded body names only
   the first field of the wrong type (`{"note":1,"object_ref":2}` names `note`).
   `POST /api/repos/{repo_name}/upstream/pull` takes `{ref?, after?}` and works the same

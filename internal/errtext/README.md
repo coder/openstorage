@@ -14,7 +14,7 @@ Bounds the request text that an error answer repeats, so that an answer stays sm
 
 ## Callers
 - `api` cuts `error`, `detail` and each `invalid_params` name of a problem body (`newProblem`), and the `result.message` of a commit write (`wcRefUpdate`) [../api/errors.go:newProblem] [../api/handlers_write_commit.go:wcRefUpdate]
-- `api` cuts each unknown member name at 32 bytes in the answer of a strictly decoded body that names several members (`Cut`) [../api/handlers_write_refs.go:strictProblem.err]
+- `api` cuts an unknown member name at 256 bytes in an answer that names one unknown member (`unknownNameText`), and each unknown member name at 32 bytes in the answer of a strictly decoded body that names several members (`Cut`) [../api/decode_body.go:unknownNameText] [../api/handlers_write_refs.go:strictProblem.err]
 - `githttp` cuts the error text of the git and LFS routes [../githttp/server.go:httpError] [../githttp/lfs.go:lfsError]
 
 ## Verification
