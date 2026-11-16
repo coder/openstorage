@@ -365,9 +365,12 @@ func (cfg upstreamConfig) validate(errs *bodyErrors) (host string) {
 // query/fragment noise must be rejected here, where the attacker-controlled
 // value enters (the worker additionally pins GIT_ALLOW_PROTOCOL).
 //
-// A zone-scoped IPv6 address (fe80::1%25eth0) is refused too. The egress
-// guard refuses it under every policy, so no run could use it, and the
-// egress answer repeats the hostname, whose zone can be any length.
+// It also refuses what no sync run can use, so the create answers 400
+// instead of storing a link whose every run fails: a hostname that is
+// neither an IP address nor a name the run's resolver looks up
+// (dialableHostname), a port outside 1-65535, and a base URL with a query
+// or a fragment, even an empty one (`https://h?`), which would end the
+// path of every fetch URL.
 func validUpstreamHost(host string) bool {
 	assertf(host != "", "validUpstreamHost: empty host")
 	if !strings.Contains(host, "://") {
@@ -376,19 +379,77 @@ func validUpstreamHost(host string) bool {
 		// is written %25, which the parse decodes, so it never
 		// round-trips.
 		u, err := neturl.Parse("https://" + host)
-		return err == nil && u.Host == host && u.Hostname() != "" && u.User == nil &&
-			u.Path == "" && u.RawQuery == "" && u.Fragment == ""
+		return err == nil && u.Host == host && u.User == nil &&
+			u.Path == "" && u.RawQuery == "" && u.Fragment == "" && dialableAuthority(u)
 	}
 	u, err := neturl.Parse(host)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	if ip, err := netip.ParseAddr(u.Hostname()); err == nil && ip.Zone() != "" {
+	// A path is allowed (sub-path-hosted forges); credentials belong in
+	// the credential store, never in the URL. url.Parse drops an empty
+	// query or fragment, so the bytes are checked.
+	return u.User == nil && !strings.ContainsAny(host, "?#") && dialableAuthority(u)
+}
+
+// dialableAuthority reports whether the host and port of u name something
+// that a sync run can dial: a dialableHostname and, when u has one, a port
+// from 1 to 65535.
+func dialableAuthority(u *neturl.URL) bool {
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return false
+		}
+	}
+	return dialableHostname(u.Hostname())
+}
+
+// dialableHostname reports whether name is an IP address without a zone,
+// or a name that the resolver of a sync run looks up. A run dials through
+// the egress proxy (upsync.startEgressProxy), whose Go resolver refuses any
+// other name before it asks DNS (net.isDomainName, after RFC 1035 and RFC
+// 3696): at most 253 bytes, or 254 with a final dot; labels of 1 to 63
+// letters, digits, '_' and '-' that do not start or end with '-'; and not
+// only digits and dots, which curl reads as an IPv4 address (2130706433 is
+// 127.0.0.1) that the registration check never saw. A zone-scoped address
+// (fe80::1%eth0) is refused:
+// the egress guard refuses it under every policy, and the egress answer
+// would repeat a zone of any length.
+func dialableHostname(name string) bool {
+	if ip, err := netip.ParseAddr(name); err == nil {
+		return ip.Zone() == ""
+	}
+	if name == "" || len(name) > 254 || len(name) == 254 && name[253] != '.' {
 		return false
 	}
-	// A path is allowed (sub-path-hosted forges); credentials belong in
-	// the credential store, never in the URL.
-	return u.Hostname() != "" && u.User == nil && u.RawQuery == "" && u.Fragment == ""
+	prev := byte('.')
+	letters := false // a letter, '_' or '-': all digits would be an address
+	label := 0
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', c == '_':
+			letters = true
+			label++
+		case '0' <= c && c <= '9':
+			label++
+		case c == '-':
+			if prev == '.' {
+				return false
+			}
+			letters = true
+			label++
+		case c == '.':
+			if prev == '.' || prev == '-' || label > 63 {
+				return false
+			}
+			label = 0
+		default:
+			return false
+		}
+		prev = c
+	}
+	return prev != '-' && label <= 63 && letters
 }
 
 // upstreamHostname extracts the hostname the sync fetch will dial from a
