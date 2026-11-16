@@ -18,7 +18,8 @@ Bounds the request text that an error answer repeats, so that an answer stays sm
 - `api` cuts `error`, `detail` and each `invalid_params` name of a problem body (`newProblem`), and the `result.message` of a commit write (`wcRefUpdate`) [../api/errors.go:newProblem] [../api/handlers_write_commit.go:wcRefUpdate]
 - `api` quotes an unknown member name in an answer that names one unknown member (`unknownNameText`), and cuts each unknown member name at 32 bytes in the answer of a strictly decoded body that names several members (`Cut`) [../api/decode_body.go:unknownNameText] [../api/handlers_write_refs.go:strictProblem.err]
 - `api` quotes a refused sync provider, operation, access or host (`upstreamConfig.validate`, `validateSyncBaseRepo`) and the ref policy op of a token in a 403 (`refPolicyOpDenies`) [../api/handlers_sync.go:upstreamConfig.validate] [../api/handlers_sync.go:refPolicyOpDenies]
-- `events` quotes a webhook URL or its host in a registration refusal (`CheckRegistration`) [../events/guard.go:CheckRegistration]
+- `api` quotes a ref policy op that a ref, commit or merge write does not know (`unknown policy op "x" for <ref>`) [../api/handlers_write_refs.go:wrefPolicyCheck] [../api/handlers_write_commit.go:wcCheckRefPolicy] [../api/handlers_write_merge.go:server.wmCheckRefPolicy]
+- `events` quotes a webhook URL or its host in a registration refusal, and cuts the parse error it adds after a URL that does not parse (`CheckRegistration`) [../events/guard.go:CheckRegistration]
 - `githttp` cuts the error text of the git and LFS routes [../githttp/server.go:httpError] [../githttp/lfs.go:lfsError]
 
 ## Verification

@@ -111,18 +111,21 @@ func TestUnknownPolicyOpQuotedBounded(t *testing.T) {
 				t.Fatalf("wrefPolicyCheck = %.300q, %v; want %.300q", deny, err, want)
 			}
 
-			// A commit write route answers a 403 in a problem body
-			// (commitWriteEnvelopeStatuses lists no 403).
-			rec := httptest.NewRecorder()
-			if wcCheckRefPolicy(&envelopeWriter{ResponseWriter: rec}, claims, refName) {
-				t.Fatal("wcCheckRefPolicy admitted an unknown op")
-			}
-			var wc problemBody
-			if err := json.Unmarshal(rec.Body.Bytes(), &wc); err != nil || rec.Code != http.StatusForbidden || wc.Detail != want {
-				t.Fatalf("wcCheckRefPolicy: %d %.300s; want 403 %.300q", rec.Code, rec.Body.Bytes(), want)
+			// Each commit write route answers a 403 in a problem body:
+			// its envelope statuses (commitWriteEnvelopeStatuses) hold no
+			// 403.
+			for path, statuses := range commitWriteEnvelopeStatuses {
+				rec := httptest.NewRecorder()
+				if wcCheckRefPolicy(&envelopeWriter{ResponseWriter: rec, statuses: statuses}, claims, refName) {
+					t.Fatalf("%s: wcCheckRefPolicy admitted an unknown op", path)
+				}
+				var wc problemBody
+				if err := json.Unmarshal(rec.Body.Bytes(), &wc); err != nil || rec.Code != http.StatusForbidden || wc.Detail != want {
+					t.Fatalf("%s: wcCheckRefPolicy: %d %.300s; want 403 %.300q", path, rec.Code, rec.Body.Bytes(), want)
+				}
 			}
 
-			rec = httptest.NewRecorder()
+			rec := httptest.NewRecorder()
 			r := httptest.NewRequest(http.MethodPost, "/api/v1/repos/merge", nil).WithContext(auth.WithClaims(t.Context(), claims))
 			if (&server{}).wmCheckRefPolicy(rec, r, nil, refName, ref.ZeroSHA, newSHA, false, "main") {
 				t.Fatal("wmCheckRefPolicy admitted an unknown op")
