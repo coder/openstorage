@@ -411,10 +411,11 @@ func dialableAuthority(u *neturl.URL) bool {
 // 3696): at most 253 bytes, or 254 with a final dot; labels of 1 to 63
 // letters, digits, '_' and '-' that do not start or end with '-'; and not
 // only digits and dots, which curl reads as an IPv4 address (2130706433 is
-// 127.0.0.1) that the registration check never saw. A zone-scoped address
-// (fe80::1%eth0) is refused:
-// the egress guard refuses it under every policy, and the egress answer
-// would repeat a zone of any length.
+// 127.0.0.1) that the registration check never saw. A name with other
+// letters goes in its ASCII form (xn--bcher-kva.example): curl refuses
+// bücher.example as a bad URL. A zone-scoped address (fe80::1%eth0) is
+// refused: the egress guard refuses it under every policy, and the egress
+// answer would repeat its zone, which only the upstream URL limit bounds.
 func dialableHostname(name string) bool {
 	if ip, err := netip.ParseAddr(name); err == nil {
 		return ip.Zone() == ""
