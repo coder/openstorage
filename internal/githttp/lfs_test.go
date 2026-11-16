@@ -272,6 +272,8 @@ func TestLFS_BatchInvalidOIDEcho(t *testing.T) {
 		{"one long", long, long[:64] + "…", 1},
 		{"many long", long[:16384], long[:64] + "…", 250},
 		{"rune boundary", "a" + strings.Repeat("é", 40), "a" + strings.Repeat("é", 31) + "…", 1},
+		{"three-byte rune at the cut", strings.Repeat("a", 62) + strings.Repeat("中", 3), strings.Repeat("a", 62) + "…", 1},
+		{"four-byte rune at the cut", strings.Repeat("a", 61) + strings.Repeat("😀", 2), strings.Repeat("a", 61) + "…", 1},
 	} {
 		for _, op := range []string{"download", "upload"} {
 			t.Run(tc.name+"/"+op, func(t *testing.T) {
