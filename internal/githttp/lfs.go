@@ -46,6 +46,7 @@ import (
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/ref"
 )
 
@@ -178,14 +179,14 @@ const lfsRetryAfterSecs = 10
 // media type, so git-lfs surfaces the message to the user. Throttled
 // responses uniformly carry the Retry-After + RateLimit header pair
 // (SetRateLimited, issue #150) — stamped here so no 429 path can forget
-// them.
+// them. It cuts msg as httpError does.
 func lfsError(w http.ResponseWriter, status int, msg string) {
 	if status == http.StatusTooManyRequests {
 		SetRateLimited(w.Header(), lfsRetryAfterSecs)
 	}
 	w.Header().Set("Content-Type", lfsMediaType)
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"message": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"message": errtext.Bound(msg)})
 }
 
 // lfsToken extracts the JWT from either Basic auth (username "t" — what

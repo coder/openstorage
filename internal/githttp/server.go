@@ -26,6 +26,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -503,10 +504,13 @@ func NewServer(st ref.RefStore, bl blob.BlobStore, cacheDir string, verifier aut
 	}
 }
 
+// httpError writes the JSON error body of a git route. It cuts msg with
+// errtext.Bound: a message can repeat request text, such as the issuer of a
+// token (verifyFailure).
 func httpError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": errtext.Bound(msg)})
 }
 
 // Handler routes the smart-HTTP and LFS endpoints per repo (docs/explanation/git-protocol-and-namespaces.md):
