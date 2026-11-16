@@ -1000,7 +1000,7 @@ func strictJSON(body []byte, dst any) error {
 // that JSON escapes to at most 192: at most 105,203 bytes and the request
 // path in `instance` (TestStrictBodiesBoundTheNamesTheyRepeat). No field
 // name in upstream's spec has more than 25 bytes. An answer that names
-// one unknown member cuts its name at maxUnknownNameBytes, as the other
+// one unknown member cuts its name at errtext.MaxQuotedBytes, as the other
 // decoders do (unknownNameText).
 const maxListedNameBytes = 32
 
@@ -1065,7 +1065,7 @@ func (p strictProblem) err(listed bool) error {
 	case strictNotObject:
 		return newFieldError(path, "must be an object", path+" must be a JSON object")
 	}
-	path = p.path + errtext.Cut(p.name, maxUnknownNameBytes)
+	path = p.path + errtext.Cut(p.name, errtext.MaxQuotedBytes)
 	msg := unknownNameText(p.path, p.name)
 	if listed {
 		path = p.path + errtext.Cut(p.name, maxListedNameBytes)

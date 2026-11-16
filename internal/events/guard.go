@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/coder/openstorage/internal/errtext"
 )
 
 // ErrTargetDenied marks dial-time policy denials (as opposed to ordinary
@@ -221,18 +223,26 @@ func (g TargetGuard) vetHost(ctx context.Context, host string) ([]netip.Addr, er
 // is NOT a delivery-reachability promise (the resolver may be partitioned,
 // or the record may change later either way). Dial-time enforcement in
 // NewClient is authoritative.
+//
+// The error quotes the URL or its host with errtext.Quote: the URL is
+// request text of any length, and its host can hold an IPv6 zone of any
+// length.
 func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("parse webhook url: %w", err)
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err // url.Error repeats the whole URL
+		}
+		return fmt.Errorf("parse webhook url %s: %w", errtext.Quote("", rawURL), err)
 	}
 	host := u.Hostname()
 	if host == "" {
-		return fmt.Errorf("webhook url %s has no host", rawURL)
+		return fmt.Errorf("webhook url %s has no host", errtext.Quote("", rawURL))
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if reason := g.deniedReason(ip); reason != "" {
-			return fmt.Errorf("webhook target %s denied: %s", host, reason)
+			return fmt.Errorf("webhook target %s denied: %s", errtext.Quote("", host), reason)
 		}
 		return nil
 	}
@@ -244,7 +254,7 @@ func (g TargetGuard) CheckRegistration(ctx context.Context, rawURL string) error
 	}
 	for _, ip := range addrs {
 		if reason := g.deniedReason(ip); reason != "" {
-			return fmt.Errorf("webhook target %s resolves to denied address %s: %s", host, ip, reason)
+			return fmt.Errorf("webhook target %s resolves to denied address %s: %s", errtext.Quote("", host), ip, reason)
 		}
 	}
 	return nil

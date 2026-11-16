@@ -990,7 +990,10 @@ through this API) holds a ref that the run would otherwise forward at an older v
 the request stays pending, and a new run starts a few seconds later.
 
 **Ref policies fail closed:** any policy op denies pull-upstream, push-upstream, and a
-sync create at `POST /repos` (403).
+sync create at `POST /repos` (403). The 403 quotes the op (`ref policy op "no-push"
+denies pull-upstream`); an op of more than 256 bytes is cut there, as an unknown member
+name is (`"xx…" (100000 bytes)`). The 403s of `PATCH /repo` and `DELETE /repos/delete`
+quote it the same way.
 The same gate covers the sync that a ref write schedules. A REST write or git push from
 a token that carries any ref-policy op does not trigger the inbound sync, since the sync
 force-updates every head and tag from the upstream, not just the refs that token may

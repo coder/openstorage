@@ -28,3 +28,27 @@ func TestBound(t *testing.T) {
 		})
 	}
 }
+
+func TestQuote(t *testing.T) {
+	if MaxQuotedBytes != 256 {
+		t.Fatalf("MaxQuotedBytes = %d, the docs say 256", MaxQuotedBytes)
+	}
+	exact := strings.Repeat("<", 256)
+	for _, tc := range []struct{ name, prefix, in, want string }{
+		{"a short value", "", "gitea", `"gitea"`},
+		{"a value of exactly the limit", "", exact, `"` + exact + `"`},
+		{"a value one byte over", "", exact + "<", `"` + exact + `…" (257 bytes)`},
+		{"a long value", "", strings.Repeat("x", 1_000_000), `"` + strings.Repeat("x", 256) + `…" (1000000 bytes)`},
+		// The prefix is never cut, and the length is the value's own.
+		{"a prefix", "base_repo.", exact + "<", `"base_repo.` + exact + `…" (257 bytes)`},
+		// A cut inside a rune moves back to its start; Go quotes "é" as is.
+		{"a cut inside a rune", "", "a" + strings.Repeat("é", 200), `"a` + strings.Repeat("é", 127) + `…" (401 bytes)`},
+		{"control characters are escaped", "", "a\nb", `"a\nb"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Quote(tc.prefix, tc.in); got != tc.want {
+				t.Fatalf("Quote(%q, %d bytes) = %.300q, want %.300q", tc.prefix, len(tc.in), got, tc.want)
+			}
+		})
+	}
+}
