@@ -29,8 +29,9 @@ import (
 )
 
 // TestGitArgLimitsAreTheDocumentedNumbers pins the limits that
-// docs/reference/http-api.md states. The other tests take them from the
-// constants, so a limit made too strict would pass them.
+// docs/reference/http-api.md states, and the texts of the list limit. The
+// other tests take them from the constants, so a limit made too strict, or
+// a text that drifts from the docs, would pass them.
 func TestGitArgLimitsAreTheDocumentedNumbers(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -39,9 +40,19 @@ func TestGitArgLimitsAreTheDocumentedNumbers(t *testing.T) {
 		{"gitlimit.MaxArgBytes", gitlimit.MaxArgBytes, 131071},
 		{"maxGitPathBytes", maxGitPathBytes, 131060},
 		{"maxGitIdentBytes", maxGitIdentBytes, 131051},
+		{"gitlimit.MaxArgListBytes", gitlimit.MaxArgListBytes, 65536},
+		{"gitlimit.ArgListEntryBytes", gitlimit.ArgListEntryBytes, 32},
 	} {
 		if c.got != c.want {
 			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	for _, c := range [][2]string{
+		{listTooLongMsg("paths"), "invalid paths (want at most 65536 bytes for all entries, each counting 32 more)"},
+		{listTooLongReason, "must total at most 65536 bytes, each entry counting 32 more"},
+	} {
+		if c[0] != c[1] {
+			t.Errorf("text %q, want the documented %q", c[0], c[1])
 		}
 	}
 }
@@ -77,6 +88,29 @@ func requireTooLong(t *testing.T, resp *http.Response, body []byte, field string
 	want := fmt.Sprintf("must be at most %d bytes", max)
 	if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != field || p.InvalidParams[0].Reason != want {
 		t.Fatalf("invalid_params = %+v, want [{%s %s}]", p.InvalidParams, field, want)
+	}
+}
+
+// requireListTooLong asserts the 400 of a list of values that together
+// pass gitlimit.MaxArgListBytes: the message names the list and the limit,
+// and a body field is the one item of invalid_params.
+func requireListTooLong(t *testing.T, resp *http.Response, body []byte, field string, bodyField bool) {
+	t.Helper()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %.300s)", resp.StatusCode, body)
+	}
+	if want := listTooLongMsg(field); !bytes.Contains(body, []byte(want)) {
+		t.Fatalf("body %.300s, want the message %q", body, want)
+	}
+	if !bodyField {
+		return
+	}
+	var p problemBody
+	if err := json.Unmarshal(body, &p); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != field || p.InvalidParams[0].Reason != listTooLongReason {
+		t.Fatalf("invalid_params = %+v, want [{%s %s}]", p.InvalidParams, field, listTooLongReason)
 	}
 }
 
@@ -403,6 +437,9 @@ func gitValuesRepo(t *testing.T, e *testEnv) (string, string) {
 	return repoURL, e.mint(t, tokenSpec{iss: org, repo: repoURL, scopes: []string{auth.ScopeGitRead}})
 }
 
+// blameRange is a range of n bytes that git reads as line 1: 1,000...01.
+func blameRange(n int) string { return "1," + strings.Repeat("0", n-3) + "1" }
+
 // grepPattern is a pattern of n bytes that git can compile: git takes each
 // line as a regex of its own and refuses one regex of 32 KiB.
 func grepPattern(n int) string {
@@ -414,7 +451,9 @@ func grepPattern(n int) string {
 // routes that git takes as an argument at its limit and past it, in both
 // route groups. The longest value reaches git and answers as any value
 // that names nothing (404, or 200 with nothing found); each longer one is
-// a 400 that names the field.
+// a 400 that names the field. A value of a list (list is its name) also
+// counts against gitlimit.MaxArgListBytes, which is less than its own
+// limit: past that budget a value alone is a 400 that names the list.
 func TestReadValuesPastGitArgLimit(t *testing.T) {
 	path := func(n int) string { return strings.Repeat("p", n) }
 	query := func(route string) func(v string) (string, []byte) {
@@ -437,30 +476,36 @@ func TestReadValuesPastGitArgLimit(t *testing.T) {
 		req   func(v string) (string, []byte) // route suffix and body (POST when not nil)
 		// atMax is the status of the longest value.
 		atMax int
+		list  string
 	}{
-		{"file", "path", maxGitPathBytes, path, query("/file?ref=main&path="), http.StatusNotFound},
-		{"files", "path", maxGitPathBytes, path, query("/files?ref=main&path="), http.StatusNotFound},
-		{"files/metadata", "path", maxGitPathBytes, path, query("/files/metadata?ref=main&path="), http.StatusNotFound},
-		{"commits", "path", maxGitPathBytes, path, query("/commits?ref=main&path="), http.StatusOK},
-		{"diff", "path", maxGitPathBytes, path, query("/diff?ref=main&path="), http.StatusOK},
-		{"branches/diff", "path", maxGitPathBytes, path, query("/branches/diff?branch=main&path="), http.StatusOK},
-		{"blame path", "path", maxGitPathBytes, path, query("/blame?ref=main&path="), http.StatusNotFound},
-		// git reads 1,000...01 as line 1.
-		{"blame range", "range", gitlimit.MaxArgBytes, func(n int) string { return "1," + strings.Repeat("0", n-3) + "1" },
-			query("/blame?ref=main&path=a.txt&range="), http.StatusOK},
+		{"file", "path", maxGitPathBytes, path, query("/file?ref=main&path="), http.StatusNotFound, ""},
+		{"files", "path", maxGitPathBytes, path, query("/files?ref=main&path="), http.StatusNotFound, ""},
+		{"files/metadata", "path", maxGitPathBytes, path, query("/files/metadata?ref=main&path="), http.StatusNotFound, ""},
+		{"commits", "path", maxGitPathBytes, path, query("/commits?ref=main&path="), http.StatusOK, ""},
+		{"diff", "path", maxGitPathBytes, path, query("/diff?ref=main&path="), http.StatusOK, "path params"},
+		{"branches/diff", "path", maxGitPathBytes, path, query("/branches/diff?branch=main&path="), http.StatusOK, "path params"},
+		{"blame path", "path", maxGitPathBytes, path, query("/blame?ref=main&path="), http.StatusNotFound, ""},
+		{"blame range", "range", gitlimit.MaxArgBytes, blameRange,
+			query("/blame?ref=main&path=a.txt&range="), http.StatusOK, "range params"},
 		{"grep pattern", "query.pattern", gitlimit.MaxArgBytes, grepPattern,
-			grep(func(v string) map[string]any { return map[string]any{"query": map[string]any{"pattern": v}} }), http.StatusOK},
+			grep(func(v string) map[string]any { return map[string]any{"query": map[string]any{"pattern": v}} }), http.StatusOK, ""},
 		{"grep paths", "paths.0", maxGitPathBytes, path,
 			grep(func(v string) map[string]any {
 				return map[string]any{"query": map[string]any{"pattern": "needle"}, "paths": []string{v}}
-			}), http.StatusOK},
+			}), http.StatusOK, "paths"},
 	}
+	// listMax is the longest value of a list of one.
+	const listMax = gitlimit.MaxArgListBytes - gitlimit.ArgListEntryBytes
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		repoURL, token := gitValuesRepo(t, e)
 		for group, prefix := range routeGroups(repoURL) {
 			for _, tc := range cases {
 				t.Run(group+"/"+tc.name, func(t *testing.T) {
-					for _, size := range gitArgSizes(tc.max) {
+					sizes := gitArgSizes(tc.max)
+					if tc.list != "" {
+						sizes = append([]int{listMax, listMax + 1}, sizes...)
+					}
+					for _, size := range sizes {
 						t.Run(strconv.Itoa(size), func(t *testing.T) {
 							v := tc.value(size)
 							if len(v) != size {
@@ -472,15 +517,115 @@ func TestReadValuesPastGitArgLimit(t *testing.T) {
 								method = http.MethodPost
 							}
 							resp, out := e.doReq(t, method, prefix+suffix, token, body, "")
-							if size > tc.max {
+							switch {
+							case size > tc.max:
 								requireTooLong(t, resp, out, tc.field, tc.max, body != nil)
-							} else if resp.StatusCode != tc.atMax {
+							case tc.list != "" && size > listMax:
+								requireListTooLong(t, resp, out, tc.list, body != nil)
+							case resp.StatusCode != tc.atMax:
 								t.Fatalf("status = %d, want %d (body %.300s)", resp.StatusCode, tc.atMax, out)
 							}
 						})
 					}
 				})
 			}
+		}
+	})
+}
+
+// TestReadValueListsPastGitArgBudget sends each list of the read routes
+// whose values git takes as arguments of their own, in both route groups,
+// with values that each fit their own limit. A list of
+// gitlimit.MaxArgListBytes reaches git, and one byte more is a 400 that
+// names the list. Before this test such lists reached git at any size, and
+// a grep with many short paths passed what exec takes and got a 500.
+func TestReadValueListsPastGitArgBudget(t *testing.T) {
+	// list returns count values of total bytes as gitlimit.ArgListBytes
+	// counts them; value(i, n) is the i-th value, n bytes long.
+	list := func(count, total int, value func(i, n int) string) []string {
+		vs := make([]string, count)
+		each := total/count - gitlimit.ArgListEntryBytes
+		for i := range vs {
+			n := each
+			if i == 0 {
+				n += total % count
+			}
+			vs[i] = value(i, n)
+		}
+		return vs
+	}
+	path := func(i, n int) string {
+		dir := fmt.Sprintf("d%d/", i)
+		return dir + strings.Repeat("p", n-len(dir))
+	}
+	query := func(route, name string) func(vs []string) (string, []byte) {
+		return func(vs []string) (string, []byte) { return route + url.Values{name: vs}.Encode(), nil }
+	}
+	grepBody := func(paths []string) []byte {
+		raw, err := json.Marshal(map[string]any{"query": map[string]any{"pattern": "needle"}, "paths": paths})
+		if err != nil {
+			panic(err)
+		}
+		return raw
+	}
+	cases := []struct {
+		name, list string
+		count      int
+		value      func(i, n int) string
+		req        func(vs []string) (string, []byte) // route suffix and body (POST when not nil)
+	}{
+		{"diff", "path params", 64, path, query("/diff?ref=main&", "path")},
+		{"branches/diff", "path params", 64, path, query("/branches/diff?branch=main&", "path")},
+		{"blame range", "range params", maxBlameRanges, func(_, n int) string { return blameRange(n) },
+			query("/blame?ref=main&path=a.txt&", "range")},
+		{"grep paths", "paths", 64, path, func(vs []string) (string, []byte) { return "/grep", grepBody(vs) }},
+	}
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		repoURL, token := gitValuesRepo(t, e)
+		for group, prefix := range routeGroups(repoURL) {
+			for _, tc := range cases {
+				t.Run(group+"/"+tc.name, func(t *testing.T) {
+					for _, total := range []int{gitlimit.MaxArgListBytes, gitlimit.MaxArgListBytes + 1} {
+						vs := list(tc.count, total, tc.value)
+						if got := gitlimit.ArgListBytes(vs); got != total {
+							t.Fatalf("list is %d bytes, want %d", got, total)
+						}
+						suffix, body := tc.req(vs)
+						method := http.MethodGet
+						if body != nil {
+							method = http.MethodPost
+						}
+						resp, out := e.doReq(t, method, prefix+suffix, token, body, "")
+						if total > gitlimit.MaxArgListBytes {
+							requireListTooLong(t, resp, out, tc.list, body != nil)
+						} else if resp.StatusCode != http.StatusOK {
+							t.Fatalf("%d bytes: status = %d, want 200 (body %.300s)", total, resp.StatusCode, out)
+						}
+					}
+				})
+			}
+		}
+
+		// 200,000 entries of one byte fit a 1 MiB body. git got them as
+		// 4 MB of arguments, past the 2 MiB that exec takes with an 8 MiB
+		// stack limit, and the grep answered 500.
+		paths := make([]string, 200_000)
+		for i := range paths {
+			paths[i] = "p"
+		}
+		resp, out := e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(paths), "")
+		requireListTooLong(t, resp, out, "paths", true)
+
+		// An entry with a problem of its own is named, and the list is not,
+		// also when good entries follow it.
+		paths[0] = "../x"
+		resp, out = e.doReq(t, http.MethodPost, "/api/v1/repos/grep", token, grepBody(paths[:3001]), "")
+		var p problemBody
+		if err := json.Unmarshal(out, &p); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest || len(p.InvalidParams) != 1 || p.InvalidParams[0].Name != "paths.0" {
+			t.Fatalf("status %d, invalid_params %+v; want 400 naming paths.0 only", resp.StatusCode, p.InvalidParams)
 		}
 	})
 }

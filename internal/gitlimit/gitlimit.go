@@ -42,7 +42,34 @@ const (
 	// that git takes as an argument or an entry are refused past it before
 	// git starts, so the answer is the same on every platform.
 	MaxArgBytes = 128<<10 - 1
+
+	// MaxArgListBytes bounds a list of request values that git gets as
+	// arguments of their own (grep paths, diff path params, blame ranges),
+	// counted by ArgListBytes. Linux limits all arguments and environment
+	// entries of one program together, their pointers included, to a
+	// quarter of the stack limit, at most 6 MiB, and to 128 KiB (ARG_MAX,
+	// 131,072 bytes) for a stack limit from 144 KiB to 512 KiB (measured
+	// with 4 KiB pages), below which the stack itself holds less. macOS
+	// limits them to 1 MiB. Half of the 128 KiB leaves the other half to
+	// the server's environment, which git inherits, and to git's own
+	// arguments.
+	MaxArgListBytes = 64 << 10
+	// ArgListEntryBytes is what a value of such a list costs beyond its
+	// length: what the server puts around it (":(literal)", or a "-L"
+	// argument of its own), its terminating NUL, and its argument pointer,
+	// rounded up.
+	ArgListEntryBytes = 32
 )
+
+// ArgListBytes is the size of values as arguments of a git child: the
+// length of each value plus ArgListEntryBytes.
+func ArgListBytes(values []string) int {
+	n := 0
+	for _, v := range values {
+		n += len(v) + ArgListEntryBytes
+	}
+	return n
+}
 
 var (
 	// ErrBusy: no admission slot freed up in time; git was not started.

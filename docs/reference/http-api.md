@@ -252,11 +252,28 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   check it without its trailing `/`), and a blame `range` or grep `query.pattern` over
   131,071 bytes. The message names the field and its limit, and grep names the field
   in `invalid_params`. The limits on idents are with the
-  [commit writes](#commit-messages-and-idents). Linux also limits all arguments and
-  environment entries of one program together: a quarter of the server's stack limit,
-  at most 6 MiB (2 MiB with the usual 8 MiB stack limit). A request with many values
-  whose sizes each fit, such as a grep with many short `paths`, or a server with a low
-  stack limit, can pass that total, and that answer is a `500`.
+  [commit writes](#commit-messages-and-idents).
+- **Lists of such values** have a limit for all their entries together. Linux limits all
+  arguments and environment entries of one program together, their pointers included: a
+  quarter of the server's stack limit, at most 6 MiB (2 MiB with the usual 8 MiB stack
+  limit), and 128 KiB (131,072 bytes) for a stack limit from 144 KiB to 512 KiB
+  (measured with 4 KiB pages). A smaller stack limit holds less. macOS allows 1 MiB. So
+  the grep `paths`, the `path` params of a diff, and the blame `range` params may hold
+  at most 65,536 bytes together, half of those 128 KiB, where each entry counts its
+  length plus 32 bytes (what git gets around it: `:(literal)` or `-L`, the terminating
+  NULs and the argument pointers). The other half is for the server's environment, which
+  git inherits, and git's own arguments. A longer list answers `400` before git starts,
+  once each of its entries is valid, so one entry over 65,504 bytes already answers
+  `400` although its own limit is higher. The message names the list and the limit
+  (`invalid paths (want at most 65536 bytes for all entries, each counting 32 more)`;
+  `path params` and `range params` on the query routes), and grep names `paths` in
+  `invalid_params`. These limits do not make every request fit. Values that each fit can
+  still pass the total, and that answer is a `500`: a single value near its own limit
+  with a stack limit of about 512 KiB or less, a value over about 64 KiB next to a list
+  near the budget with a stack limit below about 1 MiB, or a large server environment.
+  git also needs stack of its own: with a stack limit below about 176 KiB it can start
+  and then crash, and that answer is a `422`. Below that, even a list within the budget
+  can fail with a `422` or a `500`.
 - **Path encoding**: a git tree entry name can hold any byte except NUL and `/`, but
   JSON strings hold Unicode text. A response path that is not valid UTF-8 comes back
   twice. The path field holds one U+FFFD per invalid byte, and a sibling field
