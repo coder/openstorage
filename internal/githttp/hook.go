@@ -1519,6 +1519,9 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 	assertf(len(verdicts) == len(commands), "preReceivePolicyGate: %d verdicts for %d commands", len(verdicts), len(commands))
 	var firstErr error
 	needsPack := false
+	// The first command that git refuses before the update hook runs (see
+	// reachesUpdateHook): it can never land, so its pack is no reason to publish.
+	gitRefused := ""
 	for i, c := range commands {
 		// Verdicts are the caller's single shared policy evaluation
 		// (Codex round-4 P2 on #173: re-evaluating here double-charged
@@ -1535,11 +1538,20 @@ func preReceivePolicyGate(commands []refCommand, verdicts []error, atomicPush bo
 			continue
 		}
 		if c.new != ref.ZeroSHA && !objectInMainStore(c.new) {
-			needsPack = true
+			switch {
+			case needsPack:
+			case reachesUpdateHook(c.new):
+				needsPack = true
+			case gitRefused == "":
+				gitRefused = c.ref
+			}
 		}
 	}
-	if firstErr == nil || needsPack {
+	if needsPack || (firstErr == nil && gitRefused == "") {
 		return nil
+	}
+	if firstErr == nil {
+		return fmt.Errorf("pre-receive: the quarantined pack is needed only by ref updates that git refuses (%s: its objects are incomplete, or the update is a shallow update), refusing pack publication", gitRefused)
 	}
 	return fmt.Errorf("pre-receive: the quarantined pack is needed only by policy-denied ref updates, refusing pack publication (push the allowed updates separately): %w", firstErr)
 }
@@ -2906,6 +2918,28 @@ func objectExists(sha string) bool {
 	}
 	// Not an exit status (git missing, spawn failure): a bug, fail fast.
 	panic(fmt.Sprintf("githttp assertion failed: cat-file -e %s: %v", sha, err))
+}
+
+// reachesUpdateHook reports whether git's own connectivity check passes for sha,
+// the check that receive-pack runs for each command before it runs the update
+// hook (connected.c: rev-list --objects --stdin --not --all, with the hidden
+// refs excluded, over the quarantine and the main store). git still runs
+// pre-receive for a command that fails it ("missing necessary objects", or
+// "shallow update not allowed"), but the update hook never runs for that
+// command, so no ref can ever point into a pack that only it needs. A
+// non-zero exit of git is the answer "no". A git that cannot start is a
+// bug, which fails fast like objectExists.
+func reachesUpdateHook(sha string) bool {
+	cmd := exec.Command("git", "rev-list", "--objects", "--stdin", "--not", "--exclude-hidden=receive", "--all", "--quiet", "--alternate-refs")
+	cmd.Stdin = strings.NewReader(sha + "\n")
+	err := cmd.Run()
+	if err == nil {
+		return true
+	}
+	if _, ok := errors.AsType[*exec.ExitError](err); ok {
+		return false
+	}
+	panic(fmt.Sprintf("githttp assertion failed: connectivity rev-list %s: %v", sha, err))
 }
 
 // objectInMainStore reports whether sha is resolvable WITHOUT the
