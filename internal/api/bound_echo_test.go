@@ -5,33 +5,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"unicode/utf8"
-)
 
-func TestBoundEcho(t *testing.T) {
-	if maxEchoBytes != 16384 {
-		t.Fatalf("maxEchoBytes = %d, the docs say 16384", maxEchoBytes)
-	}
-	exact := strings.Repeat("a", maxEchoBytes)
-	if got := boundEcho(exact); got != exact {
-		t.Fatalf("a text of exactly %d bytes changed", maxEchoBytes)
-	}
-	if got := boundEcho(exact + "b"); got != exact+"…" {
-		t.Fatalf("a text one byte over: got %d bytes, want the cut text and an ellipsis", len(got))
-	}
-	// A cut inside a multi-byte rune moves back to the rune start.
-	runes := strings.Repeat("é", maxEchoBytes) // 2 bytes each
-	got := boundEcho(runes[:maxEchoBytes+1])
-	if !utf8.ValidString(got) || got != strings.Repeat("é", maxEchoBytes/2)+"…" {
-		t.Fatalf("rune cut: %d bytes, valid %v", len(got), utf8.ValidString(got))
-	}
-	// Three-byte runes: 16384 is not a multiple of 3.
-	three := strings.Repeat("€", maxEchoBytes/3+10)
-	got = boundEcho(three)
-	if !utf8.ValidString(got) || len(got) > maxEchoBytes+len("…") || !strings.HasSuffix(got, "…") {
-		t.Fatalf("three-byte runes: %d bytes, valid %v", len(got), utf8.ValidString(got))
-	}
-}
+	"github.com/coder/openstorage/internal/errtext"
+)
 
 // TestLongValuesAreCutInAnswers: a 400 repeats request text in `error`,
 // `detail` and, for a member name, `invalid_params`. A 1 MiB value must not
@@ -74,17 +50,55 @@ func TestLongValuesAreCutInAnswers(t *testing.T) {
 	})
 }
 
+// TestCommitWriteResultMessageIsCut: the result envelope of a commit write
+// repeats request text in `result.message`, which is cut as `error` is. A
+// short value is repeated whole.
+func TestCommitWriteResultMessageIsCut(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wctServer(t, e)
+		_, writeTok, _ := wctRepo(t, e)
+		long := strings.Repeat("<", 900_000)
+		file := func(mode string) []map[string]any {
+			return []map[string]any{{"path": "a", "content_id": "c", "mode": mode}}
+		}
+		gitPath := "x/.git/" + long
+		patch := "diff --git a/" + gitPath + " b/" + gitPath + "\nnew file mode 100644\n--- /dev/null\n+++ b/" + gitPath + "\n@@ -0,0 +1 @@\n+hi\n"
+		for _, tc := range []struct {
+			name, path, want string
+			body             []byte
+		}{
+			{"a commit-pack mode", "/api/v1/repos/commit-pack", `invalid mode "<<<`,
+				wctLines(t, wctMeta("main", "m", file(long), nil))},
+			{"a diff-commit path", "/api/v1/repos/diff-commit", `invalid patch: .git component in path "x/.git/<<<`,
+				wctLines(t, wctMeta("main", "m", nil, nil), wctDiffChunk([]byte(patch), true))},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resp, body := wctPost(t, srv, tc.path, writeTok, strings.NewReader(string(tc.body)))
+				msg := wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid").Result.Message
+				// A cut of at most 16 KiB, with six bytes for every escaped `<`.
+				if len(body) > 120_000 || !strings.HasPrefix(msg, tc.want) || !strings.HasSuffix(msg, "…") || len(msg) > errtext.MaxBytes+len("…") {
+					t.Fatalf("the answer has %d bytes and a message of %d bytes (%.80q) for a 900,000-byte value", len(body), len(msg), msg)
+				}
+			})
+		}
+		resp, body := wctPost(t, srv, "/api/v1/repos/commit-pack", writeTok, strings.NewReader(string(wctLines(t, wctMeta("main", "m", file("<x>"), nil)))))
+		if msg := wctRequireFail(t, resp, body, http.StatusBadRequest, "invalid").Result.Message; msg != `invalid mode "<x>" for "a"` {
+			t.Fatalf("a short value: message %q", msg)
+		}
+	})
+}
+
 // TestNewProblemKeepsTheCallersParams: the cut of a name must not write
 // through to the slice that the caller passed in.
 func TestNewProblemKeepsTheCallersParams(t *testing.T) {
-	long := strings.Repeat("n", maxEchoBytes+10)
+	long := strings.Repeat("n", errtext.MaxBytes+10)
 	params := []invalidParam{{Name: long, Reason: "is not a known field"}}
 	rec := httptest.NewRecorder()
 	got := newProblem(rec, http.StatusBadRequest, "bad_request", "msg", params, "", "")
 	if params[0].Name != long {
 		t.Fatalf("the caller's name was cut to %d bytes", len(params[0].Name))
 	}
-	if n := got.InvalidParams[0].Name; len(n) != maxEchoBytes+len("…") {
+	if n := got.InvalidParams[0].Name; len(n) != errtext.MaxBytes+len("…") {
 		t.Fatalf("the answer's name has %d bytes", len(n))
 	}
 }

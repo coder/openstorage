@@ -57,7 +57,11 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   The limit counts the bytes of the text as the server holds it, before JSON escapes
   them, so a text with invalid UTF-8 or with bytes that JSON escapes takes more bytes in
   the answer. A text that has up to 16384 bytes is not cut, and the bytes of a message
-  that holds request text count with the rest of the message.
+  that holds request text count with the rest of the message. The same cut applies to
+  the `result.message` of a commit write (`commit-pack`, `diff-commit` and
+  `restore-commit`), which can repeat a `content_id`, a `mode` or a path, and to the
+  error text of the git smart HTTP and Git LFS routes (`error` on a git route, `message`
+  on an LFS route), which can repeat the issuer of a token.
   A `400` for a request body can also carry `invalid_params` (`[{name, reason}]`, as
   upstream's `ValidationProblemDetails`): `name` is the dotted wire path of the invalid
   field, and `reason` is the rule its value breaks. open.storage sends it when a body

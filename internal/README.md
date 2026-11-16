@@ -8,6 +8,7 @@ The Go packages behind the openstorage server (module `github.com/coder/openstor
 - `auth`: [./auth/README.md](./auth/README.md) - JWT claims, scopes, per-org key verifier, token minting, and ref-policy parsing and matching
 - `blob`: [./blob/README.md](./blob/README.md) - `BlobStore` contract with S3 and filesystem backends, pack and LFS key layout, usage listing, and restore covers
 - `envconfig`: [./envconfig/README.md](./envconfig/README.md) - `OPENSTORAGE_*` environment lookup. It never reads the old `CODESTORAGE_*` names: `[envconfig/envconfig.go:CheckLegacy]` rejects a process that sets one without its `OPENSTORAGE_*` replacement
+- `errtext`: [./errtext/README.md](./errtext/README.md) - the 16384-byte cut of request text that an error answer repeats, shared by `api` and `githttp`
 - `events`: [./events/README.md](./events/README.md) - signed webhook delivery with an SSRF dial guard, and a ref-store decorator that emits push events
 - `githttp`: [./githttp/README.md](./githttp/README.md) - git smart-HTTP and LFS server, cache-repo hydration, push holds, and the pre-receive, update, and reference-transaction hooks
 - `gitlimit`: [./gitlimit/README.md](./gitlimit/README.md) - admission slots, tracked git process groups, and the Linux heap cap
