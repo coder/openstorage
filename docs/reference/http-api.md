@@ -82,7 +82,9 @@ are in [`../upstream/openapi.yaml`](../upstream/openapi.yaml).
   `body must be {"metadata": {...}}`. The `upstream` member, the copy form of
   `base_repo` and a branch create without `target_branch` refuse an unknown member, put
   it in `detail` (`invalid upstream: unknown field "branch"`) and name no
-  `invalid_params` item. A
+  `invalid_params` item. A member name of more than 256 bytes is cut there to its
+  first 256 bytes or fewer, at a character, and ends with `…` and its length in bytes:
+  `unknown field "xx…" (1000000 bytes)`. A
   frame of a `commit-pack` or `diff-commit` stream that has a field of the wrong type
   answers in the same way, in the `message` of its result:
   `malformed NDJSON frame: metadata.target_branch must be a string`.
