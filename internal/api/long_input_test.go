@@ -606,19 +606,22 @@ func TestReadValueListsPastGitArgBudget(t *testing.T) {
 			}
 		}
 
-		// The list is checked before the repository is looked up and
-		// before git starts: a list over the budget answers its 400 for
-		// a repository that does not exist, not 404.
+		// On the v1 routes the list is checked before the repository is
+		// looked up and before git starts: a list over the budget answers
+		// its 400 for a repository that does not exist, not 404. (The
+		// path-style alias looks the repository up first and answers 404.)
 		org := e.newOrg(t)
 		missing := e.mint(t, tokenSpec{iss: org, repo: "https://example.com/" + org + "/missing", scopes: []string{auth.ScopeGitRead}})
 		for _, tc := range cases {
-			suffix, body := tc.req(list(tc.count, gitlimit.MaxArgListBytes+1, tc.value))
-			method := http.MethodGet
-			if body != nil {
-				method = http.MethodPost
-			}
-			resp, out := e.doReq(t, method, "/api/v1/repos"+suffix, missing, body, "")
-			requireListTooLong(t, resp, out, tc.list, body != nil)
+			t.Run("missing repository/"+tc.name, func(t *testing.T) {
+				suffix, body := tc.req(list(tc.count, gitlimit.MaxArgListBytes+1, tc.value))
+				method := http.MethodGet
+				if body != nil {
+					method = http.MethodPost
+				}
+				resp, out := e.doReq(t, method, "/api/v1/repos"+suffix, missing, body, "")
+				requireListTooLong(t, resp, out, tc.list, body != nil)
+			})
 		}
 
 		// 200,000 entries of one byte fit a 1 MiB body. git got them as

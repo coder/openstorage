@@ -1344,8 +1344,8 @@ func TestResolveWebhookAllowPrivate(t *testing.T) {
 // TestResolveSyncEgress covers the unified sync egress policy resolution
 // (issue #139): the unified knob governs both directions when set; unset
 // keeps the transitional compatibility default (strict pushes unless the
-// deprecated push-only spelling relaxes them, allow-private pulls with the
-// boot warning); malformed values are boot errors for BOTH spellings.
+// deprecated push-only variable relaxes them, allow-private pulls with the
+// boot warning); malformed values are boot errors for BOTH variables.
 func TestResolveSyncEgress(t *testing.T) {
 	for name, tc := range map[string]struct {
 		env     map[string]string
@@ -1401,6 +1401,46 @@ func TestResolveSyncEgress(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("resolveSyncEgress(%v) = %+v, want %+v", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveServeConfigEmptySyncAllowPrivate: serve reads an
+// OPENSTORAGE_SYNC_ALLOW_PRIVATE that is present but empty as unset, so the
+// deprecated push-only variable still decides pushes and pulls keep the
+// transitional default. resolveSyncEgress cannot tell an empty value from
+// an absent one; this is the layer where the environment can.
+func TestResolveServeConfigEmptySyncAllowPrivate(t *testing.T) {
+	for name, tc := range map[string]struct {
+		env  map[string]string
+		want syncEgressSettings
+	}{
+		"empty unified, legacy true": {
+			env:  map[string]string{envSyncAllowPrivate: "", envSyncPushAllowPrivate: "true"},
+			want: syncEgressSettings{pushAllowPrivate: true, pullAllowPrivate: true, pullTransitional: true, legacyPushFlagSet: true},
+		},
+		"empty unified, no legacy": {
+			env:  map[string]string{envSyncAllowPrivate: ""},
+			want: syncEgressSettings{pullAllowPrivate: true, pullTransitional: true},
+		},
+		"unified false wins over legacy true": {
+			env:  map[string]string{envSyncAllowPrivate: "false", envSyncPushAllowPrivate: "true"},
+			want: syncEgressSettings{legacyPushFlagSet: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{
+				"OPENSTORAGE_ORG":         "org1",
+				"OPENSTORAGE_ORG_PUBKEYS": "/tmp/org.pub.pem",
+			}
+			maps.Copy(env, tc.env)
+			cfg, err := resolveServeConfig(mapEnv(env), "", "127.0.0.1:0", "/tmp/cache", t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.syncEgress != tc.want {
+				t.Fatalf("syncEgress = %+v, want %+v", cfg.syncEgress, tc.want)
 			}
 		})
 	}
