@@ -374,6 +374,14 @@ the same scopes, query parameters and responses.
   `base_repo.auth.token`, `upstream.owner`, `upstream.name`), and nothing is stored. The
   stored text must be UTF-8 without NUL, as a PostgreSQL text value must; a request body
   decodes to valid UTF-8 already.
+- A sync create whose values git cannot take → 400 `bad_request`, and nothing is
+  stored. An upstream URL (`https://{host}/{owner}/{name}.git`) over 131,070 bytes
+  names the `owner`, the `name`, and the host field when the body sent one
+  (`upstream.host`, `base_repo.upstream_host`), each with the reason `must keep the
+  upstream URL at most 131070 bytes` (message `invalid upstream URL (want at most
+  131070 bytes)`). A `base_repo.auth.token` over 131,042 bytes names that field (`must
+  be at most 131042 bytes`). The limits are those of the sync run
+  ([Upstream sync](#upstream-sync), [Git credentials](#git-credentials-generic-https-upstreams)).
 - Providers: `code, github, gitlab, bitbucket, gitea, forgejo, codeberg, sr.ht`, plus
   generic with `upstream_host`.
 - A body with several invalid fields, in any create form, gets an `invalid_params` item
@@ -475,7 +483,8 @@ the same scopes, query parameters and responses.
 stores the username exactly as sent. An update that omits it clears the stored one.
 
 A `username` or `password` that holds a NUL byte → 400 `bad_request` with `invalid_params`
-naming the field, on every credential route, and nothing is stored. A credential `id`
+naming the field, on every credential route, and nothing is stored. So does one over
+131,042 bytes (`must be at most 131042 bytes`), which the sync run could not hand to git. A credential `id`
 that holds a NUL byte, in the body or in the path (also invalid UTF-8 in the path), names
 no credential → 404 `credential_not_found`, as an unknown `id` does.
 
@@ -507,6 +516,8 @@ environment. A stored username or password that contains a carriage return, line
 or NUL fails the sync as a configuration error. So does one over 131,042 bytes, before
 git gets it: git takes it as one environment entry, such as
 `OPENSTORAGE_ASKPASS_PASSWORD=<password>`, which must fit 128 KiB with its terminating NUL.
+The credential routes and `POST /repos` refuse such a long value, so only a value
+stored before they did reaches this check.
 
 ### Files & trees (`git:read`)
 
@@ -830,7 +841,9 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`) is over
 131,070 bytes fails as `repository configuration error` before git starts. git gets the URL
 as one argument, and its HTTP transport hands it on with a `/` added, which must fit
-128 KiB with its terminating NUL. A stored credential that git cannot take fails the same
+128 KiB with its terminating NUL. `POST /repos` refuses such a link with `400`
+([Repository lifecycle](#repository-lifecycle-repowrite--orgread)), so only a link
+registered before it did reaches this check. A stored credential that git cannot take fails the same
 way ([Git credentials](#git-credentials-generic-https-upstreams)). Values that each fit
 can still pass the total limit together: one git start can carry the URL twice and both
 credential entries, about 512 KiB at the limits, so a server with a stack limit of 2 MiB

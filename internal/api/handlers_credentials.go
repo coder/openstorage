@@ -138,12 +138,17 @@ func gcredValidate(withID bool, id, username, password string) error {
 	if withID && id == "" {
 		idErr = newFieldError("id", "is required", "id is required")
 	}
+	// The sync worker hands each value to git in an environment entry,
+	// which must fit upsync.MaxCredentialBytes.
 	if password == "" {
 		passwordErr = newFieldError("password", "is required", "password is required")
-	} else {
-		passwordErr = invalidTextFields([2]string{"password", password})
+	} else if passwordErr = invalidTextFields([2]string{"password", password}); passwordErr == nil {
+		passwordErr = tooLongField("password", password, upsync.MaxCredentialBytes)
 	}
 	usernameErr := invalidTextFields([2]string{"username", username})
+	if usernameErr == nil {
+		usernameErr = tooLongField("username", username, upsync.MaxCredentialBytes)
+	}
 	if passwordErr == nil && (idErr != nil || usernameErr != nil) && meta.ReservedSecret(password) {
 		passwordErr = gcredReservedPassword()
 	}
