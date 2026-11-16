@@ -60,7 +60,7 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 		}
 		return body(map[string]any{"base_repo": spec})
 	}
-	// A host with a scheme is used as is, without its trailing "/".
+	// A host with a scheme is used as is, without trailing "/"s.
 	pathHost := "https://" + host + "/sub/"
 	if got := len(upsync.Upstream{Owner: owner(hostBase, "n", urlMax), Name: "n", UpstreamHost: host}.CloneURL()); got != urlMax {
 		t.Fatalf("the URL at the limit is %d bytes, want %d", got, urlMax)
@@ -95,9 +95,16 @@ func TestSyncValuesGitCannotTakeAtRegistration(t *testing.T) {
 				`invalid upstream host "bad host"`, ipParam{"upstream.host", "is not a valid host"}),
 			post("upstream owner with a NUL is not a URL problem", upstream(over+"\x00", nil),
 				"invalid upstream.owner (want UTF-8 text without NUL)", ipParam{"upstream.owner", ipcNulReason}),
+			// The URL needs no provider when the body sent the host.
+			post("upstream URL over the limit with an unsupported provider", upstream(over, map[string]any{"provider": "zz"}),
+				`unsupported upstream provider "zz"; `+urlMsg, ipParam{"upstream.provider", "is not supported"},
+				ipParam{"upstream.owner", urlWhy}, ipParam{"upstream.name", urlWhy}, ipParam{"upstream.host", urlWhy}),
 			post("upstream name with a NUL is not a URL problem",
 				upstream("o", map[string]any{"name": strings.Repeat("n", urlMax) + "\x00"}),
 				"invalid upstream.name (want UTF-8 text without NUL)", ipParam{"upstream.name", ipcNulReason}),
+			post("base_repo bad host is not a URL problem",
+				baseRepo(owner("https://bad host/", "n", urlMax+1), "t", map[string]any{"upstream_host": "bad host"}),
+				`invalid base_repo upstream_host "bad host"`, ipParam{"base_repo.upstream_host", "is not a valid host"}),
 			post("base_repo URL one byte over", baseRepo(over, "t"), urlMsg,
 				ipParam{"base_repo.owner", urlWhy}, ipParam{"base_repo.name", urlWhy}, ipParam{"base_repo.upstream_host", urlWhy}),
 			post("base_repo token one byte over", baseRepo("o", strings.Repeat("t", credMax+1)),

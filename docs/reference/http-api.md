@@ -376,7 +376,7 @@ the same scopes, query parameters and responses.
   decodes to valid UTF-8 already.
 - A sync create whose values git cannot take → 400 `bad_request`, and nothing is
   stored. An upstream URL over 131,070 bytes (`https://{host}/{owner}/{name}.git`; a
-  host given with `http://` or `https://` is used as is, without its trailing `/`)
+  host given with `http://` or `https://` is used as is, without trailing `/`s)
   names the `owner`, the `name`, and the host field when the body sent one
   (`upstream.host`, `base_repo.upstream_host`), each with the reason `must keep the
   upstream URL at most 131070 bytes` (message `invalid upstream URL (want at most
@@ -485,9 +485,9 @@ stores the username exactly as sent. An update that omits it clears the stored o
 
 A `username` or `password` that holds a NUL byte → 400 `bad_request` with `invalid_params`
 naming the field, on every credential route, and nothing is stored. So does one over
-131,042 bytes (`must be at most 131042 bytes`), which the sync run could not hand to git. A credential `id`
-that holds a NUL byte, in the body or in the path (also invalid UTF-8 in the path), names
-no credential → 404 `credential_not_found`, as an unknown `id` does.
+131,042 bytes (`must be at most 131042 bytes`), which the sync run could not hand to git.
+A credential `id` that holds a NUL byte, in the body or in the path (also invalid UTF-8 in
+the path), names no credential → 404 `credential_not_found`, as an unknown `id` does.
 
 A stored username is always sent as is. Git sends no credentials when the username is
 empty, so for a credential with no username the sync worker sends the upstream's
@@ -841,7 +841,7 @@ Before [#647](https://github.com/coder/openstorage/issues/647), a failed guard a
 | `POST /repos/push-upstream` | git:write + git:read | `{force?}` → **202 Accepted** (async). Sync-linked repos only. open.storage extension |
 
 A pull or push run whose upstream URL (`https://{host}/{owner}/{name}.git`, or the host
-as given when it has a scheme, without its trailing `/`) is over 131,070 bytes fails as
+as given when it has a scheme, without trailing `/`s) is over 131,070 bytes fails as
 `repository configuration error` before git starts. git gets the URL as one argument,
 and its HTTP transport hands it on with a `/` added, which must fit 128 KiB with its
 terminating NUL. `POST /repos` refuses such a link with `400` ([Repository
