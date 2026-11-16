@@ -21,9 +21,12 @@ const maxDecodeWork = 256 << 10
 // of the wrong JSON type. encoding/json keeps decoding after a type error
 // but returns only the first one. unmarshalBody replaces the member that
 // failed by null, which every type accepts as no change, and decodes again
-// until the body decodes or a bound is reached. A body with one wrong-type
-// field returns the error of encoding/json unchanged. Any other error
-// (syntax, a wrong top-level type) is returned unchanged.
+// until the body decodes or a bound is reached. It also stops when null
+// does not fix the field (a map key that does not decode, an UnmarshalJSON
+// that refuses null): when a pass leaves the body as it was, or the next
+// decode names the same field again. A body with one wrong-type field
+// returns the error of encoding/json unchanged. Any other error (syntax, a
+// wrong top-level type) is returned unchanged.
 func unmarshalBody(body []byte, dst any) error {
 	err := json.Unmarshal(body, dst)
 	te, ok := errors.AsType[*json.UnmarshalTypeError](err)
@@ -36,12 +39,13 @@ func unmarshalBody(body []byte, dst any) error {
 	for !errs.full() && budget >= len(work) {
 		next, ok := nullMembers(work, te.Field)
 		// null is longer than a value of 1 to 3 bytes, so the body can grow.
-		if !ok || len(next) > budget {
+		if !ok || len(next) > budget || bytes.Equal(next, work) {
 			break
 		}
 		work, budget = next, budget-len(next)
+		prev := te.Field
 		te, ok = errors.AsType[*json.UnmarshalTypeError](json.Unmarshal(work, dst))
-		if !ok || te.Field == "" {
+		if !ok || te.Field == "" || te.Field == prev {
 			break
 		}
 		errs.add(te)
@@ -131,8 +135,8 @@ func unknownFieldText(err error) string {
 	return "unknown field " + rest
 }
 
-// nullMembers returns body with every value at the dotted path field
-// (members by name, array elements by index) replaced by null. It reports
+// nullMembers returns body with every value at the path field (an
+// UnmarshalTypeError.Field, see memberSpans) replaced by null. It reports
 // false when no value is found at the path.
 func nullMembers(body []byte, field string) ([]byte, bool) {
 	spans := memberSpans(body, strings.Split(field, "."))
@@ -151,8 +155,14 @@ func nullMembers(body []byte, field string) ([]byte, bool) {
 }
 
 // memberSpans returns the byte ranges of the values at path in the JSON
-// value b. encoding/json matches a member name to a field without regard to
-// case, and so does this.
+// value b. path is an UnmarshalTypeError.Field split at each ".":
+// encoding/json spells the path of a value as its JSON Pointer (RFC 6901)
+// with each "/" written as ".", so a member is its name with "~" as "~0"
+// and "/" as "~1", and an array element is its index. A name that holds
+// "." takes several segments of path, and two values can have the same
+// path (`{"a.b":1}` and `{"a":{"b":1}}`): memberSpans returns both.
+// encoding/json matches a member name to a field without regard to case,
+// and so does this.
 func memberSpans(b []byte, path []string) [][2]int {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	open, err := dec.Token()
@@ -175,16 +185,33 @@ func memberSpans(b []byte, path []string) [][2]int {
 		}
 		end := int(dec.InputOffset())
 		start := end - len(raw)
-		if !strings.EqualFold(name, path[0]) {
+		n := pathSegments(name, path)
+		if n == 0 {
 			continue
 		}
-		if len(path) == 1 {
+		if n == len(path) {
 			spans = append(spans, [2]int{start, end})
 			continue
 		}
-		for _, sp := range memberSpans(raw, path[1:]) {
+		for _, sp := range memberSpans(raw, path[n:]) {
 			spans = append(spans, [2]int{start + sp[0], start + sp[1]})
 		}
 	}
 	return spans
+}
+
+// pointerEscaper escapes a member name as a JSON Pointer does.
+var pointerEscaper = strings.NewReplacer("~", "~0", "/", "~1")
+
+// pathSegments returns how many segments at the start of path the member
+// name spells, or 0 when it does not spell them.
+func pathSegments(name string, path []string) int {
+	n := 0
+	for seg := range strings.SplitSeq(pointerEscaper.Replace(name), ".") {
+		if n == len(path) || !strings.EqualFold(seg, path[n]) {
+			return 0
+		}
+		n++
+	}
+	return n
 }

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -210,5 +212,71 @@ func TestDecodeError(t *testing.T) {
 	}
 	if got := frameMsg(json.Unmarshal([]byte(`{`), new(decodeBodyReq))); got != "malformed NDJSON frame" {
 		t.Errorf("frame with a syntax error: %q", got)
+	}
+}
+
+// decodePathReq has members that encoding/json names by their JSON
+// Pointer with each "/" written as ".": map keys that hold "." (kept as
+// is), "/" (written ~1) or "~" (written ~0), and members that null does
+// not fix.
+type decodePathReq struct {
+	Decodes decodeCount               `json:"n"`
+	M       map[string]int            `json:"m"`
+	Nested  map[string]map[string]int `json:"nested"`
+	Keys    map[int]int               `json:"keys"`
+	Strict  refusesNull               `json:"strict"`
+	Count   int                       `json:"count"`
+}
+
+// decodeCount counts the decodes of the body that holds it.
+type decodeCount int
+
+func (c *decodeCount) UnmarshalJSON([]byte) error { *c++; return nil }
+
+// refusesNull takes a JSON string only. Like a hand-written UnmarshalJSON
+// can, it refuses null too, with a type error that names its member.
+type refusesNull struct{}
+
+func (*refusesNull) UnmarshalJSON(b []byte) error {
+	if b[0] == '"' {
+		return nil
+	}
+	return &json.UnmarshalTypeError{Value: "number", Type: reflect.TypeFor[string](), Field: "strict"}
+}
+
+// TestUnmarshalBodyPaths: unmarshalBody names each wrong-type field
+// whatever its map keys hold, and decodes the body once for each field it
+// names and once more. When null does not fix a field (a map key that does
+// not decode, an UnmarshalJSON that refuses null), it names that field,
+// with the error of encoding/json as for any lone field, and stops: at
+// once when the field is null already.
+func TestUnmarshalBodyPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       []string
+		decodes    int
+	}{
+		{"a key with a dot", `{"m":{"a.b":"x","c":"y"},"count":"z"}`, []string{"m.a.b", "m.c", "count"}, 4},
+		{"a key with a slash", `{"m":{"a/b":"x","c":"y"}}`, []string{"m.a~1b", "m.c"}, 3},
+		{"a key with a tilde", `{"m":{"a~b":"x","c":"y"}}`, []string{"m.a~0b", "m.c"}, 3},
+		{"a key that reads as an escaped slash", `{"m":{"a/b":"x","a~1b":"y","c":"z"}}`, []string{"m.a~1b", "m.a~01b", "m.c"}, 4},
+		{"nested maps", `{"nested":{"a.b":{"c/d":"x"},"e":{"f":"y"}},"count":"z"}`, []string{"nested.a.b.c~1d", "nested.e.f", "count"}, 4},
+		{"two values with one path", `{"nested":{"a.b":{"c":"x"},"a":{"b.c":"y"}},"count":"z"}`, []string{"nested.a.b.c", "count"}, 3},
+		{"a map key that does not decode", `{"keys":{"x":1}}`, []string{"keys.x"}, 2},
+		{"a map key that does not decode, null already", `{"keys":{"x":null}}`, []string{"keys.x"}, 1},
+		{"an UnmarshalJSON that refuses null", `{"strict":5}`, []string{"strict"}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var dst decodePathReq
+			err := unmarshalBody([]byte(`{"n":0,`+tc.body[1:]), &dst) // n counts the decodes
+			var got []string
+			for _, p := range invalidParamsFor(err) {
+				got = append(got, p.Name)
+			}
+			_, lone := errors.AsType[*json.UnmarshalTypeError](err)
+			if !slices.Equal(got, tc.want) || int(dst.Decodes) != tc.decodes || lone != (len(tc.want) == 1) {
+				t.Fatalf("named %q in %d decodes (error %T), want %q in %d", got, dst.Decodes, err, tc.want, tc.decodes)
+			}
+		})
 	}
 }
