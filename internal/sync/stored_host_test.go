@@ -49,18 +49,20 @@ func TestRunRefusesStoredInvalidHost(t *testing.T) {
 	for _, host := range []string{
 		"bücher.example",
 		"https://bücher.example",
+		"<<<.com",
 		"http://2130706433" + port, // curl dials 127.0.0.1
 		"http://0x7f.1" + port,     // curl dials 127.0.0.1
 		"http://127.0.0.1" + port + "?",
+		"http://127.0.0.1" + port + "#x",
 		"http://127.0.0.1" + port + "/a b",
 		"HTTP://127.0.0.1" + port,
 		"forge.example:65536",
 		"https://[fe80::1%25eth0]",
 	} {
 		for _, lane := range []string{"pull", "push"} {
-			// A % in the name would reach the file:// URL of the
+			// A % or # in the name would reach the file:// URL of the
 			// fixture's t.TempDir.
-			t.Run(lane+" "+strings.ReplaceAll(host, "%", "_"), func(t *testing.T) {
+			t.Run(lane+" "+strings.NewReplacer("%", "_", "#", "_").Replace(host), func(t *testing.T) {
 				reached.Store(false)
 				f := newWorkerFixture(t)
 				var logs lockedBuffer
@@ -91,5 +93,18 @@ func TestRunRefusesStoredInvalidHost(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestRunChecksStoredHostBeforeURLLength: a stored host that POST /repos
+// refuses gives its own reason even when the upstream URL is also over
+// MaxUpstreamURLBytes, because the run checks the host first, as POST
+// /repos does.
+func TestRunChecksStoredHostBeforeURLLength(t *testing.T) {
+	f := newWorkerFixture(t)
+	f.putUpstream(t, "repo_ihl", "own", "proj", "https://bücher.example/"+strings.Repeat("a", MaxUpstreamURLBytes))
+	err := f.worker.Run(t.Context(), Job{Org: "acme", RepoID: "repo_ihl"})
+	if want := "repository configuration error: upstream host is not a valid host"; err == nil || err.Error() != want {
+		t.Fatalf("run = %.200v; want %q", err, want)
 	}
 }

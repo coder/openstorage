@@ -957,12 +957,13 @@ A pull or push run whose stored host `POST /repos` refuses (`is not a valid host
 [Repository lifecycle](#repository-lifecycle-repowrite--orgread)) also fails as
 `repository configuration error` before git starts. The server's `WARN` line for the
 failed run gives the cause `upstream host is not a valid host` and does not repeat the
-host. Only a link stored before `POST /repos` refused its host has one, such as a name
-with letters outside ASCII (`bücher.example`), a number that curl reads as an IPv4
-address (`2130706433`), or a base URL with an upper-case scheme (`HTTPS://`). Such a
-link fails every run: to sync that upstream, link a repository again through
-`POST /repos` with the host in a form it takes, such as `xn--bcher-kva.example`, the
-ASCII form of `bücher.example`.
+host. Only a link stored before `POST /repos` refused its host (by an older release, or
+by an older server during an upgrade) has one, such as a name with letters outside ASCII
+(`bücher.example`), a number that curl reads as an IPv4 address (`2130706433`), or a
+base URL with an upper-case scheme (`HTTPS://`). Such a link fails every run, and no
+route changes the host of a stored link: to sync that upstream, create a sync repository
+through `POST /repos` with the host in a form it takes, such as `xn--bcher-kva.example`,
+the ASCII form of `bücher.example`.
 
 #### Deprecation header
 
