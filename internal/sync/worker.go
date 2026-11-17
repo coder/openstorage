@@ -785,7 +785,7 @@ func (w *Worker) transfer(ctx context.Context, job Job, repo RepoInfo, up Upstre
 	// longer reach the upstream fetch: the guard dials destinations
 	// directly, exactly like webhook delivery and push forwarding.
 	var egress *egressProxy
-	if u := up.CloneURL(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+	if viaEgressProxy(up.CloneURL()) {
 		egress, err = startEgressProxy(w.PullEgressAllowPrivate)
 		if err != nil {
 			return &syncFailure{code: FailInternal, cause: err}
