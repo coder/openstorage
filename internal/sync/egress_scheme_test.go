@@ -71,13 +71,15 @@ func unreachedServer(t *testing.T) (url string, reached *atomic.Bool) {
 	return srv.URL, reached
 }
 
-// TestWorkerUpperCaseSchemeUpstreamDialsThroughProxy: a stored upstream
-// whose scheme is upper case (`HTTP://`) fetches through the egress proxy
-// like a lower-case one, so the strict policy refuses its loopback host
-// and the upstream is never contacted. Before, only a lower-case scheme
-// started the proxy, and a git that took the transport dialed the link
-// directly.
-func TestWorkerUpperCaseSchemeUpstreamDialsThroughProxy(t *testing.T) {
+// TestWorkerUpperCaseSchemeUpstreamNeverDialsAroundProxy: a stored
+// upstream whose scheme is upper case (`HTTP://`) never reaches its
+// loopback host under the strict policy, even with a git that takes the
+// transport. Two guards hold: the run refuses the host before git starts
+// (upstreamURLFailure), and the egress proxy would refuse the dial
+// (viaEgressProxy), so the test fails only when both break. Before #905,
+// only a lower-case scheme started the proxy, and such a git dialed the
+// link directly.
+func TestWorkerUpperCaseSchemeUpstreamNeverDialsAroundProxy(t *testing.T) {
 	f := newWorkerFixture(t)
 	takeUpperCaseHTTP(t, f.worker)
 	f.worker.PullEgressAllowPrivate = false // strict policy
@@ -97,9 +99,9 @@ func TestWorkerUpperCaseSchemeUpstreamDialsThroughProxy(t *testing.T) {
 	}
 }
 
-// TestPushRunUpperCaseSchemeUpstreamDialsThroughProxy is the push lane's
-// twin of TestWorkerUpperCaseSchemeUpstreamDialsThroughProxy.
-func TestPushRunUpperCaseSchemeUpstreamDialsThroughProxy(t *testing.T) {
+// TestPushRunUpperCaseSchemeUpstreamNeverDialsAroundProxy is the push
+// lane's twin of TestWorkerUpperCaseSchemeUpstreamNeverDialsAroundProxy.
+func TestPushRunUpperCaseSchemeUpstreamNeverDialsAroundProxy(t *testing.T) {
 	f := newWorkerFixture(t)
 	takeUpperCaseHTTP(t, f.worker)
 	f.worker.PushEgressAllowPrivate = false // production default
