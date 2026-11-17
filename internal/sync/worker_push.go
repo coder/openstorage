@@ -629,7 +629,7 @@ func (w *Worker) transferPush(ctx context.Context, job Job, repo RepoInfo, up Up
 	// file:// upstreams (tests; GIT_ALLOW_PROTOCOL-blocked in production)
 	// have no network egress to guard.
 	var egress *egressProxy
-	if u := up.CloneURL(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+	if viaEgressProxy(up.CloneURL()) {
 		egress, err = startEgressProxy(w.PushEgressAllowPrivate)
 		if err != nil {
 			return nil, &syncFailure{code: FailInternal, cause: err}

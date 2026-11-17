@@ -47,6 +47,17 @@ type egressProxy struct {
 	dialErr string
 }
 
+// viaEgressProxy reports whether url names an http or https upstream,
+// whose transfer must dial through the egress proxy. A URL scheme is case
+// insensitive (RFC 3986), and curl dials `HTTPS://` as https, so a stored
+// `HTTPS://` link matches too. Today GIT_ALLOW_PROTOCOL refuses such a
+// link before any dial (git compares transport names case-sensitively:
+// "transport 'HTTPS' not allowed"), but the guard must not depend on it.
+func viaEgressProxy(url string) bool {
+	scheme, _, ok := strings.Cut(url, "://")
+	return ok && (strings.EqualFold(scheme, "http") || strings.EqualFold(scheme, "https"))
+}
+
 func startEgressProxy(allowPrivate bool) (*egressProxy, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
