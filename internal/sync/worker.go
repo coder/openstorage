@@ -218,7 +218,7 @@ type Worker struct {
 	// PushEgressAllowPrivate relaxes the outbound push egress guard's
 	// private receiver classes (resolved from OPENSTORAGE_SYNC_ALLOW_PRIVATE
 	// with OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE as the deprecated push-only
-	// spelling, see egress.go): loopback, RFC 1918, RFC 6598 shared,
+	// variable, see egress.go): loopback, RFC 1918, RFC 6598 shared,
 	// link-local and ULA upstreams for genuinely internal forges. The
 	// cloud metadata endpoints and the other special-purpose ranges stay
 	// denied either way — every http(s) push dials through

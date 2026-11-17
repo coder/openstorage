@@ -40,8 +40,11 @@ func TestSyncValuesTheRunRefusesAtRegistration(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		ctx := context.Background()
 		org := e.newOrg(t)
-		tok := e.mint(t, tokenSpec{iss: org, repo: "val-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
+		// Each case creates a repository of its own name, so a case that
+		// stores one (a 500 before the fix) cannot turn the next into a
+		// repeat create.
 		post := func(name, body, wantError string, want ...ipParam) ipCase {
+			tok := e.mint(t, tokenSpec{iss: org, repo: "val-" + randomHex(t, 4), scopes: []string{auth.ScopeRepoWrite}})
 			return ipCase{name: name, method: http.MethodPost, path: "/api/v1/repos", token: tok, body: body, wantError: wantError, want: want}
 		}
 		ipRun(t, e, []ipCase{
@@ -69,27 +72,30 @@ func TestSyncValuesTheRunRefusesAtRegistration(t *testing.T) {
 
 		// The tracked create (CreateLinkedRepo) refuses the same tokens
 		// before it stores a row, and a repeat create of a linked repo
-		// checks its body first too.
-		s := newPendingSyncStack(t, e, true)
-		linked := "val-linked-" + randomHex(t, 4)
-		if code, _, msg := s.create(t, linked, baseRepo("token")); code != http.StatusCreated {
-			t.Fatalf("tracked create = %d %q, want 201", code, msg)
-		}
-		for _, tc := range []struct{ token, want string }{
-			{"to\nken", "invalid base_repo.auth.token (want no carriage return or line feed)"},
-			{"enc:token", reserved},
-		} {
-			name := "val-tracked-" + randomHex(t, 4)
-			if code, _, msg := s.create(t, name, baseRepo(tc.token)); code != http.StatusBadRequest || msg != tc.want {
-				t.Fatalf("tracked create with token %q = %d %q, want 400 %q", tc.token, code, msg, tc.want)
+		// checks its body first too. A subtest, so that its failure does
+		// not skip the credential cases below.
+		t.Run("tracked and repeat creates", func(t *testing.T) {
+			s := newPendingSyncStack(t, e, true)
+			linked := "val-linked-" + randomHex(t, 4)
+			if code, _, msg := s.create(t, linked, baseRepo("token")); code != http.StatusCreated {
+				t.Fatalf("tracked create = %d %q, want 201", code, msg)
 			}
-			if r, err := e.store.GetRepoByURL(ctx, s.org, name); !errors.Is(err, meta.ErrNotFound) {
-				t.Fatalf("repo after a refused tracked create = %+v, %v; want not found", r, err)
+			for _, tc := range []struct{ token, want string }{
+				{"to\nken", "invalid base_repo.auth.token (want no carriage return or line feed)"},
+				{"enc:token", reserved},
+			} {
+				name := "val-tracked-" + randomHex(t, 4)
+				if code, _, msg := s.create(t, name, baseRepo(tc.token)); code != http.StatusBadRequest || msg != tc.want {
+					t.Errorf("tracked create with token %q = %d %q, want 400 %q", tc.token, code, msg, tc.want)
+				}
+				if r, err := e.store.GetRepoByURL(ctx, s.org, name); !errors.Is(err, meta.ErrNotFound) {
+					t.Errorf("repo after a refused tracked create = %+v, %v; want not found", r, err)
+				}
+				if code, _, msg := s.create(t, linked, baseRepo(tc.token)); code != http.StatusBadRequest || msg != tc.want {
+					t.Errorf("repeat create with token %q = %d %q, want 400 %q", tc.token, code, msg, tc.want)
+				}
 			}
-			if code, _, msg := s.create(t, linked, baseRepo(tc.token)); code != http.StatusBadRequest || msg != tc.want {
-				t.Fatalf("repeat create with token %q = %d %q, want 400 %q", tc.token, code, msg, tc.want)
-			}
-		}
+		})
 
 		repo, err := e.store.CreateRepo(ctx, org, "https://example.com/"+org+"/val-cred-"+randomHex(t, 4), "main")
 		if err != nil {

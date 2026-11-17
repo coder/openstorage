@@ -31,14 +31,14 @@ boot warning announcing the future flip of that default to deny. Syncing
 from internal RFC 1918 gitea/forgejo/GitLab forges is a mainstream released
 0.6.x deployment shape; default-denying it is a breaking change that gets a
 deprecation window, not a surprise. `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
-becomes the deprecated push-only spelling: still honored (its historical
+becomes the deprecated push-only variable: still honored (its historical
 meaning, push only) when the unified knob is unset, ignored with a boot
 notice when it is set. One knob was chosen over per-direction flags because
 the threat and the deployment shape are symmetric — an internal-forge
 deployment wants both directions private, a hardened deployment wants
 neither — and a second per-direction flag would double the migration story
 for no expressible policy anyone asked for. Malformed booleans in either
-spelling are boot errors.
+variable are boot errors.
 
 **Ambient proxies no longer apply to sync transfers.** The pull fetch
 previously inherited `HTTP_PROXY`/`HTTPS_PROXY` from the environment; the
@@ -58,12 +58,14 @@ on resolution errors, never a substitute for dial-time enforcement. Under
 the transitional default this already rejects cloud metadata and
 special-purpose targets while admitting private forges.
 
-**Cloud metadata stays denied under every setting.** The private classes
-hold the instance-metadata and credential endpoints of the clouds
-(`169.254.169.254` in link-local space, Alibaba Cloud's `100.100.100.200`
-in RFC 6598 shared space, `fd20:ce::254` in ULA space, and more). The guard
+**Cloud metadata stays denied under every setting.** Most of the
+instance-metadata and credential endpoints of the clouds lie in the private
+classes (`169.254.169.254` in link-local space, Alibaba Cloud's
+`100.100.100.200` in RFC 6598 shared space, `fd20:ce::254` in ULA space, and
+more); Azure's WireServer, `168.63.129.16`, is a public address. The guard
 denies each of these single addresses whatever the policy, so admitting a
-private class never admits instance credentials. The list and its sources
+private class never admits instance credentials, and the strict policy
+denies the public one too. The list and its sources
 are in the
 [configuration reference](../reference/configuration.md#cloud-metadata-endpoints).
 
@@ -72,5 +74,5 @@ gain the dial-time guard with private targets still allowed by default;
 `serve` warns at boot until `OPENSTORAGE_SYNC_ALLOW_PRIVATE` is set
 explicitly. Set `true` to keep internal-forge sync across the future flip,
 `false` to adopt strict mode early. A future minor release flips the unset
-pull default to deny; the deprecated push-only spelling is removed no
+pull default to deny; the deprecated push-only variable is removed no
 earlier than that flip.

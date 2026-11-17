@@ -111,7 +111,8 @@ const dialTimeout = 10 * time.Second
 //     Instance Metadata Service as serving metadata and bootstrapping VM
 //     credentials
 //     (learn.microsoft.com/azure/virtual-machines/metadata-security-protocol/overview).
-//     It is a public address, so the guard denied it under no policy.
+//     It is a public address, so without this entry no policy would deny
+//     it.
 //   - 192.0.0.192: Oracle Cloud Infrastructure Classic metadata
 //     (docs.oracle.com/en/cloud/iaas-classic/compute-iaas-cloud/stcsg/retrieving-instance-metadata.html),
 //     inside 192.0.0.0/24, which specialUsePrefixes denies too.

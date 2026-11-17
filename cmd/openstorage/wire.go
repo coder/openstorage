@@ -38,7 +38,7 @@ import (
 // logSyncEgressWarnings emits the boot-time sync egress policy notices
 // (issue #139) beside the webhook hatch warning: a relaxed guard must never
 // be silent, the transitional pull default announces its future flip to
-// deny, and the deprecated push-only spelling names its replacement.
+// deny, and the deprecated push-only variable names its replacement.
 func logSyncEgressWarnings(logger *slog.Logger, s syncEgressSettings) {
 	assertf(logger != nil, "logSyncEgressWarnings: nil logger")
 	switch {

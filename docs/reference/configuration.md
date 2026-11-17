@@ -48,7 +48,7 @@ Each setting takes its value from the first source that is set:
 | [`OPENSTORAGE_TRUSTED_PROXIES`](#openstorage_trusted_proxies) | unset | CIDR allowlist of reverse proxies for rate-limit client identity |
 | [`OPENSTORAGE_WEBHOOK_ALLOW_PRIVATE`](#openstorage_webhook_allow_private) | `false` | Permit private-network webhook receivers (cloud metadata endpoints and redirects stay blocked) |
 | [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) | unset (transitional) | Unified sync egress policy: permit private-network upstreams for pull and push (cloud metadata endpoints stay blocked) |
-| [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) | `false` | **Deprecated** push-only spelling of the sync egress policy |
+| [`OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`](#openstorage_sync_push_allow_private) | `false` | **Deprecated** push-only variable of the sync egress policy |
 | [`OPENSTORAGE_SECRETS_KEY`](#openstorage_secrets_key) | unset (plaintext) | AES-256 key list for at-rest encryption of stored webhook secrets and upstream credentials |
 | [`OPENSTORAGE_SECRETS_MODE`](#openstorage_secrets_mode) | `encrypt` | `decrypt-only` stages the key fleet-wide before encrypted writes begin |
 | [`OPENSTORAGE_PACK_QUOTA_BYTES`](#openstorage_pack_quota_bytes) | 10 GiB | Per-repo storage quota, packs + LFS (`0` disables) |
@@ -409,7 +409,7 @@ through an external proxy.
 
 ### `OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE`
 
-**Deprecated** push-only spelling of the sync egress policy, kept for 0.6.x deployments.
+**Deprecated** push-only variable of the sync egress policy, kept for 0.6.x deployments.
 
 - **Default:** `false`.
 - If [`OPENSTORAGE_SYNC_ALLOW_PRIVATE`](#openstorage_sync_allow_private) is unset or
@@ -425,9 +425,10 @@ Controls the native webhook SSRF guard.
 
 - **Default:** `false`. Delivery rejects IANA special-purpose ranges, including loopback,
   RFC 1918, RFC 6598 shared, IPv4/IPv6 link-local, IPv6 ULA, translation/protocol
-  anycast, documentation, benchmarking, reserved, unspecified, multicast, broadcast, and
-  the [cloud metadata endpoints](#cloud-metadata-endpoints). IPv4-mapped IPv6 is
-  normalized first, so `::ffff:10.0.0.1` is private.
+  anycast, documentation, benchmarking, reserved, unspecified, multicast and broadcast,
+  and the [cloud metadata endpoints](#cloud-metadata-endpoints), one of which
+  (`168.63.129.16`) is a public address. IPv4-mapped IPv6 is normalized first, so
+  `::ffff:10.0.0.1` is private.
 - **`true`** (Go boolean; logs a startup warning): admits loopback, RFC 1918, RFC 6598
   shared, link-local, and ULA receivers. Use it only for intentionally internal webhooks.
   It **still blocks** the [cloud metadata endpoints](#cloud-metadata-endpoints) (such

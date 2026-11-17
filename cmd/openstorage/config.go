@@ -198,13 +198,13 @@ const (
 	// metadata endpoints and the other special-purpose ranges stay denied);
 	// "false" denies the private classes in both directions. Unset is the
 	// transitional compatibility default: pushes stay strict (the
-	// deprecated per-direction spelling below may relax them) while pulls
+	// deprecated push-only variable below may relax them) while pulls
 	// ALLOW private upstreams with a boot warning — internal-forge
 	// mirrors are a mainstream released 0.6.x deployment shape, and a
 	// future release flips the unset pull default to deny.
 	envSyncAllowPrivate = "OPENSTORAGE_SYNC_ALLOW_PRIVATE"
 	// envSyncPushAllowPrivate relaxes the outbound push egress guard's
-	// private receiver classes (issue #90). Deprecated spelling: it stays
+	// private receiver classes (issue #90). Deprecated variable: it stays
 	// push-only (its historical meaning), and envSyncAllowPrivate wins
 	// for both directions when set.
 	envSyncPushAllowPrivate = "OPENSTORAGE_SYNC_PUSH_ALLOW_PRIVATE"
@@ -1184,17 +1184,17 @@ type syncEgressSettings struct {
 	// is unset, so pulls allow private upstreams (released 0.6.x behavior)
 	// and boot warns about the future default flip to deny.
 	pullTransitional bool
-	// legacyPushFlagSet records that the deprecated push-only spelling was
+	// legacyPushFlagSet records that the deprecated push-only variable was
 	// present, for the boot-time deprecation notice (when the unified knob
 	// is also set the legacy value is ignored entirely).
 	legacyPushFlagSet bool
 }
 
 // resolveSyncEgress resolves the unified sync egress policy (issue #139).
-// Both spellings parse fail-fast even when losing (a malformed boolean is
+// Both variables parse fail-fast even when losing (a malformed boolean is
 // a boot error, never a silent fallback); the unified knob wins for both
 // directions. Unset keeps the transitional compatibility default: strict
-// pushes (unless the deprecated push-only spelling relaxes them) and
+// pushes (unless the deprecated push-only variable relaxes them) and
 // allow-private pulls, with wire.go warning about the future flip.
 func resolveSyncEgress(getenv func(string) string) (syncEgressSettings, error) {
 	assertf(getenv != nil, "resolveSyncEgress: nil getenv")
