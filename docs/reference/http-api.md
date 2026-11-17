@@ -404,7 +404,20 @@ the same scopes, query parameters and responses.
     open.storage does not have → 400. To sync a private GitHub repository, use the
     deprecated `base_repo` sync form with `auth.token`.
   - `host`: a bare `hostname[:port]`, or (open.storage extension) an `http(s)://` base
-    URL like `base_repo.upstream_host`. It defaults to the provider's public host.
+    URL like `base_repo.upstream_host`. It defaults to the provider's public host. Both
+    host fields take only what a sync run can use as given; any other host → 400 `is not
+    a valid host`:
+    - an IP address without a zone, or a DNS name: at most 253 bytes (254 with a final
+      dot), labels of 1 to 63 letters, digits, `_` and `-` that do not start or end with
+      `-`, not only digits and dots, and not a numerical IPv4 address in curl's forms:
+      one to four decimal, octal or `0x` hexadecimal numbers within IPv4's range
+      (`2130706433`, `1.2.3` and `0x7f.1` → 400: curl would dial `127.0.0.1`, `1.2.0.3`
+      and `127.0.0.1`; `0x100.1` is out of range, so it stays a name);
+    - a name with other letters in its ASCII form (`xn--bcher-kva.example`, not
+      `bücher.example`);
+    - a port from 1 to 65535, or an empty one, which is the default;
+    - in a base URL, `http://` or `https://` in lower case, and no `?`, `#` or space, even
+      an empty query (`https://forge.example?` → 400).
   - No credential is stored at create. For a private non-GitHub upstream, add one with
     `POST /repos/git-credentials`, then call `pull-upstream`.
   - `upstream` has no `forward_pushes`; use the deprecated `base_repo` sync form to opt in.
