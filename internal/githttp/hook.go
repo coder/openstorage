@@ -24,6 +24,7 @@ import (
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
 	"github.com/coder/openstorage/internal/envconfig"
+	"github.com/coder/openstorage/internal/errtext"
 	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/meta"
 	"github.com/coder/openstorage/internal/ref"
@@ -2426,8 +2427,10 @@ func evalRefPolicy(ctx context.Context, repo, refName, old, new string, fullEval
 				needsSig = true
 			}
 		default:
-			// Unknown policy ops fail closed.
-			return refusef("unknown policy op %q for %s", op, refName)
+			// Unknown policy ops fail closed. The op is text of the
+			// pusher's token, as long as an environment entry allows, so
+			// the refusal quotes it cut (errtext.Quote), as the API does.
+			return refusef("unknown policy op %s for %s", errtext.Quote("", op), refName)
 		}
 	}
 	if needsAncestry {
