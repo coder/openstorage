@@ -21,6 +21,7 @@ Bounds the request text that an error answer repeats, so that an answer stays sm
 - `api` quotes a ref policy op that a ref, commit or merge write does not know (`unknown policy op "x" for <ref>`) [../api/handlers_write_refs.go:wrefPolicyCheck] [../api/handlers_write_commit.go:wcCheckRefPolicy] [../api/handlers_write_merge.go:server.wmCheckRefPolicy]
 - `events` quotes a webhook URL or its host in a registration refusal, and cuts the parse error it adds after a URL that does not parse (`CheckRegistration`) [../events/guard.go:CheckRegistration]
 - `githttp` cuts the error text of the git and LFS routes [../githttp/server.go:httpError] [../githttp/lfs.go:lfsError]
+- `githttp` quotes a ref policy op that the update hook does not know, in the refusal that git shows the pusher (`evalRefPolicy`) [../githttp/hook.go:evalRefPolicy]
 
 ## Verification
 - Run: `go test ./internal/errtext/... -tags=openstorage_viewcheck -count=1 -race -timeout=30m`
