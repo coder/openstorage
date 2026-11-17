@@ -16,7 +16,7 @@ package sync
 //
 // Egress posture: the push targets the CloneURL the pull lane already
 // fetches from — a host validated at link time (providerHosts /
-// validUpstreamHost) — under the same hermetic environment and
+// ValidUpstreamHost) — under the same hermetic environment and
 // GIT_ALLOW_PROTOCOL pin, PLUS a dial-time destination guard (egress.go):
 // writes into private networks are a stronger SSRF primitive than the
 // pull lane's reads, so every http(s) push dials through a vetting proxy
