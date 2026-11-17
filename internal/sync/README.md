@@ -6,6 +6,7 @@ Upstream git mirror sync (pull) and outbound push-forward. The package defines t
 ## Interface
 - Data types: `Credential`, `Upstream` (`CloneURL`), `Job` [sync.go:Credential]; `RejectedRef`, `EventRepository`, `Event` [events.go:Event]
 - `ProviderHost`, `NewCredentialID` (`ggc_` + 16 hex) [sync.go:ProviderHost]
+- `ValidUpstreamHost`, `InvalidUpstreamHostReason` — the upstream hosts that `POST /repos` stores and a run takes, and the reason (`is not a valid host`) for any other [upstreamhost.go:ValidUpstreamHost]
 - `PushPendingNone`, `PushPendingPush`, `PushPendingForce` — outbound pending levels 0, 1, 2 [sync.go:PushPendingNone]
 - Errors: `ErrNotFound`, `ErrCredentialExists`, `ErrUpstreamExists`, `ErrSyncInProgress`, `ErrPushInProgress`, `ErrClaimLost`, `ErrShutdown` [sync.go:ErrNotFound] [local_schedule.go:ErrShutdown]
 - Contracts: `CredentialStore`, `UpstreamStore`, `EventSink`, `Queue`, `DefaultBranchAdopter`, `FirstSyncScheduler`, `ShutdownRestorer`, `LocalLanes` [sync.go:Queue] [default_branch.go:DefaultBranchAdopter] [first_sync.go:FirstSyncScheduler] [metastore.go:ShutdownRestorer] [local_schedule.go:LocalLanes]
@@ -23,11 +24,12 @@ Upstream git mirror sync (pull) and outbound push-forward. The package defines t
 
 ## Invariants
 - `assertf` panics on programming errors only, never on untrusted input [sync.go:assertf]
+- `ValidUpstreamHost` rejects userinfo, query, fragment (even an empty one), a space, a scheme other than lower-case `http`/`https`, a port outside 1-65535, and a hostname that is neither an IP address without a zone nor a name that Go's resolver asks DNS for and that curl does not read as a numerical IPv4 address (one to four decimal, octal or hex numbers within IPv4's range) [upstreamhost.go:ValidUpstreamHost] [upstreamhost.go:dialableHostname] [upstreamhost.go:curlIPv4Name]
 - `ValidBranchName` rejects empty names, names over 255 bytes, `..`, bad components, and `.lock` or `.` suffixes [default_branch.go:ValidBranchName]
 - `Worker.assertReady` panics when a required dependency is unset; `Run` and `RunPush` assert non-empty org and repo ID [worker.go:assertReady]
 - `Run` returns nil without events when the repo no longer exists [worker.go:Run]
 - A transfer refuses to push when the holder changed (`errClaimStolen`), the row is gone (`errDetached`), or the claim lease is inside `claimFenceMargin` [worker.go:transfer]
-- `hermeticGitEnv` strips inherited `GIT_*` variables and sets `GIT_ALLOW_PROTOCOL` [worker.go:hermeticGitEnv]; stored credentials containing CR, LF, or NUL fail with `FailConfig`, and so does one over `MaxCredentialBytes` [worker.go:Worker.upstreamAuth]; an upstream URL over `MaxUpstreamURLBytes` fails with `FailConfig` before any git starts [worker.go:upstreamURLFailure]. The API refuses both limits at registration (`POST /repos`, git credential routes) with the same constants; the run checks stay for stored values
+- `hermeticGitEnv` strips inherited `GIT_*` variables and sets `GIT_ALLOW_PROTOCOL` [worker.go:hermeticGitEnv]; stored credentials containing CR, LF, or NUL fail with `FailConfig`, and so does one over `MaxCredentialBytes` [worker.go:Worker.upstreamAuth]; a stored host that `ValidUpstreamHost` refuses (a `file://` test fixture aside) and an upstream URL over `MaxUpstreamURLBytes` fail with `FailConfig` before any git starts, and the error never names the host or the URL [worker.go:upstreamURLFailure]. The API refuses both limits and such a host at registration (`POST /repos`, git credential routes) with the same constants and `ValidUpstreamHost`; the run checks stay for stored values
 - Only `FailUnreachable` push failures retry, at most `MaxPushTransientRetries` times; pushes use `--atomic` [worker_push.go:RunPush]
 - `proxyEnv` removes inherited proxy variables in any case; the egress proxy maps policy denials to 403 and dial failures to 502 [egress.go:proxyEnv]
 - `MemStore.BeginSync` returns `ErrSyncInProgress` while an unexpired claim exists; legacy claims get a grace period; `RequestPush` never downgrades force; a stolen push claim inherits force [memstore.go:BeginPush]

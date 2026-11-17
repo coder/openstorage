@@ -1043,10 +1043,18 @@ const MaxCredentialBytes = gitlimit.MaxArgBytes - len("OPENSTORAGE_ASKPASS_PASSW
 // checks it again for links registered before.
 const MaxUpstreamURLBytes = gitlimit.MaxArgBytes - len("/")
 
-// upstreamURLFailure fails a run whose upstream URL is over
-// MaxUpstreamURLBytes, before any git starts: such a link fails the same
-// way on every run, so it is configuration. The error never names the URL.
+// upstreamURLFailure fails a run whose upstream URL a run cannot use,
+// before any git starts: a host that ValidUpstreamHost refuses, such as
+// one with non-ASCII letters that an older release stored, or a URL over
+// MaxUpstreamURLBytes. Such a link fails the same way on every run, so it
+// is configuration. The error gives POST /repos's reason for the host
+// (InvalidUpstreamHostReason) and never names the host or the URL. A
+// file:// host is the tests' fixture: POST /repos never stores one, and
+// GIT_ALLOW_PROTOCOL refuses it in production.
 func upstreamURLFailure(up Upstream) *syncFailure {
+	if !strings.HasPrefix(up.UpstreamHost, "file://") && !ValidUpstreamHost(up.UpstreamHost) {
+		return &syncFailure{code: FailConfig, cause: errors.New("upstream host " + InvalidUpstreamHostReason)}
+	}
 	if len(up.CloneURL()) <= MaxUpstreamURLBytes {
 		return nil
 	}
