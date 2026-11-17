@@ -11,8 +11,8 @@ import (
 // TestUnknownPolicyOpRefusalQuotedBounded: the update hook refuses a ref
 // policy op that it does not know with a refusal that git shows the
 // pusher, and quotes the op with errtext.Quote, so an op of any length
-// makes a short line. The reservation classifier (fullEval off) gives the
-// same refusal.
+// makes a short line. The budget-free evaluation (fullEval off), which
+// the reservation classifier runs, gives the same refusal.
 func TestUnknownPolicyOpRefusalQuotedBounded(t *testing.T) {
 	const refName = "refs/heads/main"
 	newSHA := strings.Repeat("a", 40)
