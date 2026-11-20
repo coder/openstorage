@@ -148,7 +148,7 @@ Encoding: a JSON array of `[pattern, ops]` 2-element tuples. Evaluation:
 | Op | Enforcement |
 |---|---|
 | `no-push` | reject any update to matching refs |
-| `no-force-push` | reject non-fast-forward updates (git push -f, restore-commit that rewinds, etc.). An update of an existing ref whose old or new value names no commit in the repository (a tag counts as the commit it points at) counts as non-fast-forward |
+| `no-force-push` | reject non-fast-forward updates (git push -f, restore-commit that rewinds, etc.). An update of an existing ref whose old or new value names no commit in the repository (a tag counts as the commit it points at) counts as non-fast-forward, and so does an update between two commits whose history git cannot walk (a commit whose parent is missing). The server logs the second case for the operator |
 | `verify-sig` | reject pushes introducing commits without a valid signature from a registered key |
 
 Ops apply to git receive-pack **and** every HTTP write endpoint. They are the only

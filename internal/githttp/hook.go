@@ -2686,11 +2686,14 @@ func introducedPending(ctx context.Context, state *verifyState, refName, old, ne
 		return nil, examined, fmt.Errorf("verify-sig: reading rev-list: %w", err)
 	}
 	if err := cmd.Wait(); err != nil {
-		// rev-list exits 128 for an id that is no readable commit here. The
-		// pusher chose it (see isAncestorUncached), so that is a refusal,
-		// decided by object state and not by git's message.
-		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 &&
-			(old != ref.ZeroSHA && !commitExists(old) || !commitExists(new) || !historyIntact(new)) {
+		// rev-list exits 128 for an id that is no readable commit here, or
+		// for a commit whose history it cannot walk. The pusher chose both
+		// ids (see isAncestorUncached), so that is a refusal. Two real
+		// commits that git cannot walk also get an operator line.
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 {
+			if (old == ref.ZeroSHA || commitExists(old)) && commitExists(new) {
+				logUnwalkableHistory("rev-list", old, new)
+			}
 			return nil, examined, refusef("verify-sig: the old or new value of %s is not a readable commit in this repository", refName)
 		}
 		return nil, examined, fmt.Errorf("verify-sig: git %s: %w", strings.Join(args, " "), err)
@@ -3176,9 +3179,13 @@ func isAncestor(old, new string) bool {
 // pusher can plant such a commit, because receive-pack checks the tips that
 // a command updates, not every object that its pack carries. A walk that
 // needs the unreadable part proves no ancestry, so the answer is false; a
-// walk that never reaches it ends in 0 or 1 as usual. Object state decides,
-// not git's message (commitExists, historyIntact). Exit 128 for two commits
-// with intact history, or any other failure, means a broken git: fail fast.
+// walk that never reaches it ends in 0 or 1 as usual. When both ids name
+// commits, exit 128 means that git cannot walk their history: a planted
+// commit or a damaged repository. The answer is false there too, and the
+// operator gets a line in the hook-errors file (logUnwalkableHistory). No
+// further walk decides which one it is: a walk of a long history without a
+// commit-graph costs seconds for each command. Any other failure means a
+// broken git: fail fast.
 func isAncestorUncached(old, new string) bool {
 	err := exec.Command("git", "merge-base", "--is-ancestor", old, new).Run()
 	if err == nil {
@@ -3189,12 +3196,23 @@ func isAncestorUncached(old, new string) bool {
 		case 1:
 			return false
 		case 128:
-			if !commitExists(old) || !commitExists(new) || !historyIntact(old) || !historyIntact(new) {
-				return false
+			if commitExists(old) && commitExists(new) {
+				logUnwalkableHistory("merge-base", old, new)
 			}
+			return false
 		}
 	}
 	panic(fmt.Sprintf("githttp assertion failed: merge-base --is-ancestor %s %s: %v", old, new, err))
+}
+
+// logUnwalkableHistory writes the operator line for a git walk (cmd) that
+// exited 128 for two commits: the history between them has a commit that git
+// cannot read. The pusher can plant one, so the push is refused. A repository
+// whose stored history is damaged gets the same line for every such push.
+func logUnwalkableHistory(cmd, old, new string) {
+	hookErrorsLogger().Warn("git cannot walk the history between two commits, so the update is refused",
+		"git", cmd, "old", old, "new", new,
+		"cause", "a commit whose parent is missing: a pushed commit, or a damaged repository")
 }
 
 // commitExists reports whether sha names a commit, or a tag that peels to
@@ -3211,17 +3229,4 @@ func commitExists(sha string) bool {
 	// A corrupt object or a spawn failure: a bug or a broken repository,
 	// never the pusher's input.
 	panic(fmt.Sprintf("githttp assertion failed: rev-parse --verify %s^{commit}: %v", sha, err))
-}
-
-// historyIntact reports whether git can read every commit that sha reaches.
-// sha must name a commit. rev-list exits 128 for a missing parent.
-func historyIntact(sha string) bool {
-	err := exec.Command("git", "rev-list", "--quiet", sha).Run()
-	if err == nil {
-		return true
-	}
-	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok && exitErr.ExitCode() == 128 {
-		return false
-	}
-	panic(fmt.Sprintf("githttp assertion failed: rev-list --quiet %s: %v", sha, err))
 }
