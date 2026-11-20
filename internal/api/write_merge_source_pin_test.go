@@ -7,7 +7,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -193,6 +195,36 @@ func TestMergeExpectedSourceSHARefusesAPinThatThePacksLack(t *testing.T) {
 				}
 			})
 		}
+
+		// The check is git work that the merge starts, so it runs under the same
+		// admission slots as a create: with every slot taken the merge answers
+		// 503 with Retry-After (not 500) and writes nothing, and it frees its
+		// slot when it is done. ffMid is held completely and reached by ffsrc.
+		t.Run("no free slot", func(t *testing.T) {
+			p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+			if won, err := e.refStore.CASRef(ctx, fx.repoID, "refs/heads/t-plant-busy", ref.ZeroSHA, fx.c2); err != nil || !won {
+				t.Fatalf("create t-plant-busy: won %v, err %v", won, err)
+			}
+			body := wmMergeBody("ffsrc", "t-plant-busy", "ff_only", map[string]any{"expected_source_sha": fx.ffMid})
+			before := wmRefsSnapshot(t, e, fx.repoID)
+			key := gitlimit.RepoKey(fx.repoID)
+			if err := p.slots.Acquire(ctx, key); err != nil {
+				t.Fatal(err)
+			}
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
+			if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+				t.Fatalf("with no free slot: status %d, Retry-After %q, body %s, want 503 with Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"), raw)
+			}
+			if after := wmRefsSnapshot(t, e, fx.repoID); !reflect.DeepEqual(before, after) {
+				t.Fatalf("refs changed while no slot was free: before %v, after %v", before, after)
+			}
+			p.slots.Release(key)
+			resp, raw = wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token, body)
+			if got := wmDecode(t, raw); resp.StatusCode != http.StatusOK || got["commit_sha"] != fx.ffMid {
+				t.Fatalf("with a free slot: status %d body %s, want fast_forward to %s", resp.StatusCode, raw, fx.ffMid)
+			}
+			requireSlotsFree(t, p)
+		})
 
 		// The tip itself is a ref already: pinning it is no walk and no refusal.
 		t.Run("the tip", func(t *testing.T) {

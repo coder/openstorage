@@ -409,7 +409,7 @@ func (s *server) wrefUsableCommit(ctx context.Context, repoID, repoPath, sha str
 	defer b.Close()
 	usable, err := gitread.RegisteredClosure(gitread.WithBudget(ctx, b), s.refStore, s.blobStore, repoPath, repoID, sha)
 	if err == nil && !usable {
-		s.logger.Warn("a ref write names a commit that the registered packs cannot walk: a pack lacks the commit or one of its ancestors, trees or blobs",
+		s.logger.Warn("a ref write names a commit that the registered packs cannot walk: a pack lacks the commit or one of its ancestors, trees or blobs, or the cache is damaged",
 			"repo", repoID, "sha", sha)
 	}
 	return usable, err

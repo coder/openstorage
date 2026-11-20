@@ -774,13 +774,16 @@ on 500,000 linear commits: the tip of a branch takes 5 ms, a commit 1,000 back 1
 commits and trees, and also the walk of the history of the refs down to its commit date (1,000 new
 commits dated after the tip took 14 ms, and the same commits dated 1970 took 1.7 s). A commit
 whose parent no pack holds always costs the whole history (1.6 s). A separate unreferenced history
-costs more: 100,000 commits took 2.8 s. The walk runs under the admission slots, the 30-second
-time budget and the 256 MiB heap cap of the git:read routes ([Resource limits on git
+costs more, because git also holds its trees: 50,000 commits took 2.4 s, and 100,000 commits need
+more than the heap cap. The walk runs under the admission slots, the 30-second time budget and the
+256 MiB heap cap (Linux) of the git:read routes ([Resource limits on git
 reads](#resource-limits-on-git-reads)): a request that finds no free slot answers `503` with
 `Retry-After`, a walk that outlasts its budget answers `503`, and a walk that needs more memory
-(an unreferenced history of 500,000 commits) answers `422`. git 2.39 exits with status 128 on a
-missing parent commit, and git 2.43 on a ref at a missing object, instead of printing the object:
-the check reads that exit status as a history that cannot be walked.
+answers `422`. A create whose `base_ref` is refused walks `preferred_base` under a budget of its
+own. git 2.39 exits with status 128 on a missing parent commit, and git 2.43 on a ref at a missing
+object, instead of printing the object. The check reads exit status 128 as a history that cannot be
+walked, as the ancestry check of a push does. That status is also git's answer to a damaged cache
+(a corrupt pack), which therefore answers `404` too, and the log line names both causes.
 
 #### Guarded branch create and move
 
