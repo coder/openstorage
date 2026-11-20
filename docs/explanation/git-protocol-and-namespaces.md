@@ -48,9 +48,12 @@ The receive path must:
   and stock git answers `ok` with the warning `deleting a non-existent ref`. The hooks do
   the same when the ref store holds no such ref. When the store holds it (the replica's
   cache lags, or the ref was created since the client read the refs), the hooks refuse
-  that command with a per-ref `ng` that names the ref and its SHA (`<ref> exists at <sha>
-  in the ref store, but this replica does not list it`), and `serve` logs an operator line.
-  Fetch, then push the delete again.
+  that command with a per-ref `ng` (`hook declined`) whose `remote:` text names the ref and
+  the first 8 hex digits of its SHA (`<ref> exists at <sha> in the ref store, but this
+  replica does not list it`), and `serve` logs an operator line. Fetch, then push the
+  delete again. An `--atomic` push with such a command is refused whole by pre-receive
+  (`<ref> already exists (created concurrently); fetch first`), as for any command whose
+  old value the store contradicts, with no SHA and no operator line.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
   open.storage gives the `+ephemeral` remote its own storage key. The HTTP API, though, stores its
