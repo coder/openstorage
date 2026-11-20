@@ -1,5 +1,94 @@
 # Changelog
 
+## [0.21.0](https://github.com/coder/openstorage/compare/v0.20.0...v0.21.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** `POST /repos/merge` with `squash: true` and no `commit_message` now answers 400 before any branch lookup, instead of the answer it got before (a squash commit with a default message, `no_op`, or an error such as 403, 404, 409 or 412). A merge commit without `commit_message` now gets the message `Merge branch '<source>' into <target>` instead of `Merge <source> into <target>`.
+* **githttp:** the persistent git remote `/<repo>.git` no longer lists, fetches or accepts pushes to `refs/namespaces/` refs, the API's ephemeral branches included, and an import push through `/<repo>+import.git` cannot write them either. Use the HTTP API for those branches. Delete unwanted refs that a push wrote under `refs/namespaces/` before you upgrade: git cannot delete them afterwards. `POST /repos` now refuses a `default_branch` outside `refs/heads/` with 400, as `PATCH /repo` does.
+* **githttp:** the `+import` remote is push-only and an import push writes the repository's normal branches and tags. Clone and fetch through `+import` answer 403, and a repository with a sync base refuses an import push. Before you upgrade, stop pushes to `+import`, then fetch every ref you pushed through `+import` with the current version and push it to the normal remote of a repository without a sync base. The copy stores the objects a second time, so raise the pack quota first when they do not fit (docs/explanation/git-protocol-and-namespaces.md, "Upgrading from 0.20.0 or earlier"). Data under the old `<repo_id>+import` key keeps counting against the repository's quota until the repository is deleted.
+
+### Features
+
+* **cmd:** add repair-refs to delete refs that git can never lock ([#826](https://github.com/coder/openstorage/issues/826)) ([587c7e2](https://github.com/coder/openstorage/commit/587c7e2465165af16db471b1b062001a32b80795))
+
+
+### Bug Fixes
+
+* **api:** answer 400 for a request value too long for a git argument, and send commit messages on stdin ([#780](https://github.com/coder/openstorage/issues/780)) ([871536c](https://github.com/coder/openstorage/commit/871536c209f94814d1afbe597f3c035715cd71b8))
+* **api:** answer 400, not 500, for a PATCH /repo default_branch with whitespace ([#837](https://github.com/coder/openstorage/issues/837)) ([f7a01a6](https://github.com/coder/openstorage/commit/f7a01a6d12a3502cc6c490065a22694794e13118))
+* **api:** answer 404 to a mux redirect whose location passes 16384 bytes ([#884](https://github.com/coder/openstorage/issues/884)) ([5610c16](https://github.com/coder/openstorage/commit/5610c16b94b294a403cf088e70f613e4f40a46b5))
+* **api:** check expected_target_sha on branches/create ([#811](https://github.com/coder/openstorage/issues/811)) ([303cb29](https://github.com/coder/openstorage/commit/303cb2909d8e4966f148a5e8b981cb7d50aeeb9d))
+* **api:** count the 404 for a long /healthz redirect under git ([#891](https://github.com/coder/openstorage/issues/891)) ([accb8c6](https://github.com/coder/openstorage/commit/accb8c62151e727398c126a17000f8ba54743fca))
+* **api:** cut a long unknown member name in a decode error answer ([#882](https://github.com/coder/openstorage/issues/882)) ([535e967](https://github.com/coder/openstorage/commit/535e967c9ca8ebf171059c48ba8665cfe5d49d8c))
+* **api:** cut the commit write result message and git and LFS error text ([#885](https://github.com/coder/openstorage/issues/885)) ([bd0a3ea](https://github.com/coder/openstorage/commit/bd0a3ea8ec8b6be5a1812eab655f16c5212d9585))
+* **api:** cut the instance of an error answer at 16384 bytes ([#834](https://github.com/coder/openstorage/issues/834)) ([a0b3838](https://github.com/coder/openstorage/commit/a0b3838d1f2ff3107ce0cbf235f2da45b9b8b1d1))
+* **api:** cut the invalid oid that an lfs batch entry repeats ([#887](https://github.com/coder/openstorage/issues/887)) ([59600c5](https://github.com/coder/openstorage/commit/59600c550db560467fd472238f3506dbd8823c75))
+* **api:** cut the one unknown name that a strict body repeats ([#895](https://github.com/coder/openstorage/issues/895)) ([dc6ef0c](https://github.com/coder/openstorage/commit/dc6ef0cf8237b388b048fb6557c07686c71da7f8))
+* **api:** cut the request text that an error answer repeats at 16384 bytes ([#833](https://github.com/coder/openstorage/issues/833)) ([7a7f9f9](https://github.com/coder/openstorage/commit/7a7f9f9d68d27b9fc38c90994334b0615bdb02b5))
+* **api:** cut the webhook URL and the ref policy op that a refusal quotes ([#902](https://github.com/coder/openstorage/issues/902)) ([04b97f9](https://github.com/coder/openstorage/commit/04b97f98f8797c877f5b0859683262e720ed0ccb))
+* **api:** default a commit-pack file operation to upsert and accept a delete without content_id ([#822](https://github.com/coder/openstorage/issues/822)) ([769825d](https://github.com/coder/openstorage/commit/769825d4bfefdb36deab48b00ccaf5c9a296d128))
+* **api:** keep Go type names out of the detail of a wrong-type body field 400 ([#851](https://github.com/coder/openstorage/issues/851)) ([51951fa](https://github.com/coder/openstorage/commit/51951fa506091ddaf0217ecda5196f6bd857b36b))
+* **api:** log a key store failure that the REST routes meet ([#870](https://github.com/coder/openstorage/issues/870)) ([bcf858f](https://github.com/coder/openstorage/commit/bcf858fec06a1a59f3091aa0b113b09c56647396))
+* **api:** name every bad member of a strictly decoded body ([#886](https://github.com/coder/openstorage/issues/886)) ([dd57090](https://github.com/coder/openstorage/commit/dd5709056d11a756d1643683e3b816e3566826b6))
+* **api:** name every invalid field of a branch or tag request in invalid_params ([#832](https://github.com/coder/openstorage/issues/832)) ([c2c6dae](https://github.com/coder/openstorage/commit/c2c6daee3c9e8b93918a72b9a2754b9d1692ae71))
+* **api:** name every invalid field of a git credential request in invalid_params ([#828](https://github.com/coder/openstorage/issues/828)) ([810909a](https://github.com/coder/openstorage/commit/810909a1d0d328dcfa986ed81453091ed9ca04f8))
+* **api:** name every invalid field of a grep or archive request in invalid_params ([#827](https://github.com/coder/openstorage/issues/827)) ([6d529a9](https://github.com/coder/openstorage/commit/6d529a9ca69e34f54d9633702c395b613d07baee))
+* **api:** name every invalid field of a merge request in invalid_params ([#825](https://github.com/coder/openstorage/issues/825)) ([331c6fa](https://github.com/coder/openstorage/commit/331c6fae5215068e02537dc6f7b66162a935ba13))
+* **api:** name every invalid field of a note request in invalid_params ([#830](https://github.com/coder/openstorage/issues/830)) ([964fc14](https://github.com/coder/openstorage/commit/964fc1474449065293eb9b1e862b7de5ed65ed1b))
+* **api:** name every invalid field of a repo create, update or pull-upstream request in invalid_params ([#829](https://github.com/coder/openstorage/issues/829)) ([3d43725](https://github.com/coder/openstorage/commit/3d437255624fc72424eae84fd7cea0d82fd37e8a))
+* **api:** name every wrong-type field of a request body in invalid_params ([#836](https://github.com/coder/openstorage/issues/836)) ([deba107](https://github.com/coder/openstorage/commit/deba1070e6aadac4905e016163a91f4c1b2bcce8))
+* **api:** name the field of a DELETE branches body and finish the invalid_params docs ([#835](https://github.com/coder/openstorage/issues/835)) ([1ac2ab7](https://github.com/coder/openstorage/commit/1ac2ab734c11e47eaa04d248840377fec07437f5))
+* **api:** read strategy, squash and allow_unrelated_histories in merge/preview ([#810](https://github.com/coder/openstorage/issues/810)) ([76bb164](https://github.com/coder/openstorage/commit/76bb164fb330162b1c5f8787d88eeabc9e1ad014))
+* **api:** refuse a branch or tag at a commit whose history the packs cannot walk ([#929](https://github.com/coder/openstorage/issues/929)) ([786352e](https://github.com/coder/openstorage/commit/786352e52e15ef886001aa9b849d1b398204d499))
+* **api:** refuse a branch or tag name whose last part is over 250 bytes ([#824](https://github.com/coder/openstorage/issues/824)) ([26e8d12](https://github.com/coder/openstorage/commit/26e8d128609c9a33124a62154452717802c12883))
+* **api:** refuse a NUL in a commit message, an ident or a note author with 400, not 500 ([#840](https://github.com/coder/openstorage/issues/840)) ([61782b8](https://github.com/coder/openstorage/commit/61782b832999ceed7d00452c4a5ce40d8417680f))
+* **api:** refuse a NUL in a grep pattern with 400, not 500 ([#839](https://github.com/coder/openstorage/issues/839)) ([96efedd](https://github.com/coder/openstorage/commit/96efedd41161e480fbf3b2277f5b5f13d52ddfca))
+* **api:** refuse a read list of git arguments past a fixed budget ([#890](https://github.com/coder/openstorage/issues/890)) ([b98cdac](https://github.com/coder/openstorage/commit/b98cdacb470e917d2781f795c8f62966a706d7de))
+* **api:** refuse a sync link or credential that git cannot take when it is stored ([#892](https://github.com/coder/openstorage/issues/892)) ([ee76167](https://github.com/coder/openstorage/commit/ee76167105480fb9a9c991a0fec9bafbbd38b0c6))
+* **api:** refuse an upstream host that no sync run resolves as given ([#903](https://github.com/coder/openstorage/issues/903)) ([324dd32](https://github.com/coder/openstorage/commit/324dd3268ab58b7532a967bd1153d1568677e790))
+* **api:** refuse an upstream host without a hostname with 400, not 500 ([#838](https://github.com/coder/openstorage/issues/838)) ([bd51b10](https://github.com/coder/openstorage/commit/bd51b10b96cc0a6401eb4ff6a69094b819db6df4))
+* **api:** refuse sync credentials that the run refuses, and cut quoted sync values ([#900](https://github.com/coder/openstorage/issues/900)) ([d75aa38](https://github.com/coder/openstorage/commit/d75aa382835442a7e18bb2d21eff7157a471ca3d))
+* **api:** require commit_message for a squash merge and use upstream's default merge message ([#814](https://github.com/coder/openstorage/issues/814)) ([9e37270](https://github.com/coder/openstorage/commit/9e372700d9c03c78452fa8224eaabc860d1174cf))
+* **api:** store permission-style commit-pack file modes as upstream does ([#820](https://github.com/coder/openstorage/issues/820)) ([657da0a](https://github.com/coder/openstorage/commit/657da0acd6fe4da0a07b0153ba4f647467ea3086))
+* **api:** tidy the invalid_params docs and pin the quoting of a cut name ([#888](https://github.com/coder/openstorage/issues/888)) ([bece294](https://github.com/coder/openstorage/commit/bece294e6ef790564823b58196a7ef0d830980da))
+* **auth:** keep Go type names out of the text of a token claim that does not decode ([#861](https://github.com/coder/openstorage/issues/861)) ([4e671fc](https://github.com/coder/openstorage/commit/4e671fc19bf68452b0607577cd21e855a954cfc4))
+* **auth:** refuse a token whose header has crit ([#878](https://github.com/coder/openstorage/issues/878)) ([c0a221b](https://github.com/coder/openstorage/commit/c0a221b1cc2a6cd95e8493776aca076f6212a58e))
+* **auth:** refuse any byte outside the token header object ([#881](https://github.com/coder/openstorage/issues/881)) ([7080675](https://github.com/coder/openstorage/commit/70806758b386c078c44e773f4099592614f03ba4))
+* **auth:** require the token header to be one JSON object ([#880](https://github.com/coder/openstorage/issues/880)) ([4bf53ab](https://github.com/coder/openstorage/commit/4bf53ab32921076fd1435ca8f6558a0fffc503a6))
+* **cmd:** correct the repair-refs empty-repo message and add tests ([#831](https://github.com/coder/openstorage/issues/831)) ([d989793](https://github.com/coder/openstorage/commit/d989793f0c738ca9024600a697fe44be147c2df0))
+* **cmd:** repair-refs also removes a branch whose tip is not a commit ([#869](https://github.com/coder/openstorage/issues/869)) ([97b6d12](https://github.com/coder/openstorage/commit/97b6d12483ad2096fa4ea47c0ebc7c6c4f5bd245))
+* **cmd:** repair-refs cleans up its packs after the scan and on SIGHUP ([#873](https://github.com/coder/openstorage/issues/873)) ([a8544b3](https://github.com/coder/openstorage/commit/a8544b322dcb654ab063275b572024c184ad2ea3))
+* **cmd:** repair-refs docs state the name rule and the dry-run output ([#877](https://github.com/coder/openstorage/issues/877)) ([1ac697a](https://github.com/coder/openstorage/commit/1ac697a1bd429c593efaf364cb791139624cc5ca))
+* **cmd:** repair-refs lists an uncertain delete in its recovery warning ([#917](https://github.com/coder/openstorage/issues/917)) ([a17acff](https://github.com/coder/openstorage/commit/a17acff0e821fa42b25af76489c4e1b9f4cea13b))
+* **cmd:** repair-refs lists and deletes a ref at a missing object ([#879](https://github.com/coder/openstorage/issues/879)) ([f9ac163](https://github.com/coder/openstorage/commit/f9ac163ed3d22f7a320355babacec6a87e2749df))
+* count merge tips on stdin, and fail a sync whose upstream URL or credential git cannot take as configuration ([#748](https://github.com/coder/openstorage/issues/748)) ([1e70aef](https://github.com/coder/openstorage/commit/1e70aefc4a818eaea855cc374d9f6a82abaf2874))
+* **deps:** bump github.com/jackc/pgx/v5 to v5.13.0 (GHSA-w9rp-vfrh-q8vv) ([#859](https://github.com/coder/openstorage/issues/859)) ([d157031](https://github.com/coder/openstorage/commit/d15703183ab2ced9e2773fe073399e3fb32bbaab))
+* **deps:** bump Go 1.27.3 to 1.27.4 for GO-2026-6859 ([#847](https://github.com/coder/openstorage/issues/847)) ([6f056d5](https://github.com/coder/openstorage/commit/6f056d5f98d9a5f82f10133ab2afa1a3f1b1540b))
+* **events:** deny every cloud metadata endpoint under every egress policy ([#901](https://github.com/coder/openstorage/issues/901)) ([a56cf56](https://github.com/coder/openstorage/commit/a56cf565bb1003dbbc76523bd3f927935dc3e837))
+* **githttp:** answer a delete of a ref that the replica does not list ([#928](https://github.com/coder/openstorage/issues/928)) ([7211578](https://github.com/coder/openstorage/commit/72115785411437d1bb11cb8f08e0a3f663fbe7e4))
+* **githttp:** cap the decoded bytes of an LFS batch body ([#858](https://github.com/coder/openstorage/issues/858)) ([0a26fdd](https://github.com/coder/openstorage/commit/0a26fdd07fdf950d312c6488f6f7992d3dcbcc36))
+* **githttp:** cut the unknown ref policy op that a push refusal quotes ([#906](https://github.com/coder/openstorage/issues/906)) ([57f04fe](https://github.com/coder/openstorage/commit/57f04fe1ec4a789be756c4771144f3a5478b6bb1))
+* **githttp:** drop the second history walk from the ancestry check ([#918](https://github.com/coder/openstorage/issues/918)) ([03ffe1f](https://github.com/coder/openstorage/commit/03ffe1f3a5ee7e2a43773ec5bdc439034c65da0a))
+* **githttp:** hide refs/namespaces/ on the persistent remote ([#800](https://github.com/coder/openstorage/issues/800)) ([b5e8d36](https://github.com/coder/openstorage/commit/b5e8d36c6cbace688d15ede5ea3da7763ea1e86e))
+* **githttp:** keep Go type names out of the message of an LFS batch 400 ([#852](https://github.com/coder/openstorage/issues/852)) ([39f2f87](https://github.com/coder/openstorage/commit/39f2f87603245f38f4b024b3949140040c3a5a23))
+* **githttp:** keep key store and key parser text out of the 401 of a git or LFS request ([#865](https://github.com/coder/openstorage/issues/865)) ([3ecc0d2](https://github.com/coder/openstorage/commit/3ecc0d260646666b265a236bd203b23e006306ca))
+* **githttp:** make +import a push-only remote that writes normal branches ([#809](https://github.com/coder/openstorage/issues/809)) ([0bce3c1](https://github.com/coder/openstorage/commit/0bce3c1fdb7de3adea17c575ffb651f548de5635))
+* **githttp:** refuse a branch tip that is not a commit before the ref store takes it ([#860](https://github.com/coder/openstorage/issues/860)) ([c76fedf](https://github.com/coder/openstorage/commit/c76fedf785952fb6f9a58471ee521e14ac0d7c02))
+* **githttp:** refuse a push whose old id names no commit ([#845](https://github.com/coder/openstorage/issues/845)) ([2945107](https://github.com/coder/openstorage/commit/2945107828764ca179f46e56528d3663aa33548e))
+* **githttp:** refuse a ref at an object that no registered pack holds ([#896](https://github.com/coder/openstorage/issues/896)) ([be8cc18](https://github.com/coder/openstorage/commit/be8cc180ce1752937490742bdf6c8df7d5a179f0))
+* **githttp:** store no pack for a push command that git refuses ([#894](https://github.com/coder/openstorage/issues/894)) ([cf74700](https://github.com/coder/openstorage/commit/cf747000eb20a47f02ad96aa9b8bba6300b36001))
+* **githttp:** store no pack that only an unupdatable ref name needs ([#817](https://github.com/coder/openstorage/issues/817)) ([46219f0](https://github.com/coder/openstorage/commit/46219f08e349e5b3f248233726ac5c48f74fc65e))
+* **githttp:** wait for the sweep restore of a missing registered pack ([#893](https://github.com/coder/openstorage/issues/893)) ([044adc3](https://github.com/coder/openstorage/commit/044adc343dc4be1ec24ac5422f698df15351cbcb))
+* **image:** upgrade every runtime image package at build time ([#913](https://github.com/coder/openstorage/issues/913)) ([d6fbebe](https://github.com/coder/openstorage/commit/d6fbebebcb51493e7c56b93fab83eef5ea1f562e))
+* **image:** upgrade zlib in the runtime image (ALPINE-CVE-2026-4738) ([#853](https://github.com/coder/openstorage/issues/853)) ([dc64a2e](https://github.com/coder/openstorage/commit/dc64a2e314f28b8b2a80493e91bc311eb38a3f6f))
+* **ref:** a failed SQLite COMMIT is never a win, whatever the swap changed ([#868](https://github.com/coder/openstorage/issues/868)) ([32ebf20](https://github.com/coder/openstorage/commit/32ebf20d52a1f035bafbef10c948872f4bc7a902))
+* **ref:** a lost reply to the CAS statement is not a win ([#863](https://github.com/coder/openstorage/issues/863)) ([40d1db2](https://github.com/coder/openstorage/commit/40d1db2ee4be324a1a4648466ac3e8d4bd3b9540))
+* **sync:** fail a run whose stored host POST /repos refuses ([#907](https://github.com/coder/openstorage/issues/907)) ([3385593](https://github.com/coder/openstorage/commit/338559318cc9dbbf59f48d0a5740a812dc4c31da))
+* **sync:** send an upper-case http(s) scheme through the egress proxy ([#905](https://github.com/coder/openstorage/issues/905)) ([0d1f65e](https://github.com/coder/openstorage/commit/0d1f65ec7ccc88ed267714d74ae3c989899b1ead))
+* trim refs/heads/ on fork defaults and keep git children on protocol v0 ([#816](https://github.com/coder/openstorage/issues/816)) ([f0b0f7b](https://github.com/coder/openstorage/commit/f0b0f7bb9ae0a87e0fae7726878cfdd295b55639))
+
 ## [0.20.0](https://github.com/coder/openstorage/compare/v0.19.0...v0.20.0) (2026-11-11)
 
 
