@@ -65,6 +65,7 @@ func startMetricsNode(t *testing.T, listen string, wantMetrics bool, extraEnv ..
 	cmd.Env = append(cmd.Env, extraEnv...)
 	n := &metricsNode{cmd: cmd, stderr: &syncBuffer{}}
 	cmd.Stderr = n.stderr
+	cmd.SysProcAttr = nodeSysProcAttr()
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -72,10 +73,12 @@ func startMetricsNode(t *testing.T, listen string, wantMetrics bool, extraEnv ..
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	})
+	node := &testNode{cmd: cmd}
+	t.Cleanup(node.stop)
+	if err := trackNodeSession(cmd.Process.Pid); err != nil {
+		node.stop()
+		return nil, err
+	}
 	lines := make(chan string, 4)
 	go func() {
 		sc := bufio.NewScanner(stdout)

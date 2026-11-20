@@ -6,6 +6,7 @@
 package githttp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -47,8 +48,18 @@ func tryServeExpectExit(t *testing.T, cacheDir string, extraEnv ...string) (stri
 		"OPENSTORAGE_TEST_MODE=1",
 	)
 	cmd.Env = append(cmd.Env, extraEnv...)
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.SysProcAttr = nodeSysProcAttr()
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	defer (&testNode{cmd: cmd}).stop()
+	if err := trackNodeSession(cmd.Process.Pid); err != nil {
+		t.Fatalf("guard the serve process: %v", err)
+	}
+	err := cmd.Wait()
+	return out.String(), err
 }
 
 // TestS3WAL_RestartFromBucketOnly is the §2.5 W10 restart drill: kill a
