@@ -72,7 +72,8 @@ func testAdoptUpstreamDefaultBranch(t *testing.T, s Backend) {
 	expect("stale PATCH", lost, "main", true)
 
 	// An older binary's PATCH (rolling upgrade) changes the branch without
-	// clearing the flag: adopt then only clears the flag.
+	// clearing the flag in Go: on PostgreSQL the trigger clears it at that
+	// write, on SQLite adopt clears it later. Either way the branch stays.
 	oldPatch := create("old-patch", true)
 	rawExec(t, s, `UPDATE repos SET default_branch = 'dev' WHERE repo_id = '`+oldPatch.RepoID+`'`)
 	adopt("adopt after an old-binary PATCH", oldPatch, "trunk", false)
