@@ -46,10 +46,11 @@ package fixes:
 
 Alpine v3.24 upstream support ([release branches](https://alpinelinux.org/releases/) and
 [release inventory](https://alpinelinux.org/releases.json), checked 2026-11-20): the
-`main` repository through **2028-06-01**. Every package in the runtime image comes from
-`main`. The image installs nothing from `community`, which Alpine supports only until
-its next stable release. These are repository support dates, not a whole-image support
-guarantee or a vulnerability-scan result.
+`main` repository through **2028-06-01**, and the `community` repository only until
+Alpine's next stable release. Every package in the runtime image comes from `main`, and
+the [CI](../../.github/workflows/ci.yml) `image` job fails when one does not. These are
+repository support terms, not a whole-image support guarantee or a vulnerability-scan
+result.
 
 ## Backing services
 
@@ -379,8 +380,10 @@ Remove any of these refs from the ref store with
    namespace (for example a notes ref). There, delete the ref that a replica's cache lists,
    with `git push <remote> :<ref>` through that replica. That is usually the ref that the
    push created, not the one that step 3 printed: the restored ref was at a missing
-   object, so no cache lists it, and the push that deletes it fails. Ask the pusher to push
-   it again under a free name: the old name conflicts with the restored ref.
+   object, so no cache lists it, and the replica refuses a push that deletes it (`<ref>
+   exists at <sha> in the ref store, but this replica does not list it`, and `serve` logs
+   an operator line). Ask the pusher to push it again under a free name: the old name
+   conflicts with the restored ref.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and
@@ -736,6 +739,7 @@ webhook events.
 | `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git, LFS or REST request reached the key store or a registered key, and it failed. The line holds the cause (a cause of more than 300 runes loses its middle). A git or LFS client reads a text that does not hold the cause. For each kind, the git and LFS routes together write at most one line per minute in each `serve` process, the REST routes write at most one more, and a line says how many earlier lines of its kind were held back when some were |
 | `receive-pack <repo>: hook: … git cannot walk the history between two commits, so the update is refused` log line | A push named two commits whose history git cannot read, so the hook refused that update: as non-fast-forward under `no-force-push`, and with `is not a readable commit in this repository` under `verify-sig`. The line has the fields `git`, `old` and `new`. A pusher can cause it with a commit whose parent is missing. A `<repo>` that repeats it for ordinary pushes from several clients has a damaged history: check a fresh copy with `git fsck` |
 | `a ref write names a commit that the registered packs cannot walk` log line | A `POST /repos/branches/create`, `POST /repos/tags` or `POST /repos/merge` (with `expected_source_sha`) named a commit that no registered pack holds, or whose ancestor, tree or blob no registered pack holds. The line has the fields `repo` and `sha`. A branch create logs one line for each base that it refuses (`base_ref` and `preferred_base` can both be refused). It answers `200` at `preferred_base` when that base is usable and `404` otherwise, a tag answers `404` and a merge answers `409` (`ref_guard_failed`). A pusher can leave such a commit in a pack (git checks only the commits that the refs of a push reach). A `repo` that logs the line for ordinary creates, with different `sha` values that name healthy bases, has a ref at an object that no registered pack holds (compare `openstorage list-packs` with the blob store, and list the ref with `openstorage repair-refs`) or a damaged cache on that node (git exits with status 128 on a corrupt pack, and the check reads that as a history that cannot be walked) |
+| `receive-pack <repo>: hook: … a push deletes a ref that its replica does not list, and the ref store holds it, so the update is refused` log line | A client sent `git push <remote> :<ref>` for a ref that its replica's cache does not list, and the ref store holds the ref. The pusher read `<ref> exists at <sha> in the ref store, but this replica does not list it`. The line has the fields `ref`, `sha` and `cause`. One line after a ref was created is normal: the client fetches and pushes again. A `<repo>` that repeats it has a replica whose cache stays behind: look for a `hydrate <repo>:` error on that replica |
 | `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
@@ -769,6 +773,7 @@ line can be up to 1 MiB.
 | `verify token: …` lines (What to monitor) | **log only** | The two texts shown, at most one line for each kind per minute for the git and LFS routes together, and one more for the REST routes, in each `serve` process |
 | `git cannot walk the history between two commits` (What to monitor) | **log only** | A hook line, so metrics do not count it. Fields `git`, `old`, `new` and `cause` |
 | `a ref write names a commit that the registered packs cannot walk` (What to monitor) | **log only** | An API line, so metrics do not count it. Fields `repo` and `sha` |
+| `a push deletes a ref that its replica does not list` (What to monitor) | **log only** | A hook line, so metrics do not count it. Fields `ref`, `sha` and `cause` |
 | `lane scan: requeued a lane whose work had no job` (What to monitor) | **log only** | Fields `org`, `repo` and `lane` |
 | S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
 | `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |
