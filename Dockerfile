@@ -35,7 +35,7 @@ FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c
 # repository ships fixes to base packages (OpenSSL, zlib) before an Alpine point
 # release does. So the same layer upgrades every installed package to the
 # repository's current build, without version pins (see git above).
-RUN apk add --no-cache git ca-certificates gnupg openssh-keygen \
+RUN apk add --no-cache git ca-certificates gnupg openssh-keygen tini \
     && apk upgrade --no-cache \
     && adduser -D -H openstorage
 COPY --from=build /out/openstorage /usr/local/bin/openstorage
