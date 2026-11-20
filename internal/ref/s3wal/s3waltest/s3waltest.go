@@ -47,9 +47,9 @@ const (
 	SeaweedFSImage   = testimages.SeaweedFS
 	MinIOLegacyImage = "quay.io/minio/minio:RELEASE.2024-01-16T16-07-38Z@sha256:4c4a4876193f030c81f57aabb22bcb9a73462010eb61fcab66908e03e5484af8"
 	// FlociImage pins the qualified stable release by OCI index digest.
-	// Release 2.4.0 includes the GetObject torn-read fix floci-io/floci#2874
-	// and follow-up #2901. The linux/amd64 image (config 0afb96950173,
-	// upstream revision 9be236e2) passed all 22 standard surfaces plus
+	// Release 2.5.0 includes the GetObject torn-read fix floci-io/floci#2874
+	// and follow-up #2901. The linux/amd64 image (config bea702f9f25d,
+	// upstream revision 53ebf2a1) passed all 22 standard surfaces plus
 	// get-under-overwrite in REQUIRE mode. It honors DeleteObject+If-Match
 	// (412), but that row stays record-only, never a correctness guard.
 	// Keep both Floci workflows in sync with this pin. See
