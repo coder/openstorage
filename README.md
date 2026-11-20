@@ -179,7 +179,7 @@ the packs.
 
 ```sh
 # 1. Start an S3-compatible service for this example (SeaweedFS).
-docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0 server -s3 -dir=/data -ip.bind=0.0.0.0
+docker run -d --name cs-s3 -p 127.0.0.1:8333:8333 -v cs-s3-data:/data chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15 server -s3 -dir=/data -ip.bind=0.0.0.0
 until curl -sf http://127.0.0.1:8333/healthz; do sleep 1; done
 # The bucket must exist before serve boots. On a cold store both bucket creation and
 # object writes can precede a writable volume, so retry create + a real write as one unit

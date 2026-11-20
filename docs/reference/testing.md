@@ -544,7 +544,7 @@ Run it locally (Docker + the `aws` CLI):
 ```sh
 docker run -d --name floci -p 4566:4566 \
   -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-  floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c
+  floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 
 # IAM accepts any credentials; only S3 enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
@@ -614,7 +614,7 @@ Run it locally (Docker + the `aws` CLI; the tag is `s3waltest.FlociImage`):
 ```sh
 docker run -d --name floci -p 4566:4566 \
   -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-  floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c
+  floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 
 # IAM/STS accept any credentials; only the S3 data plane enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1

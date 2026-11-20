@@ -54,7 +54,7 @@ const (
 	// (412), but that row stays record-only, never a correctness guard.
 	// Keep both Floci workflows in sync with this pin. See
 	// docs/reference/testing.md for credential coverage and remaining gaps.
-	FlociImage = "floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c"
+	FlociImage = "floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19"
 )
 
 // SeaweedFS's `weed server -s3` anonymous mode accepts any static
