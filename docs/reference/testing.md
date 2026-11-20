@@ -51,42 +51,43 @@ silently skipping LFS coverage.
 ### SeaweedFS fixture image
 
 The fixtures and reference Compose file pin SeaweedFS
-[4.53](https://github.com/seaweedfs/seaweedfs/releases/tag/4.53), published
-2026-11-08. [Changes since 4.51](https://github.com/seaweedfs/seaweedfs/compare/4.51...4.53)
-touch S3 authorization (lifecycle changes need Admin, CORS and versioning
-changes need their own actions, POST Object header fields with control
-characters are rejected, per-bucket Block Public Access), the write path
-(conditional write headers and multipart completion conditions are evaluated
-under the object lock), the shortened first-write wait below, and the S3 Vectors
-gateway. The image now also carries the `weed-vector` binary and unpacks 256 MB
-larger than 4.51 (792 MB against 536 MB). As of 4.51, each
+[4.54](https://github.com/seaweedfs/seaweedfs/releases/tag/4.54), published
+2026-11-16. [Changes since 4.53](https://github.com/seaweedfs/seaweedfs/compare/4.53...4.54)
+touch S3 request signing (a signed body must match its signed payload hash,
+signature V2 signs every subresource), S3 authorization (each policy condition
+is evaluated against its own values, writes to a stored version's physical path
+are refused), conditional `DeleteObject` on versioned buckets, credential and
+gRPC hardening, the Docker entrypoint (it now passes its arguments to `weed`
+unsplit), and the S3 Vectors engine. No published SeaweedFS advisory names 4.54
+as its fix. The image unpacks to 794 MB, 2 MB more than 4.53. As of 4.51, each
 `-ip.bind` port binds only that address, so `-ip.bind=0.0.0.0` still answers on
 loopback.
 
 On a fresh `weed server`, 4.50 and 4.51 held the first object write for about
 12 to 15 s ([seaweedfs#12145](https://github.com/seaweedfs/seaweedfs/issues/12145)).
 4.52 shortened that wait ([seaweedfs#12149](https://github.com/seaweedfs/seaweedfs/pull/12149))
-but did not remove it. With the fixture's flags (`server -s3 -dir=/data
--ip.bind=0.0.0.0`), the first PUT took 8.8 s on 4.53 in three runs, against
-12.6 to 12.8 s on 4.51 in three runs (2026-11-13). In a logged 4.53 run the
-master deferred volume allocation for 4.7 s, and the S3 lock ring formed about
-10 s after the container started. While the lock ring is empty, a PUT waits for
-its object-write lock and fails after 15 s. In the three 4.53 runs the first PUT
-waited and succeeded. The write-readiness check retries a failed write for
-60 s.
+but did not remove it, and 4.54 does not change it. With the fixture's flags
+(`server -s3 -dir=/data -ip.bind=0.0.0.0`) and the PUT sent right after
+`CreateBucket`, the first PUT took 8.6 to 8.8 s on 4.54 and 8.6 s on 4.53, in
+three runs each (2026-11-20). On both it finished 11.3 to 11.5 s after the
+container started. In every run the master deferred volume allocation for 3.5 to
+4.6 s, and the S3 lock ring formed 10.5 to 10.7 s after the container started.
+While the lock ring is empty, a PUT waits for its object-write lock and fails
+after 15 s. In all six runs the first PUT waited and succeeded. The
+write-readiness check retries a failed write for 60 s.
 
-SHA-256 digests of the Docker Hub image metadata (retrieved 2026-11-13; a
+SHA-256 digests of the Docker Hub image metadata (retrieved 2026-11-20; a
 published manifest does not prove runtime qualification):
 
-| Image metadata | 4.51 | 4.53 |
+| Image metadata | 4.53 | 4.54 |
 |---|---|---|
-| Multi-platform index | `f7a49e3f3972ebed5be2ed4befa4a0c68eb7bdddba6e692d42729ceb545134b8` | `ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0` |
-| Linux/amd64 manifest | `3a522c379599e163433a636e75022630848b63a74f08ea37bf06f8d776e9a707` | `972ba30c529dfc72a6a12ed427e94d99c7b6a6e59d97bfa52be0a849f43e2cc9` |
-| Linux/arm64 manifest | `7e68a388de0806ed8d96f30cb7e927182a3d80d42920cb87d97d23311a7a1a77` | `210d0f5999432219ca23f61bf467965869520202d4a820d717a6a6c008b77a41` |
-| Linux/amd64 config (image ID) | `e9535759e270021cc18782c39e1dcc7977ad801edc4e3676a3d2f6c29bf598b6` | `438dbbd3f87a4db35b82d4a9646b70d54dda6df32d434df44b6445a3a5e608de` |
+| Multi-platform index | `ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0` | `4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15` |
+| Linux/amd64 manifest | `972ba30c529dfc72a6a12ed427e94d99c7b6a6e59d97bfa52be0a849f43e2cc9` | `e7d4b80af9bd49b2630a60ac6fbb7ffb620ac6a2c501f689c22a71b9f89f0203` |
+| Linux/arm64 manifest | `210d0f5999432219ca23f61bf467965869520202d4a820d717a6a6c008b77a41` | `6f6fc8c7586c6c8f97ed4f9ab4c5a19d11dd97beecf20486e02155bcef7f0fd2` |
+| Linux/amd64 config (image ID) | `438dbbd3f87a4db35b82d4a9646b70d54dda6df32d434df44b6445a3a5e608de` | `d2dd0e2e16a2c0749be2a38eb3bda5620b9b740da3abbc877090b66c2fd9f0e4` |
 
-The linux/amd64 image of the 4.53 pin runs `weed version` 4.53 (revision
-`4ab66fb76`, the 4.53 tag commit). The linux/arm64 manifest is published and
+The linux/amd64 image of the 4.54 pin runs `weed version` 4.54 (revision
+`5ef99c1d8`, the 4.54 tag commit). The linux/arm64 manifest is published and
 hashed, but no run covers arm64.
 
 On every pin change:
@@ -410,7 +411,7 @@ deliberately invalid fixtures; it does not reproduce the flake.
 [`floci-nightly.yml`](../../.github/workflows/floci-nightly.yml) boots
 [Floci](https://hub.docker.com/r/floci/floci), a lightweight AWS wire-protocol
 emulator, with S3 auth enforced. Both Floci workflows and `s3waltest.FlociImage`
-pin stable `2.4.0` by the same OCI index digest. The blob job mints an IAM
+pin stable `2.5.0` by the same OCI index digest. The blob job mints an IAM
 access key through the IAM API and runs `go test ./internal/blob` with
 `OPENSTORAGE_TEST_S3_URL` set. That variable gates the endpoint tests in `internal/blob/s3endpoint_test.go`
 (skipped elsewhere): a CRUD round-trip through the real `blob.S3` surface, and
@@ -446,22 +447,28 @@ passed the 22 required surfaces, `get-under-overwrite`, and `delete-if-match`.
 `2.4.0` also passed the IAM blob suite and the full Git/LFS STS suite. The
 credential and gap probes below gave the same result on both releases.
 
+Stable `2.5.0` (upstream revision `53ebf2a1`, which descends from `2.4.0`)
+replaced `2.4.0` after a comparison on the exact linux/amd64 images. Both
+passed the 22 required surfaces, `get-under-overwrite`, and `delete-if-match`.
+`2.5.0` also passed the IAM blob suite and the full Git/LFS STS suite. The
+credential and gap probes below gave the same result on both releases.
+
 **Known Floci gaps** — do not extend this lane into them. All are verified open
-on the pin `2.4.0` (`s3waltest.FlociImage`) with
+on the pin `2.5.0` (`s3waltest.FlociImage`) with
 `FLOCI_SERVICES_S3_ENFORCE_AUTH=true` and an IAM-minted key:
 
 - No IAM policy evaluation on S3 actions (an explicit `Deny s3:GetObject` still
   allows `GetObject`), and `x-amz-expected-bucket-owner` is ignored (a wrong
   12-digit owner passes `GetObject` and `HeadBucket`; AWS returns 403).
   Unit-test seams cover both. With `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`,
-  `2.2.0` through `2.4.0` deny that read (`AccessDenied`), but no lane sets the
+  `2.2.0` through `2.5.0` deny that read (`AccessDenied`), but no lane sets the
   flag: it also makes IAM reject the `root`/`root` bootstrap credentials the
   lanes use.
   The expected-owner header stays ignored with the flag on.
 - A long-lived IAM key sent with an unexpected session token still passes.
 - Besides IAM- and STS-minted keys, the data plane accepts Floci's built-in
   `test` access key (secret `test`; the signature is checked). That key reads
-  buckets and objects that an IAM-minted key created. `2.1.0` through `2.4.0`
+  buckets and objects that an IAM-minted key created. `2.1.0` through `2.5.0`
   behave the same.
 
 **Fixed in `2.2.0`: conditional DELETE.** Through `2.1.0`, `DeleteObject`
@@ -478,7 +485,7 @@ keys. A temporary key with a missing, forged, garbage, or another session's
 token fails with `InvalidAccessKeyId`. Valid IAM and STS reads return the exact
 bytes. Presigned-URL signatures were already validated and still are (tampered
 GET or PUT ⇒ `403 SignatureDoesNotMatch`); that is the SigV4 property this lane
-pins. The same probes give the same results on `2.2.0`, `2.3.0` and `2.4.0`.
+pins. The same probes give the same results on `2.2.0` through `2.5.0`.
 
 **Fixed upstream: torn reads.** Through `2.0.1`, a GET racing a same-key PUT
 could return a body that was neither version, with broken HTTP framing (Go logs
@@ -489,19 +496,19 @@ CAS overwrites. [floci-io/floci#2874](https://github.com/floci-io/floci/pull/287
 fixed it. `nightly-09012026` was the first build with the fix. Stable
 [`2.1.0`](https://github.com/floci-io/floci/releases/tag/2.1.0) contains both
 changes and replaced that dated pin after qualification in #274. `2.2.0`
-descends from it, `2.3.0` descends from `2.2.0`, and `2.4.0` descends from
-`2.3.0`. The `get-under-overwrite` surface guards it in require mode.
+descends from it, and each later release up to `2.5.0` descends from the one
+before. The `get-under-overwrite` surface guards it in require mode.
 
 **Positives:** Floci passes the full 22-surface s3wal qualification suite
 (`TestQualifyExternalEndpoint` in `internal/ref/s3wal`; 22/22 on the pin via
 `TestQualifyFloci`), the only emulator besides SeaweedFS to do so. SeaweedFS
-4.46 and Floci `2.2.0` through `2.4.0` enforce conditional DELETE (412; the
+4.46 and Floci `2.2.0` through `2.5.0` enforce conditional DELETE (412; the
 object survives a mismatched `If-Match`). The legacy MinIO pin does not.
 
 **Floci row of the s3wal qualification matrix.** The same workflow runs
 `TestQualifyFloci` (`internal/ref/s3wal/qualify_floci_test.go`) against the
 pinned `s3waltest.FlociImage`: the 22 surfaces plus `get-under-overwrite` in
-**require mode**, and `delete-if-match` in record mode (`2.4.0` honors the
+**require mode**, and `delete-if-match` in record mode (`2.5.0` honors the
 condition, but s3wal never relies on it — ADR-46).
 
 This is regression armor from a second implementation, **not** s3wal promotion
@@ -544,7 +551,7 @@ Run it locally (Docker + the `aws` CLI):
 ```sh
 docker run -d --name floci -p 4566:4566 \
   -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-  floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c
+  floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 
 # IAM accepts any credentials; only S3 enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1
@@ -594,7 +601,7 @@ It adds over the per-PR `test` job:
 Limit: the lane signs only with fresh STS session keys, so the suite provably
 works on temporary keys. Floci also accepts its built-in `test` key (see the
 gap list), which the lane never uses. On `2.1.0` (the #274 probes) and `2.2.0`
-through `2.4.0`, header-auth `GetObject` rejects a missing, forged, or mismatched
+through `2.5.0`, header-auth `GetObject` rejects a missing, forged, or mismatched
 session token, unlike `nightly-09012026`. A dropped or forged
 `AWS_SESSION_TOKEN` on those reads would now fail the lane. Other operations
 were not probed, and the lane does not establish IAM policy enforcement or full
@@ -614,7 +621,7 @@ Run it locally (Docker + the `aws` CLI; the tag is `s3waltest.FlociImage`):
 ```sh
 docker run -d --name floci -p 4566:4566 \
   -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
-  floci/floci:2.4.0@sha256:5ee85db604c4aa74ac76e07ea5cc83086f37bb472bf3dbb97e34019e48efae9c
+  floci/floci:2.5.0@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 
 # IAM/STS accept any credentials; only the S3 data plane enforces auth.
 export AWS_ACCESS_KEY_ID=root AWS_SECRET_ACCESS_KEY=root AWS_DEFAULT_REGION=us-east-1

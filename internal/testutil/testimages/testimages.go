@@ -12,6 +12,6 @@ package testimages
 const (
 	// Postgres is postgres:17-alpine, which was PostgreSQL 17.12 when pinned.
 	Postgres = "postgres:17-alpine@sha256:d3244e8ce3f165ee3c93d9c4a4b1d0fe48b3a89e2287b717fdcbbde92d405065"
-	// SeaweedFS is chrislusf/seaweedfs:4.53, the self-hosted store of record.
-	SeaweedFS = "chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0"
+	// SeaweedFS is chrislusf/seaweedfs:4.54, the self-hosted store of record.
+	SeaweedFS = "chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15"
 )
