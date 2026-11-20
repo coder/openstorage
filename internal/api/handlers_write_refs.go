@@ -401,18 +401,27 @@ func wrefValidateCreateBranch(req *wrefCreateBranchRequest) (target string, allo
 // push can leave such a commit in the registry. A ref at it hydrates, and
 // every clone, fetch and archive that walks the history then fails.
 //
-// The walk runs under the same admission slots, time budget and heap cap as a
+// The walk runs under the same admission slot, time budget and heap cap as a
 // git:read route (gitReads): a write endpoint has no request budget of its own,
-// and a writer must not be able to start any number of walks at once.
-func (s *server) wrefUsableCommit(ctx context.Context, repoID, repoPath, sha string) (bool, error) {
-	b := gitread.NewBudget(gitReads.slots, gitlimit.RepoKey(repoID), gitReads.timeout, gitReads.outputBytes).WithLimits(gitReads.limits)
-	defer b.Close()
+// and a writer must not be able to start any number of walks at once. b is the
+// budget of the request, so that the walks of one request (a base, then its
+// preferred_base) share one slot and one time budget, as the git calls of a
+// read route do. The caller closes b as soon as its walks are over, so that the
+// slot is not held while the ref is written.
+func (s *server) wrefUsableCommit(ctx context.Context, b *gitread.Budget, repoID, repoPath, sha string) (bool, error) {
 	usable, err := gitread.RegisteredClosure(gitread.WithBudget(ctx, b), s.refStore, s.blobStore, repoPath, repoID, sha)
 	if err == nil && !usable {
 		s.logger.Warn("a ref write names a commit that the registered packs cannot walk: a pack lacks the commit or one of its ancestors, trees or blobs, or the cache is damaged",
 			"repo", repoID, "sha", sha)
 	}
 	return usable, err
+}
+
+// wrefWalkBudget returns the git budget of one ref write request: the slots,
+// time budget and heap cap of a git:read route, drawn for the repository. It
+// takes its slot when the first walk starts. The caller closes it.
+func wrefWalkBudget(repoID string) *gitread.Budget {
+	return gitread.NewBudget(gitReads.slots, gitlimit.RepoKey(repoID), gitReads.timeout, gitReads.outputBytes).WithLimits(gitReads.limits)
 }
 
 // handleCreateBranch resolves the base to a commit (branch, tag — peeled —
@@ -464,6 +473,10 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	// Both bases of a request (base_ref, then preferred_base) walk under one
+	// budget: one slot and one time budget for the request.
+	walks := wrefWalkBudget(repo.RepoID)
+	defer walks.Close()
 	// create runs the creation at one resolved base. It returns false, with no
 	// response written, when the registered packs lack the base commit or part
 	// of its history (wrefUsableCommit): the node's cache can hold objects that
@@ -543,7 +556,7 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 						return true
 					}
 				}
-				ok, err := s.wrefUsableCommit(ctx, repo.RepoID, repoPath, baseSHA)
+				ok, err := s.wrefUsableCommit(ctx, walks, repo.RepoID, repoPath, baseSHA)
 				if err != nil {
 					s.internalErr(w, r, "check that the registered packs hold the base and its history", err)
 					return true
@@ -552,6 +565,8 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 					return false
 				}
 				held = true
+				// No walk follows: free the slot before the ref is written.
+				walks.Close()
 			}
 			won, err := s.refStore.CASRef(ctx, repo.RepoID, targetRef, oldSHA, baseSHA)
 			if err != nil {
@@ -836,7 +851,9 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "tag already exists")
 		return
 	}
-	held, err := s.wrefUsableCommit(r.Context(), repo.RepoID, repoPath, sha)
+	walk := wrefWalkBudget(repo.RepoID)
+	held, err := s.wrefUsableCommit(r.Context(), walk, repo.RepoID, repoPath, sha)
+	walk.Close()
 	switch {
 	case err != nil:
 		s.internalErr(w, r, "check that the registered packs hold the tag target and its history", err)

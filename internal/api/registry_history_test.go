@@ -244,3 +244,40 @@ func TestRefWritesWalkUnderTheGitAdmissionSlots(t *testing.T) {
 		}
 	})
 }
+
+// A create that names two bases walks both under the budget of the request: one
+// slot, and one time budget that the second walk draws on. A fake git makes each
+// walk take about a second, and the budget lasts for 1.6 s: the first walk fits
+// and the second does not. With a budget for each walk both would fit, and the
+// request would take two budgets of git time.
+func TestBranchCreateWalksBothBasesUnderOneBudget(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		fx := wrefSeedFixture(t, e)
+		first := plantHistory(t, e, fx, "parent")
+		second := plantHistory(t, e, fx, "tree")
+		srv := newWrefServer(t, e)
+		before := wrefRefs(t, e, fx.repoID)
+
+		bin := t.TempDir()
+		script := "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = rev-list ] && sleep 1; done\nexec " + realGit + " \"$@\"\n"
+		if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		p := withGitReadPolicy(t, testGitReadPolicy(1, 1600*time.Millisecond, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+
+		resp, body := wrefDo(t, srv, http.MethodPost, "/api/v1/repos/branches/create", fx.token,
+			map[string]any{"target_branch": "both", "base_ref": first, "preferred_base": second})
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("two bases of a second each under a budget of 1.6 s: status %d, body %v, want 503 (the time budget of the request)", resp.StatusCode, body)
+		}
+		if after := wrefRefs(t, e, fx.repoID); len(after) != len(before) {
+			t.Fatalf("refs changed after the request that ran out of time: before %v, after %v", before, after)
+		}
+		requireSlotsFree(t, p)
+	})
+}

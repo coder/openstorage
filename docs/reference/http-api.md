@@ -779,8 +779,8 @@ more than the heap cap. The walk runs under the admission slots, the 30-second t
 256 MiB heap cap (Linux) of the git:read routes ([Resource limits on git
 reads](#resource-limits-on-git-reads)): a request that finds no free slot answers `503` with
 `Retry-After`, a walk that outlasts its budget answers `503`, and a walk that needs more memory
-answers `422`. A create whose `base_ref` is refused walks `preferred_base` under a budget of its
-own. git 2.39 exits with status 128 on a missing parent commit, and git 2.43 on a ref at a missing
+answers `422`. A create whose `base_ref` is refused walks `preferred_base` under the same slot and the
+same time budget. git 2.39 exits with status 128 on a missing parent commit, and git 2.43 on a ref at a missing
 object, instead of printing the object. The check reads exit status 128 as a history that cannot be
 walked, as the ancestry check of a push does. That status is also git's answer to a damaged cache
 (a corrupt pack), which therefore answers `404` too, and the log line names both causes.
