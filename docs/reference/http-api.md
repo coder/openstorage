@@ -786,8 +786,8 @@ target branch. It applies to the persistent and the ephemeral namespace:
 - Without `target_branch`, only 40 zeros is accepted (the allocated name is new); any
   other guard is `400`.
 
-This follows the public OpenAPI of 2026-11-10 (`5d8e1801`), which the cluster OpenAPI did
-not serve yet ([snapshot provenance](../explanation/wire-compatibility.md#how-drift-is-tracked)).
+This follows the public OpenAPI of 2026-11-10 (`5d8e1801`), which the cluster OpenAPI
+served by 2026-11-20 ([snapshot provenance](../explanation/wire-compatibility.md#how-drift-is-tracked)).
 
 `FileDiff` = `{path, path_base64?, state (raw letter; SDKs normalize A/M/D/R/C/T/U), old_path?, old_path_base64?, raw
 (unified diff text), bytes, is_eof, additions, deletions}`. `filtered_files` entries omit
