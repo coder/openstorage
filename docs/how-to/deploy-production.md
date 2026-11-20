@@ -38,10 +38,10 @@ package fixes:
 
 - `apk add --no-cache` resolves packages from the Alpine v3.24 repositories at build
   time, so an uncached rebuild re-resolves them. It does not upgrade a package
-  inherited from the base, so the Dockerfile then runs `apk upgrade --no-cache`,
-  which gives every installed package, the base's included, the repositories'
-  current build. An image holds the package fixes that Alpine had shipped when it
-  was built, not later ones.
+  inherited from the base. The Dockerfile then runs `apk upgrade --no-cache` to give
+  every installed package, base packages included, the repositories' current build.
+  An image holds the package fixes that Alpine had shipped when it was built, not
+  later ones.
 - Base-image and package upgrades still need qualification.
 
 Alpine v3.24 upstream support ([release inventory](https://alpinelinux.org/releases.json),
