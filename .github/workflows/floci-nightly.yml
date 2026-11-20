@@ -74,6 +74,10 @@ jobs:
             echo "::error::IAM CreateAccessKey returned missing or malformed credentials"
             exit 1
           fi
+          # Mask both values before they reach GITHUB_ENV: the log of each
+          # later step lists its environment, GITHUB_ENV values included.
+          echo "::add-mask::$access_key_id"
+          echo "::add-mask::$secret_key"
           {
             echo "AWS_ACCESS_KEY_ID=$access_key_id"
             echo "AWS_SECRET_ACCESS_KEY=$secret_key"
