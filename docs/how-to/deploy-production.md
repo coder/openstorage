@@ -345,9 +345,9 @@ Remove any of these refs from the ref store with
    object a registered pack holds, and prints `restored: <ref>`. It keeps deleted a
    branch at a blob, a tree or an annotated tag, and a ref that would conflict with an
    existing ref (directory/file), and prints `not restored: <ref>`. When a signal or an
-   error stops it after it deleted a ref at a missing object, it prints that ref with its
-   SHA: check the packs with `openstorage list-packs`, and create a ref again where a
-   pack holds its object.
+   error stops it after it deleted a ref at a missing object, it prints that ref, and the
+   ref that it was deleting, with its SHA: check the packs with `openstorage list-packs`,
+   and create a ref again where a pack holds its object and the ref is gone.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
@@ -363,6 +363,17 @@ Remove any of these refs from the ref store with
    0 refs means that the repository has no refs. When the list holds no ref, the next
    clone or fetch hydrates the repository again, on every replica. If it still answers
    `500`, read the log line of step 1 again: the repository can have another cause.
+5. When step 3 printed `restored: <ref>`, check that `git ls-remote` answers. The
+   command takes no push hold, so a push that created a nested name in the instant of the
+   restore (`<ref>/<name>`, or a parent name of `<ref>`) leaves both refs, and git cannot
+   hold the pair. The `hydrate <repo ID>: update-ref --stdin` line then names both refs,
+   for example `cannot process 'refs/tags/a' and 'refs/tags/a/b' at the same time`, or
+   `'refs/tags/a/b' exists; cannot create 'refs/tags/a'`. The dry run does not list such
+   a pair. Delete one of the two refs: a branch with `DELETE /repos/branches` and a tag
+   with `DELETE /repos/tags`, which do not need the cache. Keep the SHA that step 2
+   printed, and create the deleted ref again under a free name once the repository
+   answers. No route deletes a ref in another namespace (for example a notes ref), so a
+   pair there needs a change in the ref store itself.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and
