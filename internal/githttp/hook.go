@@ -1862,6 +1862,9 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 			return err
 		}
 	}
+	if old == ref.ZeroSHA && new == ref.ZeroSHA {
+		return answerDeleteOfAbsentRef(ctx, st, repo, refName)
+	}
 	var inner ref.RefStore = st
 	if testMode() {
 		inner = injectCASDrop(inner)
@@ -1899,6 +1902,30 @@ func updateHook(ctx context.Context, args []string) (retErr error) {
 		}
 	}
 	return nil
+}
+
+// answerDeleteOfAbsentRef answers a command whose old and new values are both
+// the zero id. git sends that for `git push <remote> :<ref>` when the replica's
+// cache does not list the ref, and a client can send it for any ref. The swap
+// that the hook makes for a command is an assertion for it (a swap from nothing
+// to nothing), and the command names no value to swap, so the hook decides
+// from the ref store alone. A ref that the store does not hold makes it a
+// delete of a ref that does not exist: stock git answers that with a warning
+// and ok, and so does this. A ref that the store holds was created after the
+// replica listed its refs, or the replica's cache lags: the pusher's expectation
+// that the ref is absent is wrong, so the command is refused, as a lost swap
+// is, and the operator gets a line.
+func answerDeleteOfAbsentRef(ctx context.Context, st ref.RefStore, repo, refName string) error {
+	cur, err := st.GetRef(ctx, repo, refName)
+	switch {
+	case errors.Is(err, ref.ErrNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("update: read %s for a delete of a ref that the push named absent: %w", refName, err)
+	}
+	hookErrorsLogger().Warn("a push deletes a ref that its replica does not list, and the ref store holds it, so the update is refused",
+		"ref", refName, "sha", cur, "cause", "the replica's cache lags the ref store, or the ref was created since the push read the refs")
+	return refusef("update: %s exists at %.8s in the ref store, but this replica does not list it: fetch, then push the delete again", refName, cur)
 }
 
 // updateBarrierEachPath derives one ref's EnvUpdateBarrierEach handshake
