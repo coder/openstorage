@@ -380,8 +380,10 @@ Remove any of these refs from the ref store with
    namespace (for example a notes ref). There, delete the ref that a replica's cache lists,
    with `git push <remote> :<ref>` through that replica. That is usually the ref that the
    push created, not the one that step 3 printed: the restored ref was at a missing
-   object, so no cache lists it, and the push that deletes it fails. Ask the pusher to push
-   it again under a free name: the old name conflicts with the restored ref.
+   object, so no cache lists it, and the replica refuses a push that deletes it (`<ref>
+   exists at <sha> in the ref store, but this replica does not list it`, and `serve` logs
+   an operator line). Ask the pusher to push it again under a free name: the old name
+   conflicts with the restored ref.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and
@@ -736,6 +738,7 @@ webhook events.
 | Postgres availability + advisory-lock waits at boot | The database is the single authority; boot hangs show in `pg_locks` |
 | `verify token: key store lookup failed` / `verify token: a registered key cannot be used` log lines | A git, LFS or REST request reached the key store or a registered key, and it failed. The line holds the cause (a cause of more than 300 runes loses its middle). A git or LFS client reads a text that does not hold the cause. For each kind, the git and LFS routes together write at most one line per minute in each `serve` process, the REST routes write at most one more, and a line says how many earlier lines of its kind were held back when some were |
 | `receive-pack <repo>: hook: … git cannot walk the history between two commits, so the update is refused` log line | A push named two commits whose history git cannot read, so the hook refused that update: as non-fast-forward under `no-force-push`, and with `is not a readable commit in this repository` under `verify-sig`. The line has the fields `git`, `old` and `new`. A pusher can cause it with a commit whose parent is missing. A `<repo>` that repeats it for ordinary pushes from several clients has a damaged history: check a fresh copy with `git fsck` |
+| `receive-pack <repo>: hook: … a push deletes a ref that its replica does not list, and the ref store holds it, so the update is refused` log line | A client sent `git push <remote> :<ref>` for a ref that its replica's cache does not list, and the ref store holds the ref. The pusher read `<ref> exists at <sha> in the ref store, but this replica does not list it`. The line has the fields `ref`, `sha` and `cause`. One line after a ref was created is normal: the client fetches and pushes again. A `<repo>` that repeats it has a replica whose cache stays behind: look for a `hydrate <repo>:` error on that replica |
 | `lane scan: requeued a lane whose work had no job` log line | A sync or push request lost its job and the [lane scan](#background-maintenance-in-a-fleet) enqueued it again. A `repo=` that repeats needs a look: its runs keep crashing |
 
 The opt-in [metrics listener](../reference/metrics.md) covers some of these signals;
@@ -768,6 +771,7 @@ line can be up to 1 MiB.
 | Postgres availability and advisory-lock waits (What to monitor) | **log only** | Observe PostgreSQL itself (`pg_locks`) |
 | `verify token: …` lines (What to monitor) | **log only** | The two texts shown, at most one line for each kind per minute for the git and LFS routes together, and one more for the REST routes, in each `serve` process |
 | `git cannot walk the history between two commits` (What to monitor) | **log only** | A hook line, so metrics do not count it. Fields `git`, `old`, `new` and `cause` |
+| `a push deletes a ref that its replica does not list` (What to monitor) | **log only** | A hook line, so metrics do not count it. Fields `ref`, `sha` and `cause` |
 | `lane scan: requeued a lane whose work had no job` (What to monitor) | **log only** | Fields `org`, `repo` and `lane` |
 | S3WAL `… conditional-write contention retries exhausted` (S3WAL signals) | `openstorage_s3wal_cas_contention_exhausted_total` by `scope` | Serve-process mutations only; push-side failures reach the client and hook stderr |
 | `WARN s3wal manifest approaching size cap` (S3WAL signals) | `openstorage_s3wal_manifest_size_guard_total{result="warn"}` | Counts when the once-per-repository warning is logged |

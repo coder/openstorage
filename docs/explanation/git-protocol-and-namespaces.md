@@ -43,6 +43,17 @@ The receive path must:
   nothing, and a push whose objects only refused commands need is declined whole, with no
   pack stored. A branch delete and a new value that the server does not have are not
   refused here. Other namespaces, such as tags, take any object.
+- Answer a delete of a ref that the client's replica does not list. git sends
+  `git push <remote> :<ref>` for such a ref as a command from the zero id to the zero id,
+  and stock git answers `ok` with the warning `deleting a non-existent ref`. The hooks do
+  the same when the ref store holds no such ref. When the store holds it (the replica's
+  cache lags, or the ref was created since the client read the refs), the hooks refuse
+  that command with a per-ref `ng` (`hook declined`) whose `remote:` text names the ref and
+  the first 8 hex digits of its SHA (`<ref> exists at <sha> in the ref store, but this
+  replica does not list it`), and `serve` logs an operator line. Fetch, then push the
+  delete again. An `--atomic` push with such a command is refused whole by pre-receive
+  (`<ref> already exists (created concurrently); fetch first`), as for any command whose
+  old value the store contradicts, with no SHA and no operator line.
 - Map namespaces: `+ephemeral` remotes see and update only the ephemeral ref space;
   persistent remotes must not see ephemeral refs (git namespaces or separate ref stores).
   open.storage gives the `+ephemeral` remote its own storage key. The HTTP API, though, stores its
