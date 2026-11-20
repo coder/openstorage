@@ -417,6 +417,16 @@ func (s *server) wrefUsableCommit(ctx context.Context, b *gitread.Budget, repoID
 	return usable, err
 }
 
+// wrefUsableCommitAlone is wrefUsableCommit for a request that checks one
+// commit: the budget is its own, and it is freed when the check ends, whatever
+// ends it (a panic included), so that the slot is not held while the ref is
+// written.
+func (s *server) wrefUsableCommitAlone(ctx context.Context, repoID, repoPath, sha string) (bool, error) {
+	b := wrefWalkBudget(repoID)
+	defer b.Close()
+	return s.wrefUsableCommit(ctx, b, repoID, repoPath, sha)
+}
+
 // wrefWalkBudget returns the git budget of one ref write request: the slots,
 // time budget and heap cap of a git:read route, drawn for the repository. It
 // takes its slot when the first walk starts. The caller closes it.
@@ -851,9 +861,7 @@ func (s *server) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "tag already exists")
 		return
 	}
-	walk := wrefWalkBudget(repo.RepoID)
-	held, err := s.wrefUsableCommit(r.Context(), walk, repo.RepoID, repoPath, sha)
-	walk.Close()
+	held, err := s.wrefUsableCommitAlone(r.Context(), repo.RepoID, repoPath, sha)
 	switch {
 	case err != nil:
 		s.internalErr(w, r, "check that the registered packs hold the tag target and its history", err)

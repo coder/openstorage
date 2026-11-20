@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -279,5 +281,118 @@ func TestBranchCreateWalksBothBasesUnderOneBudget(t *testing.T) {
 			t.Fatalf("refs changed after the request that ran out of time: before %v, after %v", before, after)
 		}
 		requireSlotsFree(t, p)
+	})
+}
+
+// slotsAtCAS records how many git read slots are held at each ref write.
+type slotsAtCAS struct {
+	ref.Store
+	p *gitReadPolicy
+
+	mu    sync.Mutex
+	inUse []int
+}
+
+func (s *slotsAtCAS) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	s.mu.Lock()
+	s.inUse = append(s.inUse, s.p.slots.InUse())
+	s.mu.Unlock()
+	return s.Store.CASRef(ctx, repo, name, old, new)
+}
+
+// A walk holds its slot while git runs and no longer: a ref write waits for a
+// concurrent push's hold on its ref for up to ten seconds, and the process has
+// eight slots for every git read.
+func TestRefWritesFreeTheirSlotBeforeTheRefIsWritten(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		type shape struct {
+			name, path string
+			body       func(fx wrefFixture, planted string) map[string]any
+		}
+		shapes := []shape{
+			{"a tag", "/api/v1/repos/tags", func(fx wrefFixture, _ string) map[string]any {
+				return map[string]any{"name": "slot-tag", "ref": fx.c2}
+			}},
+			{"a branch", "/api/v1/repos/branches/create", func(fx wrefFixture, _ string) map[string]any {
+				return map[string]any{"target_branch": "slot-branch", "base_ref": fx.c2}
+			}},
+			{"an allocated branch name", "/api/v1/repos/branches/create", func(fx wrefFixture, _ string) map[string]any {
+				return map[string]any{"base_ref": fx.c2}
+			}},
+			{"a branch after a refused base_ref", "/api/v1/repos/branches/create", func(fx wrefFixture, planted string) map[string]any {
+				return map[string]any{"target_branch": "slot-fallback", "base_ref": planted, "preferred_base": fx.c2}
+			}},
+		}
+		for _, tc := range shapes {
+			t.Run(tc.name, func(t *testing.T) {
+				fx := wrefSeedFixture(t, e)
+				planted := plantHistory(t, e, fx, "parent")
+				p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+				probe := &slotsAtCAS{Store: e.refStore, p: p}
+				env := *e
+				env.refStore = probe
+				srv := newWrefServer(t, &env)
+
+				resp, body := wrefDo(t, srv, http.MethodPost, tc.path, fx.token, tc.body(fx, planted))
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("status %d, body %v, want 200", resp.StatusCode, body)
+				}
+				probe.mu.Lock()
+				defer probe.mu.Unlock()
+				if len(probe.inUse) == 0 {
+					t.Fatal("the request wrote no ref")
+				}
+				for _, n := range probe.inUse {
+					if n != 0 {
+						t.Fatalf("%d git read slots held while the ref was written, want 0 (slots held at each write: %v)", n, probe.inUse)
+					}
+				}
+				requireSlotsFree(t, p)
+			})
+		}
+	})
+}
+
+// panicsWhileASlotIsHeld panics at the first registry read that happens while a
+// git read slot is held, as a bug in the walk would. A walk reads the registry
+// again after git answered "missing", so a commit that the packs lack reaches it.
+type panicsWhileASlotIsHeld struct {
+	ref.Store
+	p     *gitReadPolicy
+	armed atomic.Bool
+}
+
+func (s *panicsWhileASlotIsHeld) ListPacks(ctx context.Context, repo string) ([]ref.Pack, error) {
+	if s.armed.Load() && s.p.slots.InUse() > 0 {
+		panic("a bug in the walk")
+	}
+	return s.Store.ListPacks(ctx, repo)
+}
+
+// A panic between the first git child and the end of the check is what the
+// recovery middleware is for. It must not take the slot with it: the process has
+// eight, and two lost slots of one repository end every git read of it.
+func TestRefWritesFreeTheirSlotAfterAPanic(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		for _, tc := range refWriteShapes() {
+			t.Run(tc.name, func(t *testing.T) {
+				fx := wrefSeedFixture(t, e)
+				// A commit that the packs lack: only a "missing" answer reads the
+				// registry again, and it does so while the walk holds its slot.
+				planted := plantHistory(t, e, fx, "parent")
+				p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+				probe := &panicsWhileASlotIsHeld{Store: e.refStore, p: p}
+				env := *e
+				env.refStore = probe
+				srv := newWrefServer(t, &env)
+				probe.armed.Store(true)
+				resp, body := wrefDo(t, srv, http.MethodPost, tc.path, fx.token, tc.body(planted))
+				probe.armed.Store(false)
+				if resp.StatusCode != http.StatusInternalServerError {
+					t.Fatalf("status %d, body %v, want the 500 of a panic", resp.StatusCode, body)
+				}
+				requireSlotsFree(t, p)
+			})
+		}
 	})
 }

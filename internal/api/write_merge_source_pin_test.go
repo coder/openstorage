@@ -226,6 +226,26 @@ func TestMergeExpectedSourceSHARefusesAPinThatThePacksLack(t *testing.T) {
 			requireSlotsFree(t, p)
 		})
 
+		// A panic after the first git child must not take the slot with it.
+		t.Run("a panic after the walk", func(t *testing.T) {
+			p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+			if won, err := e.refStore.CASRef(ctx, fx.repoID, "refs/heads/t-plant-panic", ref.ZeroSHA, fx.c2); err != nil || !won {
+				t.Fatalf("create t-plant-panic: won %v, err %v", won, err)
+			}
+			probe := &panicsWhileASlotIsHeld{Store: e.refStore, p: p}
+			env := *e
+			env.refStore = probe
+			panicSrv := wmServer(t, &env)
+			probe.armed.Store(true)
+			resp, raw := wmDo(t, panicSrv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("plantsrc", "t-plant-panic", "ff_only", map[string]any{"expected_source_sha": pin}))
+			probe.armed.Store(false)
+			if resp.StatusCode != http.StatusInternalServerError {
+				t.Fatalf("status %d, body %s, want the 500 of a panic", resp.StatusCode, raw)
+			}
+			requireSlotsFree(t, p)
+		})
+
 		// The tip itself is a ref already: pinning it is no walk and no refusal.
 		t.Run("the tip", func(t *testing.T) {
 			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,

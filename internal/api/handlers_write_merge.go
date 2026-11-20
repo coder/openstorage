@@ -690,9 +690,7 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 		// it would wedge every other node, so it answers like a pin that the
 		// source branch does not contain. The tip needs no check: a ref is at it.
 		if req.sourcePin != sourceSHA {
-			walk := wrefWalkBudget(repo.RepoID)
-			usable, err := s.wrefUsableCommit(ctx, walk, repo.RepoID, repoPath, req.sourcePin)
-			walk.Close()
+			usable, err := s.wrefUsableCommitAlone(ctx, repo.RepoID, repoPath, req.sourcePin)
 			if err != nil {
 				const op = "check that the registered packs hold expected_source_sha and its history"
 				if !s.writeGitLimitErr(w, r, op, err) {
