@@ -70,11 +70,11 @@ but did not remove it, and 4.54 does not change it. With the fixture's flags
 (`server -s3 -dir=/data -ip.bind=0.0.0.0`) and the PUT sent right after
 `CreateBucket`, the first PUT took 8.6 to 8.8 s on 4.54 and 8.6 s on 4.53, in
 three runs each (2026-11-20). On both it finished 11.3 to 11.5 s after the
-container started. In every run the master deferred volume allocation for 3.5 to
-4.6 s, and the S3 lock ring formed 10.5 to 10.7 s after the container started.
-While the lock ring is empty, a PUT waits for its object-write lock and fails
-after 15 s. In all six runs the first PUT waited and succeeded. The
-write-readiness check retries a failed write for 60 s.
+container started. In each of these six runs the master deferred volume
+allocation for 4.5 to 4.6 s, and the S3 lock ring formed 10.5 to 10.7 s after
+the container started. While the lock ring is empty, a PUT waits for its
+object-write lock and fails after 15 s. In all six runs the first PUT waited and
+succeeded. The write-readiness check retries a failed write for 60 s.
 
 SHA-256 digests of the Docker Hub image metadata (retrieved 2026-11-20; a
 published manifest does not prove runtime qualification):
