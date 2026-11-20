@@ -37,11 +37,11 @@ runtime base, **Alpine 3.24.4**, and the Go builder, whose Go version follows
 package fixes:
 
 - `apk add --no-cache` resolves packages from the Alpine v3.24 repositories at build
-  time, so an uncached rebuild re-resolves them. It does not upgrade every package
-  inherited from the base. The Dockerfile upgrades one of them, `zlib`, by name
-  (`apk upgrade --no-cache zlib`), because the pinned base holds a version that
-  Alpine's security database lists as vulnerable. That line goes away once the
-  pinned base ships the fixed version.
+  time, so an uncached rebuild re-resolves them. It does not upgrade a package
+  inherited from the base. The Dockerfile then runs `apk upgrade --no-cache` to give
+  every installed package, base packages included, the repositories' current build.
+  An image holds the package fixes that Alpine had shipped when it was built, not
+  later ones.
 - Base-image and package upgrades still need qualification.
 
 Alpine v3.24 upstream support ([release inventory](https://alpinelinux.org/releases.json),
