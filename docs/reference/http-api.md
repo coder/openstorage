@@ -786,6 +786,13 @@ history that cannot be walked, as the ancestry check of a push does. That status
 any fatal failure, so a damaged cache (a corrupt pack, for one) answers `404` too, and the log
 line names both causes.
 
+The walk trusts the refs of the repository to be complete: it stops at a commit that a ref reaches
+and reads no tree or blob below it. A ref that a push left at a commit whose history the packs
+cannot walk (pushes keep that limit) therefore lets a branch or tag at the same commit, or at a
+commit that it reaches, pass. The check cannot tell that ref from a healthy one without the walk
+of the whole history for every request, which a repository of 500,000 commits does not fit under
+the heap cap.
+
 #### Guarded branch create and move
 
 `expected_target_sha` on `POST /repos/branches/create` (both path styles) guards the
