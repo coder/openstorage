@@ -309,9 +309,23 @@ deleted tips again, and creates each deleted ref whose object a pack holds now, 
 branch at a blob, a tree or an annotated tag, which git still refuses, and a ref that
 would conflict with an existing ref (a push created `refs/tags/a/b` while `refs/tags/a`
 was deleted). It prints `restored: <ref>` for each ref that it created again, and
-`not restored: <ref>` and the reason for each ref that it kept deleted. When a signal or an error stops the run after it deleted a ref
-at a missing object, the command prints each such ref with its SHA: check the packs with
-`openstorage list-packs`, and create a ref again where a pack holds its object.
+`not restored: <ref>` and the reason for each ref that it kept deleted.
+
+The command takes no push hold. It checks for a directory/file conflict before it
+creates a ref again, and a push whose own check ran before that create and whose write
+lands after it is not refused: the repository then holds both refs (for example
+`refs/tags/a`, which the command printed as `restored: refs/tags/a`, and `refs/tags/a/b`,
+which the push created), and git reads of it answer `500` again. The
+[runbook](../how-to/deploy-production.md#refs-that-git-can-never-lock) says how to find
+the pair and delete one of the two refs. It takes a push that is in flight while a restore
+runs, and a restore happens only when a pack registered during the deletes.
+
+When a signal or an error stops the run during the deletes or the restore, the command
+prints each ref at a missing object that it deleted or was deleting, and did not put
+right, with its SHA. A store error does not prove that the delete failed: PostgreSQL can
+return an error for a delete that committed. Check the packs with
+`openstorage list-packs`, and create a ref again where a pack holds its object and the
+ref is gone.
 
 The command ignores every `GIT_` variable of the shell (for example `GIT_DIR`,
 `GIT_OBJECT_DIRECTORY` and `GIT_DEFAULT_HASH`) and pins git's global and system config to

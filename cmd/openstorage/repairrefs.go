@@ -179,8 +179,13 @@ again. If a pack registers while it deletes, it creates again each deleted ref
 whose object a registered pack holds, and prints restored: <ref>. It keeps
 deleted a branch at a blob, a tree or an annotated tag, and a ref that would
 conflict with an existing ref (directory/file), and prints not restored: <ref>.
-If a signal or an error stops it after a delete, it prints each ref that it
-deleted as missing, with its SHA.
+The command takes no push hold, so a push that creates a nested name in the
+same instant as a restore (refs/tags/a/b while it creates refs/tags/a again)
+can leave both refs, and git reads of the repository then answer 500 again.
+docs/how-to/deploy-production.md (Refs that git can never lock) says how to
+find the pair and delete one of the two. If a signal or an error stops it
+during the deletes or the restore, it prints each ref at a missing object that
+it deleted or was deleting, and did not put right, with its SHA.
 
 The command ignores every GIT_ variable of the shell and every git config file.
 It stops with an error, and deletes nothing, when git does not work on its
@@ -334,11 +339,11 @@ func repairRefs(ctx context.Context, rs ref.RefStore, target repairTarget, yes b
 				// A signal ended the swap: say that, not the text of the
 				// store's transaction. With PostgreSQL the swap can have
 				// committed, and the next run lists what is left.
-				warnDeletedMissing(out, deletedMissing)
+				warnDeletedMissing(out, withUncertain(deletedMissing, r))
 				return fmt.Errorf("delete %s: %w (%d deleted before the error)", sanitizeTerm(r.name), ctxErr, deleted)
 			}
 			// The store's error text can quote the ref name.
-			warnDeletedMissing(out, deletedMissing)
+			warnDeletedMissing(out, withUncertain(deletedMissing, r))
 			return fmt.Errorf("delete %s: %s (%d deleted before the error)", sanitizeTerm(r.name), sanitizeTerm(err.Error()), deleted)
 		}
 		if !won {
@@ -382,6 +387,17 @@ var (
 	_ repairDFProber = (*ref.S3WAL)(nil)
 )
 
+// withUncertain adds r to the refs that the run deleted as missing when r is
+// itself a ref at a missing object. A delete that failed can have committed:
+// PostgreSQL can return an error after a commit whose status it could not
+// confirm, so the run does not know whether r is gone.
+func withUncertain(deleted []repairRef, r repairRef) []repairRef {
+	if r.kind != "missing" {
+		return deleted
+	}
+	return append(slices.Clone(deleted), r)
+}
+
 // warnDeletedMissing tells the operator which refs a run that stopped deleted
 // as missing without a last check of the packs. A pack that registered since
 // can hold the object of one of them.
@@ -389,7 +405,7 @@ func warnDeletedMissing(out io.Writer, refs []repairRef) {
 	if len(refs) == 0 {
 		return
 	}
-	fmt.Fprintf(out, "the run stopped before it checked the packs again: a pack that registered since can hold the object of one of these %d deleted refs. Check them with openstorage list-packs, and create a ref again where a pack holds its object:\n", len(refs))
+	fmt.Fprintf(out, "the run stopped before it checked the packs again: a pack that registered since can hold the object of one of these %d refs, which the run deleted as missing, or was deleting or creating again when it stopped, so some of them can still exist. Check them with openstorage list-packs, and create a ref again where a pack holds its object and the ref is gone:\n", len(refs))
 	for _, r := range refs {
 		fmt.Fprintf(out, "  %s %s\n", r.sha, sanitizeTerm(r.name))
 	}

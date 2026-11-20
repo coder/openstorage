@@ -1011,3 +1011,133 @@ func TestRepairRefsListsTheDeletedMissingRefsWhenADeleteFails(t *testing.T) {
 		})
 	}
 }
+
+// A delete that fails with a store error can have committed. The warning lists
+// the ref that the run was deleting too, when its object is missing.
+func TestRepairRefsListsTheRefWhoseDeleteFailedInTheRecoveryWarning(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run("cancel="+strconv.FormatBool(cancel), func(t *testing.T) {
+			rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := newRepairFixture(t, rs)
+			ghost := strings.Repeat("ab", 20)
+			late := strings.Repeat("cd", 20)
+			f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/ghost": ghost, "refs/tags/zzz": late})
+			ctx, stop := context.WithCancel(t.Context())
+			defer stop()
+			store := failingDeleteStore{RefStore: f.rs, name: "refs/tags/zzz"}
+			if cancel {
+				store.cancel = stop
+			}
+			var out bytes.Buffer
+			err = repairRefs(ctx, store, f.target(), true, &out)
+			warning := afterStopWarning(out.String())
+			if err == nil || !strings.Contains(warning, "  "+ghost+" refs/tags/ghost\n") || !strings.Contains(warning, "  "+late+" refs/tags/zzz\n") {
+				t.Fatalf("--yes with a failing delete = %v\n%s", err, out.String())
+			}
+		})
+	}
+}
+
+// The warning lists a ref whose delete failed only when its tip is missing.
+// A ref that git cannot lock (a last name part over 250 bytes) and a branch at
+// a blob have a tip that a pack holds, so no pack that registers later heals
+// them: listing one would send the operator to look for a pack that cannot
+// exist. The command deletes these refs before the refs at a missing object,
+// so a failed delete of one of them stops the run with nothing to list.
+func TestRepairRefsKeepsAFailedDeleteOfAnotherKindOutOfTheRecoveryWarning(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ref  string
+		sha  func(f *repairFixture) string
+	}{
+		{"unlockable name at a commit", "refs/tags/zzz" + strings.Repeat("z", 251), func(f *repairFixture) string { return f.commit }},
+		{"branch at a blob", "refs/heads/blobby", func(f *repairFixture) string { return f.blob }},
+	} {
+		for _, cancel := range []bool{false, true} {
+			t.Run(tc.name+"/cancel="+strconv.FormatBool(cancel), func(t *testing.T) {
+				rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := newRepairFixture(t, rs)
+				f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/ghost": strings.Repeat("ab", 20), tc.ref: tc.sha(f)})
+				ctx, stop := context.WithCancel(t.Context())
+				defer stop()
+				store := failingDeleteStore{RefStore: f.rs, name: tc.ref}
+				if cancel {
+					store.cancel = stop
+				}
+				var out bytes.Buffer
+				err = repairRefs(ctx, store, f.target(), true, &out)
+				if err == nil || !strings.Contains(err.Error(), "(0 deleted before the error)") {
+					t.Fatalf("--yes with a failing delete = %v\n%s", err, out.String())
+				}
+				if warning := afterStopWarning(out.String()); warning != "" {
+					t.Fatalf("the run lists refs for a failed delete of a ref that no pack can heal:\n%s", out.String())
+				}
+			})
+		}
+	}
+}
+
+// nestingStore creates a ref under a nested name right after the first
+// compare-and-swap that creates a ref, as a push whose directory/file check
+// ran before a restore and whose write lands after it.
+type nestingStore struct {
+	ref.RefStore
+	once   sync.Once
+	nested string
+	sha    string
+}
+
+func (s *nestingStore) CASRef(ctx context.Context, repo, name, old, new string) (bool, error) {
+	won, err := s.RefStore.CASRef(ctx, repo, name, old, new)
+	if old == ref.ZeroSHA && err == nil && won {
+		s.once.Do(func() { _, _ = s.RefStore.CASRef(ctx, repo, s.nested, ref.ZeroSHA, s.sha) })
+	}
+	return won, err
+}
+
+func (s *nestingStore) DFConflicts(ctx context.Context, repo string, names []string) (map[string]string, error) {
+	return s.RefStore.(repairDFProber).DFConflicts(ctx, repo, names)
+}
+
+// The command takes no push hold, so a push that creates refs/tags/late/x in
+// the same instant as the restore of refs/tags/late leaves both refs, and the
+// repository no longer hydrates. That is a stated limit. The documented fix,
+// deleting one of the two refs as DELETE /repos/tags does, makes it hydrate.
+func TestRepairRefsRestoreRaceLeavesAPairThatDeletingOneRefClears(t *testing.T) {
+	rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRepairFixture(t, rs)
+	f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late})
+	inner := &registeringStore{RefStore: f.rs, do: func() { f.registerLatePack(t) }}
+	store := &nestingStore{RefStore: inner, nested: "refs/tags/late/x", sha: f.commit}
+	var out bytes.Buffer
+	if err := repairRefs(t.Context(), store, f.target(), true, &out); err != nil {
+		t.Fatalf("--yes = %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "restored: refs/tags/late:") {
+		t.Fatalf("--yes output:\n%s", out.String())
+	}
+	want := map[string]string{"refs/heads/main": f.commit, "refs/tags/late": f.late, "refs/tags/late/x": f.commit}
+	if got := f.refs(t); !mapsEqual(got, want) {
+		t.Fatalf("refs after --yes = %v, want %v", got, want)
+	}
+	_, err = f.hydrateInto(t, filepath.Join(t.TempDir(), "cache"))
+	if err == nil || !strings.Contains(err.Error(), "refs/tags/late") {
+		t.Fatalf("hydrate with both refs = %v, want git's refusal of the pair", err)
+	}
+	t.Logf("hydrate with both refs: %v", err)
+	if won, err := f.rs.CASRef(t.Context(), f.repo, "refs/tags/late", f.late, ref.ZeroSHA); err != nil || !won {
+		t.Fatalf("delete refs/tags/late = %v, %v", won, err)
+	}
+	if _, err := f.hydrateInto(t, filepath.Join(t.TempDir(), "cache")); err != nil {
+		t.Fatalf("hydrate after deleting one of the two refs: %v", err)
+	}
+}
