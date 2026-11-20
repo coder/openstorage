@@ -321,11 +321,11 @@ the pair and delete one of the two refs. It takes a push that is in flight while
 runs, and a restore happens only when a pack registered during the deletes.
 
 When a signal or an error stops the run during the deletes or the restore, the command
-prints each ref at a missing object that it deleted and did not put right, and the ref that
-it was deleting or creating again, with its SHA. A store error does not prove that the
-delete failed: PostgreSQL can return an error for a delete that committed.
-Check the packs with `openstorage list-packs`, and create a ref again where a pack holds
-its object and the ref is gone.
+prints each ref at a missing object that it deleted or was deleting, and did not put
+right, with its SHA. A store error does not prove that the delete failed: PostgreSQL can
+return an error for a delete that committed. Check the packs with
+`openstorage list-packs`, and create a ref again where a pack holds its object and the
+ref is gone.
 
 The command ignores every `GIT_` variable of the shell (for example `GIT_DIR`,
 `GIT_OBJECT_DIRECTORY` and `GIT_DEFAULT_HASH`) and pins git's global and system config to

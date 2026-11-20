@@ -185,8 +185,7 @@ can leave both refs, and git reads of the repository then answer 500 again.
 docs/how-to/deploy-production.md (Refs that git can never lock) says how to
 find the pair and delete one of the two. If a signal or an error stops it
 during the deletes or the restore, it prints each ref at a missing object that
-it deleted and did not put right, and the ref that it was deleting or creating
-again, with its SHA.
+it deleted or was deleting, and did not put right, with its SHA.
 
 The command ignores every GIT_ variable of the shell and every git config file.
 It stops with an error, and deletes nothing, when git does not work on its
