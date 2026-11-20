@@ -7,6 +7,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/coder/openstorage/internal/gitread"
+	"github.com/coder/openstorage/internal/ref"
 )
 
 // TestMergeExpectedSourceSHA pins the source commit with
@@ -143,6 +146,60 @@ func TestMergeExpectedSourceSHA(t *testing.T) {
 			}
 			if got := wmRefsSnapshot(t, e, fx.repoID)["refs/heads/t-pin-alias"]; got != fx.ffMid {
 				t.Fatalf("t-pin-alias tip = %q, want %s", got, fx.ffMid)
+			}
+		})
+	})
+}
+
+// The source branch can reach a pin that no registered pack holds: a push can
+// leave a commit behind a ref tip while the node's cache holds it. A target ref
+// or a merge commit at that pin would wedge every other node, which hydrates
+// from the registered packs alone, so the pin answers like a commit that the
+// source branch does not contain. The tip of the source branch is a ref already
+// and needs no check.
+func TestMergeExpectedSourceSHARefusesAPinThatThePacksLack(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		srv := wmServer(t, e)
+		fx := wmSeedFixture(t, e)
+		ctx := t.Context()
+
+		// pin is in the cache only. plantsrc is a branch whose tip is a child of
+		// pin, in a registered pack that lacks pin: the push that left it there
+		// was checked against a cache that held pin.
+		repoPath, err := gitread.Materialize(ctx, e.refStore, e.blobStore, e.cacheDir, fx.repoID, "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		pin := plantCacheOnlyCommit(t, repoPath, fx.c2)
+		dir := t.TempDir()
+		scratchGit(t, dir, "", "init", "-q", "-b", "main", ".")
+		tip := scratchGit(t, dir, commitText(coreRevParse(t, fx.work, fx.c2+"^{tree}"), pin), "hash-object", "-t", "commit", "-w", "--stdin", "--literally")
+		registerLooseObjects(t, e, fx.repoID, dir, tip)
+		for name, sha := range map[string]string{"plantsrc": tip, "t-plant-ff": fx.c2, "t-plant-merge": fx.c2, "t-plant-ok": fx.c2} {
+			if won, err := e.refStore.CASRef(ctx, fx.repoID, "refs/heads/"+name, ref.ZeroSHA, sha); err != nil || !won {
+				t.Fatalf("create %s: won %v, err %v", name, won, err)
+			}
+		}
+
+		for _, tc := range []struct{ target, strategy string }{{"t-plant-ff", "ff_only"}, {"t-plant-merge", "merge"}} {
+			t.Run(tc.strategy, func(t *testing.T) {
+				before := wmRefsSnapshot(t, e, fx.repoID)
+				resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+					wmMergeBody("plantsrc", tc.target, tc.strategy, map[string]any{"author": wmTestAuthor, "expected_source_sha": pin}))
+				wmRequireRefGuard(t, resp, raw, "expected_source_sha", tip,
+					"source branch moved: the source branch does not contain commit "+pin)
+				if after := wmRefsSnapshot(t, e, fx.repoID); !reflect.DeepEqual(before, after) {
+					t.Fatalf("refs changed on a refused merge: before %v, after %v", before, after)
+				}
+			})
+		}
+
+		// The tip itself is a ref already: pinning it is no walk and no refusal.
+		t.Run("the tip", func(t *testing.T) {
+			resp, raw := wmDo(t, srv, "POST", "/api/v1/repos/merge", fx.token,
+				wmMergeBody("plantsrc", "t-plant-ok", "ff_only", map[string]any{"expected_source_sha": tip}))
+			if body := wmDecode(t, raw); resp.StatusCode != http.StatusOK || body["commit_sha"] != tip {
+				t.Fatalf("status %d body %s, want fast_forward to the tip %s", resp.StatusCode, raw, tip)
 			}
 		})
 	})

@@ -685,7 +685,11 @@ moved on since.
 
 - The source branch must still contain the commit: the commit is the tip or one of its
   ancestors. Otherwise the guard fails (`detail` "source branch moved: the source
-  branch does not contain commit …").
+  branch does not contain commit …"). The same answer covers a commit that the source
+  branch reaches but the registered packs cannot walk, the way the [branch and tag
+  create routes](#which-commit-the-base-and-the-tag-target-can-name) refuse such a commit
+  (a push can leave one behind the tip of a branch): a pin that is not the tip is checked
+  like a base, and the server logs the refusal.
 - A source branch that does not exist fails the guard too, with `current_sha` 40
   zeros. Without `expected_source_sha`, a missing source branch is `404`.
 - `source.sha` in the response is the pinned commit.
@@ -749,8 +753,8 @@ The server checks the registered packs, not the node's cache repository, because
 ref at any other object. A commit that only a cache holds answers `404`, like a commit that does
 not exist, and a `base_ref` that names no usable commit still falls back to `preferred_base`. The
 server reads the registry only for a request that is about to write: after the ref policy, and not
-for a tag that exists or for a create that leaves the branch at its tip (with `force` or
-`expected_target_sha`). So a request that the policy denies
+for a tag that exists, for a plain create of a branch that exists (`409`) or for a create that
+leaves the branch at its tip (with `force` or `expected_target_sha`). So a request that the policy denies
 answers `403` even when its commit is only in the cache.
 
 The registered packs must also hold what git needs to read the commit's history: its ancestors,
@@ -761,11 +765,22 @@ at such a commit would hydrate, and every clone, fetch and archive that walks th
 fail. A commit whose history the registered packs cannot walk answers `404`, like a commit that
 does not exist. The check is the walk that `receive-pack` runs for the new tips of a push (`git
 rev-list --objects --not --all`) over the registered packs, without a commit-graph, because a
-commit-graph can describe a commit that no registered pack holds. A commit that a ref reaches ends
-the walk at once, so a base near the tip of a branch costs milliseconds. The oldest commit of
-500,000 linear commits costs about two seconds, and a commit that no ref reaches costs the walk of
-the commits since the ones that a ref reaches, with their trees. A walk of more than 30 seconds
-answers `503`.
+commit-graph can describe a commit that no registered pack holds.
+
+The cost is the walk from the commits that the refs reach down to the commit, so it grows with the
+distance between the two and with the commit dates that the pusher chose. Measured with git 2.55
+on 500,000 linear commits: the tip of a branch takes 5 ms, a commit 1,000 back 15 ms, 100,000 back
+0.3 s and the root commit 1.6 s. A commit that no ref reaches costs the walk of its own new
+commits and trees, and also the walk of the history of the refs down to its commit date (1,000 new
+commits dated after the tip took 14 ms, and the same commits dated 1970 took 1.7 s). A commit
+whose parent no pack holds always costs the whole history (1.6 s). A separate unreferenced history
+costs more: 100,000 commits took 2.8 s. The walk runs under the admission slots, the 30-second
+time budget and the 256 MiB heap cap of the git:read routes ([Resource limits on git
+reads](#resource-limits-on-git-reads)): a request that finds no free slot answers `503` with
+`Retry-After`, a walk that outlasts its budget answers `503`, and a walk that needs more memory
+(an unreferenced history of 500,000 commits) answers `422`. git 2.39 exits with status 128 on a
+missing parent commit, and git 2.43 on a ref at a missing object, instead of printing the object:
+the check reads that exit status as a history that cannot be walked.
 
 #### Guarded branch create and move
 

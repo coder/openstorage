@@ -9,6 +9,7 @@ package api
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -16,13 +17,35 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/blob"
+	"github.com/coder/openstorage/internal/gitlimit"
 	"github.com/coder/openstorage/internal/gitread"
 	"github.com/coder/openstorage/internal/ref"
 )
 
 const absentID = "1111111111111111111111111111111111111111"
+
+// refusedWalkLine is the log line of a ref write that names a commit whose
+// history the registered packs cannot walk. The operator's only sign of such a
+// request: the response is the same 404 as for a commit that does not exist.
+const refusedWalkLine = "a ref write names a commit that the registered packs cannot walk"
+
+// logLines returns the lines of the log that hold every one of the substrings.
+func logLines(l *lockedLog, substrings ...string) []string {
+	var out []string
+next:
+	for _, line := range strings.Split(l.String(), "\n") {
+		for _, sub := range substrings {
+			if !strings.Contains(line, sub) {
+				continue next
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}
 
 // scratchGit runs git in dir with stdin and no GIT_ variable of the host.
 func scratchGit(t *testing.T, dir, stdin string, args ...string) string {
@@ -125,12 +148,17 @@ func TestRefWritesRefuseACommitWhoseHistoryThePacksLack(t *testing.T) {
 				t.Run(history+"/"+tc.name, func(t *testing.T) {
 					fx := wrefSeedFixture(t, e)
 					planted := plantHistory(t, e, fx, history)
-					srv := newWrefServer(t, e)
+					logs := &lockedLog{}
+					srv := newWrefServerLogging(t, e, slog.New(slog.NewTextHandler(logs, nil)))
 					before := wrefRefs(t, e, fx.repoID)
 
 					resp, body := wrefDo(t, srv, http.MethodPost, tc.path, fx.token, tc.body(planted))
 					if resp.StatusCode != http.StatusNotFound {
 						t.Fatalf("a commit whose %s the packs lack: status %d, want 404, body %v", history, resp.StatusCode, body)
+					}
+					// The operator hears of the refusal: one line per refused commit, with the repository and the commit.
+					if got := logLines(logs, refusedWalkLine, "level=WARN", "repo="+fx.repoID, "sha="+planted); len(got) == 0 {
+						t.Fatalf("no %q line for %s in the log:\n%s", refusedWalkLine, planted, logs.String())
 					}
 					after := wrefRefs(t, e, fx.repoID)
 					if len(after) != len(before) || after[tc.ref] != before[tc.ref] {
@@ -138,9 +166,13 @@ func TestRefWritesRefuseACommitWhoseHistoryThePacksLack(t *testing.T) {
 					}
 
 					// A commit that the packs hold completely still works.
+					refused := len(logLines(logs, refusedWalkLine))
 					resp, body = wrefDo(t, srv, http.MethodPost, tc.path, fx.token, tc.body(fx.c1))
 					if resp.StatusCode != http.StatusOK {
 						t.Fatalf("a commit that the packs hold: status %d, want 200, body %v", resp.StatusCode, body)
+					}
+					if got := len(logLines(logs, refusedWalkLine)); got != refused {
+						t.Fatalf("a commit that the packs hold added %d %q lines", got-refused, refusedWalkLine)
 					}
 				})
 			}
@@ -173,5 +205,42 @@ func TestRefWritesAcceptACommitWhoseHistoryThePacksHold(t *testing.T) {
 			t.Fatal(err)
 		}
 		scratchGit(t, repoPath, "", "rev-list", "--objects", "--all")
+	})
+}
+
+// The walk is git work that a writer starts, so it runs under the admission
+// slots, the time budget and the heap cap of the git:read routes. With every
+// slot of the repository taken, a create answers 503 with Retry-After and
+// writes nothing, and it frees its own slot when it is done.
+func TestRefWritesWalkUnderTheGitAdmissionSlots(t *testing.T) {
+	runBackends(t, func(t *testing.T, e *testEnv) {
+		for _, tc := range refWriteShapes() {
+			t.Run(tc.name, func(t *testing.T) {
+				fx := wrefSeedFixture(t, e)
+				p := withGitReadPolicy(t, testGitReadPolicy(1, time.Minute, gitread.DefaultOutputBytes, gitread.DefaultLimits()))
+				srv := newWrefServer(t, e)
+				before := wrefRefs(t, e, fx.repoID)
+
+				// c2 is the tip of main: a base that every shape has to walk to.
+				key := gitlimit.RepoKey(fx.repoID)
+				if err := p.slots.Acquire(t.Context(), key); err != nil {
+					t.Fatal(err)
+				}
+				resp, body := wrefDo(t, srv, http.MethodPost, tc.path, fx.token, tc.body(fx.c2))
+				if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+					t.Fatalf("with no free slot: status %d, Retry-After %q, body %v, want 503 with Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"), body)
+				}
+				if after := wrefRefs(t, e, fx.repoID); len(after) != len(before) || after[tc.ref] != before[tc.ref] {
+					t.Fatalf("refs changed while no slot was free: before %v, after %v", before, after)
+				}
+				p.slots.Release(key)
+
+				resp, body = wrefDo(t, srv, http.MethodPost, tc.path, fx.token, tc.body(fx.c2))
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("with a free slot: status %d, body %v, want 200", resp.StatusCode, body)
+				}
+				requireSlotsFree(t, p)
+			})
+		}
 	})
 }

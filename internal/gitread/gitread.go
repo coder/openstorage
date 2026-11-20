@@ -341,16 +341,22 @@ func (m *missingObjectScan) Write(p []byte) (int, error) {
 // The walk is git's own connectivity check, the one that receive-pack runs for
 // the new tips of a push: `rev-list --objects --not --all` over a view of the
 // registered packs (githttp.RegisteredPackView). The answer rests on which
-// objects git can read, never on git's error text: --missing=print makes git
-// print the id of each object that it cannot read and exit 0, and any other
-// outcome of git is an error. The view has no commit-graph on purpose, because a
-// commit-graph can describe commits that no registered pack holds and git then
-// walks past them. So the cost is the same with and without a commit-graph in
-// the cache.
+// objects git can read, never on git's error text. A cat-file first asks for
+// sha itself, because git before 2.45 dies on a start object that it cannot
+// read, whatever --missing says. Then --missing=print makes git print the id of
+// each object that it cannot read and exit 0. git before 2.43 also dies on a
+// missing parent commit, and git 2.43 dies on a ref at a missing object: exit
+// status 128 means that git could not walk the history, so it is the same
+// answer, as it is for the ancestry check of a push (isAncestorUncached). Any
+// other outcome of git is an error. The view has no commit-graph on purpose,
+// because a commit-graph can describe commits that no registered pack holds and
+// git then walks past them. So the cost is the same with and without a
+// commit-graph in the cache.
 //
 // A registered pack that the cache lacks makes a "missing" answer an error that
 // wraps githttp.ErrViewIncomplete, as it does for RegisteredKinds. A walk that
-// outlasts registeredWalkTimeout is an error that wraps ErrTimeBudget.
+// outlasts registeredWalkTimeout, or the request budget in ctx, is an error that
+// wraps ErrTimeBudget.
 func RegisteredClosure(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo, sha string) (bool, error) {
 	assertf(ref.ValidSHA(sha), "RegisteredClosure: malformed sha %q", sha)
 	kinds, err := githttp.AskRegisteredPacks(ctx, st, repoPath, repo, func(ctx context.Context) error {
@@ -358,20 +364,37 @@ func RegisteredClosure(ctx context.Context, st ref.RefStore, bl blob.BlobStore, 
 	}, func(view *githttp.RegisteredPackView) (map[string]string, error) {
 		walkCtx, cancel := context.WithTimeout(ctx, registeredWalkTimeout)
 		defer cancel()
-		scan := &missingObjectScan{}
-		_, err := Run(walkCtx, Cmd{Class: Heavy, Dir: repoPath, Env: view.Env(os.Environ()), Stdout: scan,
-			Args: []string{"-c", "core.commitGraph=false", "rev-list", "--objects", "--missing=print", "--quiet", sha, "--not", "--all"}})
+		env := view.Env(os.Environ())
+		out, err := Run(walkCtx, Cmd{Class: Light, Dir: repoPath, Env: env, Stdin: strings.NewReader(sha + "\n"),
+			Args: []string{"cat-file", "--batch-check=%(objecttype)"}})
+		if err == nil {
+			var start map[string]string
+			if start, err = githttp.ParseObjectKinds([]string{sha}, out); err == nil && start[sha] == "missing" {
+				return start, nil
+			}
+		}
+		if err == nil {
+			scan := &missingObjectScan{}
+			_, err = Run(walkCtx, Cmd{Class: Heavy, Dir: repoPath, Env: env, Stdout: scan,
+				Args: []string{"-c", "core.commitGraph=false", "rev-list", "--objects", "--missing=print", "--quiet", sha, "--not", "--all"}})
+			switch {
+			case err == nil && scan.err != nil:
+				err = scan.err
+			case err == nil && scan.missing:
+				return map[string]string{sha: "missing"}, nil
+			case err == nil:
+				return map[string]string{sha: "commit"}, nil
+			}
+		}
 		switch {
 		case ctx.Err() == nil && errors.Is(walkCtx.Err(), context.DeadlineExceeded):
 			return nil, fmt.Errorf("walk the history of %s: %w", sha, ErrTimeBudget)
-		case err != nil:
-			return nil, err
-		case scan.err != nil:
-			return nil, scan.err
-		case scan.missing:
-			return map[string]string{sha: "missing"}, nil
+		default:
+			if _, unreadable := gitStderr(err, 128); unreadable {
+				return map[string]string{sha: "missing"}, nil
+			}
 		}
-		return map[string]string{sha: "commit"}, nil
+		return nil, err
 	})
 	if err != nil {
 		return false, err

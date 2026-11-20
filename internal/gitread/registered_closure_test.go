@@ -13,9 +13,10 @@ import (
 )
 
 // RegisteredClosure decides from the objects that git can read, which
-// `rev-list --missing=print` prints as "?<id>" lines, and from nothing else:
-// any other outcome of git is an error, never a refusal. A stand-in git shows
-// each outcome.
+// `rev-list --missing=print` prints as "?<id>" lines, and from the exit status
+// 128 with which older git dies on a commit that it cannot read, and from
+// nothing else: any other outcome of git is an error, never a refusal. A
+// stand-in git shows each outcome.
 func TestRegisteredClosureAnswersFromTheMissingObjectsAlone(t *testing.T) {
 	sha := strings.Repeat("a", 40)
 	st, err := ref.Open(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.sqlite"))
@@ -39,13 +40,14 @@ func TestRegisteredClosureAnswersFromTheMissingObjectsAlone(t *testing.T) {
 		{"an object is missing", "echo '?" + sha + "'; exit 0", false, ""},
 		{"a missing object and a failed walk", "echo '?" + sha + "'; exit 128", false, ""},
 		{"output that is no missing object", "echo 'deadbeef'; exit 0", false, "something other than a missing object"},
-		{"git fails", "echo 'fatal: out of memory' >&2; exit 128", false, "out of memory"},
+		{"git cannot walk the history (exit 128)", "echo 'fatal: ...' >&2; exit 128", false, ""},
+		{"git fails another way (exit 129)", "echo 'usage: git rev-list' >&2; exit 129", false, "exit status 129"},
 		{"git is killed", "kill -9 $$", false, "killed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
 			// rev-list is the walk. The stand-in answers the other git commands with exit 0.
-			script := "#!/bin/sh\ncase \"$*\" in *rev-list*) " + tc.script + " ;; esac\nexit 0\n"
+			script := "#!/bin/sh\ncase \"$*\" in *cat-file*) echo commit ;; *rev-list*) " + tc.script + " ;; esac\nexit 0\n"
 			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +84,7 @@ func TestRegisteredClosureWalkBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\ncase \"$*\" in *rev-list*) sleep 30 ;; esac\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\ncase \"$*\" in *cat-file*) echo commit ;; *rev-list*) sleep 30 ;; esac\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -101,6 +103,15 @@ func TestRegisteredClosureWalkBudget(t *testing.T) {
 	cancel()
 	if _, err := RegisteredClosure(ctx, st, nil, repoPath, "repo_x", sha); errors.Is(err, ErrTimeBudget) || err == nil {
 		t.Fatalf("a caller that gave up: %v, want its own error, not ErrTimeBudget", err)
+	}
+}
+
+// A walk that is left to its own budget must end within the time that the
+// documentation promises (docs/reference/http-api.md, "Which commit the base and
+// the tag target can name").
+func TestRegisteredWalkTimeoutIsThirtySeconds(t *testing.T) {
+	if registeredWalkTimeout != 30*time.Second {
+		t.Fatalf("registeredWalkTimeout = %v, want 30s as documented", registeredWalkTimeout)
 	}
 }
 
@@ -123,7 +134,7 @@ func TestRegisteredClosureRunsGitsConnectivityCheckOverTheView(t *testing.T) {
 	}
 	bin := t.TempDir()
 	log := filepath.Join(bin, "log")
-	script := "#!/bin/sh\ncase \"$*\" in *rev-list*) echo \"$*\" >> " + log + "\n" +
+	script := "#!/bin/sh\ncase \"$*\" in *cat-file*) echo commit ;; *rev-list*) echo \"$*\" >> " + log + "\n" +
 		"echo \"GIT_DIR=$GIT_DIR\" >> " + log + "\necho \"OBJECTS=$GIT_OBJECT_DIRECTORY\" >> " + log + "\n" +
 		"echo \"ALT=$GIT_ALTERNATE_OBJECT_DIRECTORIES\" >> " + log + " ;; esac\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
@@ -153,5 +164,41 @@ func TestRegisteredClosureRunsGitsConnectivityCheckOverTheView(t *testing.T) {
 	}
 	if lines[3] != "ALT=" {
 		t.Fatalf("the walk keeps the alternates %q, want none", lines[3])
+	}
+}
+
+// git before 2.45 dies on a start object that it cannot read, whatever
+// --missing says, so the walk asks for the object first: an object that no
+// registered pack holds is missing without a walk.
+func TestRegisteredClosureAsksForTheObjectBeforeTheWalk(t *testing.T) {
+	sha := strings.Repeat("c", 40)
+	st, err := ref.Open(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.InitSchema(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	repoPath := filepath.Join(t.TempDir(), "r.git")
+	if err := os.MkdirAll(filepath.Join(repoPath, "objects", "pack"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	log := filepath.Join(bin, "log")
+	script := "#!/bin/sh\necho \"$1\" >> " + log + "\ncase \"$*\" in *cat-file*) cat >/dev/null; echo '" + sha + " missing' ;; *rev-list*) echo 'fatal: bad object' >&2; exit 128 ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if ok, err := RegisteredClosure(t.Context(), st, nil, repoPath, "repo_x", sha); err != nil || ok {
+		t.Fatalf("RegisteredClosure = %v, %v, want false and no error", ok, err)
+	}
+	b, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(b)); len(got) != 1 || got[0] != "cat-file" {
+		t.Fatalf("git ran %q, want one cat-file and no walk", got)
 	}
 }

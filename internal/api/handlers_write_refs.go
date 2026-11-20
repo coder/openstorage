@@ -400,8 +400,14 @@ func wrefValidateCreateBranch(req *wrefCreateBranchRequest) (target string, allo
 // the commits that a push's refs reach and no other commit of its pack, so a
 // push can leave such a commit in the registry. A ref at it hydrates, and
 // every clone, fetch and archive that walks the history then fails.
+//
+// The walk runs under the same admission slots, time budget and heap cap as a
+// git:read route (gitReads): a write endpoint has no request budget of its own,
+// and a writer must not be able to start any number of walks at once.
 func (s *server) wrefUsableCommit(ctx context.Context, repoID, repoPath, sha string) (bool, error) {
-	usable, err := gitread.RegisteredClosure(ctx, s.refStore, s.blobStore, repoPath, repoID, sha)
+	b := gitread.NewBudget(gitReads.slots, gitlimit.RepoKey(repoID), gitReads.timeout, gitReads.outputBytes).WithLimits(gitReads.limits)
+	defer b.Close()
+	usable, err := gitread.RegisteredClosure(gitread.WithBudget(ctx, b), s.refStore, s.blobStore, repoPath, repoID, sha)
 	if err == nil && !usable {
 		s.logger.Warn("a ref write names a commit that the registered packs cannot walk: a pack lacks the commit or one of its ancestors, trees or blobs",
 			"repo", repoID, "sha", sha)
@@ -525,6 +531,18 @@ func (s *server) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
 				return true
 			}
 			if !held {
+				// A create that cannot win is answered before the walk: a plain
+				// create of a branch that exists loses its swap, whatever the base.
+				if oldSHA == ref.ZeroSHA && !allocate {
+					now, ok := s.wrefTip(w, r, repo.RepoID, targetRef)
+					if !ok {
+						return true
+					}
+					if now != ref.ZeroSHA {
+						writeErr(w, http.StatusConflict, "branch already exists")
+						return true
+					}
+				}
 				ok, err := s.wrefUsableCommit(ctx, repo.RepoID, repoPath, baseSHA)
 				if err != nil {
 					s.internalErr(w, r, "check that the registered packs hold the base and its history", err)

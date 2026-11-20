@@ -130,8 +130,9 @@ func (c *countsPackListings) ListPacks(ctx context.Context, repo string) ([]ref.
 
 // The registry is read only for a request that is about to write a ref. A
 // writer with a token can send the same request again and again, and a request
-// that the ref policy denies, that names a tag that exists, or that leaves a
-// branch where it is, must not cost a registry read and a view of the cache.
+// that the ref policy denies, that names a tag or a branch that exists, or that
+// leaves a branch where it is, must not cost a registry read, a view of the
+// cache and a walk of its history.
 func TestRefWritesReadTheRegistryOnlyBeforeAWrite(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := wrefSeedFixture(t, e)
@@ -155,6 +156,7 @@ func TestRefWritesReadTheRegistryOnlyBeforeAWrite(t *testing.T) {
 			{"policy denies a tag", "/api/v1/repos/tags", denyAll, map[string]any{"name": "denied", "ref": fx.c1}, http.StatusForbidden},
 			{"the tag exists", "/api/v1/repos/tags", fx.token, map[string]any{"name": "annot", "ref": fx.c1}, http.StatusConflict},
 			{"the branch is already at the base", "/api/v1/repos/branches/create", fx.token, map[string]any{"target_branch": "feature", "base_ref": fx.c1, "force": true}, http.StatusOK},
+			{"a plain create of a branch that exists", "/api/v1/repos/branches/create", fx.token, map[string]any{"target_branch": "feature", "base_ref": fx.c2}, http.StatusConflict},
 		} {
 			before := counter.n.Load()
 			resp, body := wrefDo(t, srv, http.MethodPost, tc.path, tc.token, tc.body)
