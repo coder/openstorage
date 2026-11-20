@@ -127,6 +127,12 @@ Dockerfile, so it refuses tags cut before that Dockerfile stamped the version
    reads. A new dispatch builds again and passes only if Alpine has since served a Git whose
    words match. Otherwise teach `internal/api` the new words, update the cases in
    `internal/api/testdata/applymsg`, and cut a new release.
+   Next, [`scripts/check-apk-origin.sh`](../../scripts/check-apk-origin.sh) checks that
+   the image's Alpine `main` repository offers every installed package (a tag cut before
+   that script landed skips this check with a notice). If it fails because `main`
+   replaced a package after the build, a new dispatch builds again and passes. If a
+   package comes from `community` or elsewhere, change the Dockerfile and cut a new
+   release.
    Last, it runs the [Compose quickstart smoke](../../scripts/smoke-compose-quickstart.sh).
 
 2. After that run is green, request the push:
