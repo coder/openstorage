@@ -582,9 +582,9 @@ boots the pinned Floci image with S3 auth enforced, mints an IAM user and key,
 and assumes a role via STS. It reruns the full PG-mode `internal/githttp` E2E
 suite with blobs on Floci and the STS **session credentials** in the
 environment. It uses the same digest-pinned build as `s3waltest.FlociImage`
-and the blob workflow. The pin lives in `testimages.Floci`, and
-`TestDigestCopiesMatch` fails until both workflows and the repro blocks on this
-page carry the same digest.
+and the blob workflow. The pin lives in `testimages.Floci`.
+`TestDigestCopiesMatch` fails while any digest copy of it in either workflow or
+on this page holds another digest, or while one of those files holds no copy.
 
 The seam is `OPENSTORAGE_TEST_S3_ENDPOINT`, a test-only `TestMain` override
 like `OPENSTORAGE_TEST_BACKEND` that never touches production config parsing.
