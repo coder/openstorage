@@ -80,6 +80,10 @@ jobs:
             echo "::error::IAM CreateAccessKey returned missing or malformed credentials"
             exit 1
           fi
+          # Mask every minted value before anything can print it: the log of
+          # each later step lists its environment, GITHUB_ENV values included.
+          echo "::add-mask::$access_key_id"
+          echo "::add-mask::$secret_key"
           aws --endpoint-url http://127.0.0.1:4566 iam create-role \
             --role-name githttp-nightly-role \
             --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:user/githttp-nightly"},"Action":"sts:AssumeRole"}]}'
@@ -96,6 +100,9 @@ jobs:
             echo "::error::STS AssumeRole returned missing or malformed session credentials"
             exit 1
           fi
+          echo "::add-mask::$session_key_id"
+          echo "::add-mask::$session_secret"
+          echo "::add-mask::$session_token"
           {
             echo "AWS_ACCESS_KEY_ID=$session_key_id"
             echo "AWS_SECRET_ACCESS_KEY=$session_secret"
