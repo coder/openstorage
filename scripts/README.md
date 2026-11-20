@@ -8,7 +8,7 @@ Standalone maintenance scripts for docs, releases, the Compose quickstart, the w
 - `release-archives.sh`: cross-compiles `./cmd/openstorage` for four platforms, packages each binary with `LICENSE`, and writes `checksums.txt`. `.github/workflows/release.yml` runs it.
 - `smoke-compose-quickstart.sh`: an end-to-end smoke test of `compose.quickstart.yml` against a local image. It covers key init, the HTTP API, Git and Git LFS push and clone, restart persistence, and fail-closed init faults. CI runs it in `.github/workflows/ci.yml` and `.github/workflows/image.yml`.
 - `check-apply-messages.sh`: runs the patch cases in `internal/api/testdata/applymsg` through the `git` on PATH and checks the exit status and the message lines that `internal/api` reads to pick an HTTP status. `TestApplyMessageCases` in `internal/api` runs it, the `image` job in `.github/workflows/ci.yml` runs it inside the built image, whose Git is Alpine's, and `.github/workflows/image.yml` runs it inside the staged release image (before publication) and the published one (after it) when the tag carries it.
-- `check-apk-origin.sh`: runs inside the runtime image and fails unless the image's own Alpine `main` repository offers the installed build of every package. The `image` job in `.github/workflows/ci.yml` runs it inside the built image on amd64 and arm64.
+- `check-apk-origin.sh`: runs inside the runtime image and fails unless the image's own Alpine `main` repository offers the installed build of every package. The `image` job in `.github/workflows/ci.yml` runs it inside the built image on amd64 and arm64, and so do the `verify` jobs of `.github/workflows/image.yml`.
 
 `test_check_doc_links.py` holds the regression tests for `check-doc-links.py`. It is a test file, not a script.
 
@@ -101,7 +101,7 @@ No child directories.
 ### `check-apk-origin.sh`
 
 - `[check-apk-origin.sh:main]` The repository it checks: the one `/etc/apk/repositories` line that ends in `/<branch>/main`, where `<branch>` is `v` plus the major and minor version in `/etc/alpine-release` (`v3.24`). No such line, or more than one, fails the run.
-- `[check-apk-origin.sh:CHECKED]` Prints the main repository, one `FAIL` line per package that does not pass, one `::warning::` line per package that `main` has replaced since the build, then `CHECKED <n> FAILED <m>`. It exits 0 only when it checked every installed package and none failed, and 2 when `apk` itself fails.
+- `[check-apk-origin.sh:CHECKED]` Prints the main repository, one `FAIL` line per package that does not pass, then `CHECKED <n> FAILED <m>`. It exits 0 only when `apk policy` described every installed package exactly once and none failed. It exits 2 when `apk`, `mktemp` or the read of `/etc/alpine-release` fails.
 
 ## Invariants
 
@@ -168,8 +168,8 @@ No child directories.
 
 ### `check-apk-origin.sh`
 
-- `[check-apk-origin.sh:offered]` Decides by repository, as `apk policy` reports it for the installed package. `apk policy` lists one group per package build and puts the installed build in the group of the repository build with the same checksum. A package passes when `main` is in that group. It fails when only another repository is (`community`, for example), or when no repository is and `main` offers no newer version: a virtual package, a local file, a package from another branch, or a build with `main`'s name and version but other contents.
-- `[check-apk-origin.sh:newer]` An Alpine index holds only the newest build of each package. When no repository offers the installed build any more and `main` offers a newer version, `main` replaced the package after the build. The package then passes with a warning.
+- `[check-apk-origin.sh:offered]` Decides by repository, as `apk policy` reports it for the installed package. `apk policy` lists one group per package build and puts the installed build in the group of the repository build with the same checksum. A package passes when `main` is in that group. It fails when only another repository is (`community`, for example), or when no repository is: a virtual package, a local file, a package from another branch or from edge, or a build with `main`'s name and version but other contents.
+- `[check-apk-origin.sh:rerun]` An Alpine index holds only the newest build of each package, so a package that `main` replaced between the build and the check fails too. Its `FAIL` line names the versions that `main` offers, and a rerun of the job builds against the new index. The script cannot tell that case from an older build of another origin, so it never passes either.
 - `[check-apk-origin.sh:fetching]` apk only warns when it cannot read an index, so a failed read of the `main` index fails the run.
 
 ## Side Effects
@@ -214,5 +214,5 @@ No child directories.
 - Smoke syntax: `bash -n scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml`).
 - Smoke run (needs Docker and a local image): `OPENSTORAGE_IMAGE=<local-image> bash scripts/smoke-compose-quickstart.sh` (from `.github/workflows/ci.yml` and `.github/workflows/image.yml`).
 - Git's patch refusals: `sh scripts/check-apply-messages.sh internal/api/testdata/applymsg` (from `TestApplyMessageCases` in `internal/api`, from the `image` job in `.github/workflows/ci.yml`, and from `.github/workflows/image.yml`, which run it inside the image).
-- Package origin (needs Docker, a local image and network): `docker run --rm --entrypoint /bin/sh -v "$PWD/scripts/check-apk-origin.sh:/check-apk-origin.sh:ro" <local-image> /check-apk-origin.sh` (from the `image` job in `.github/workflows/ci.yml`).
+- Package origin (needs Docker, a local image and network): `docker run --rm --entrypoint /bin/sh -v "$PWD/scripts/check-apk-origin.sh:/check-apk-origin.sh:ro" <local-image> /check-apk-origin.sh` (from the `image` job in `.github/workflows/ci.yml` and the `verify` jobs in `.github/workflows/image.yml`).
 - Release archives (needs Go): `./scripts/release-archives.sh <tag> <outdir>` (from `.github/workflows/release.yml`). Use an `<outdir>` outside the checkout. Untracked files in the checkout make Go stamp `vcs.modified=true` (see the comment in `.github/workflows/release.yml`).
