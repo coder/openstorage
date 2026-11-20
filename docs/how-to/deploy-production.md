@@ -44,10 +44,12 @@ package fixes:
   later ones.
 - Base-image and package upgrades still need qualification.
 
-Alpine v3.24 upstream support ([release inventory](https://alpinelinux.org/releases.json),
-checked 2026-10-08): `main` through **2028-06-01**, `community` through **2026-11-01**.
-These are repository support dates, not a whole-image support guarantee or a
-vulnerability-scan result.
+Alpine v3.24 upstream support ([release branches](https://alpinelinux.org/releases/) and
+[release inventory](https://alpinelinux.org/releases.json), checked 2026-11-20): the
+`main` repository through **2028-06-01**. Every package in the runtime image comes from
+`main`. The image installs nothing from `community`, which Alpine supports only until
+its next stable release. These are repository support dates, not a whole-image support
+guarantee or a vulnerability-scan result.
 
 ## Backing services
 
