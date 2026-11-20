@@ -121,6 +121,14 @@ jobs:
       # Every package and version in the image, for comparing two builds.
       - name: List the image's Alpine packages
         run: docker run --rm --network none --entrypoint /sbin/apk "$OPENSTORAGE_IMAGE" list -I
+      # Alpine supports `main` far longer than `community`, and
+      # docs/how-to/deploy-production.md says every package comes from `main`.
+      # apk reads the repository indexes, so this step needs network.
+      - name: Check that every Alpine package comes from main
+        run: |
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/scripts/check-apk-origin.sh:/check-apk-origin.sh:ro" \
+            "$OPENSTORAGE_IMAGE" /check-apk-origin.sh
       # The image's Git is Alpine's. internal/api reads its patch refusals by
       # their words, so a reworded message must fail here, not answer 500.
       - name: Check the words of the image's Git patch refusals
