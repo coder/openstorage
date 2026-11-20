@@ -345,9 +345,10 @@ Remove any of these refs from the ref store with
    object a registered pack holds, and prints `restored: <ref>`. It keeps deleted a
    branch at a blob, a tree or an annotated tag, and a ref that would conflict with an
    existing ref (directory/file), and prints `not restored: <ref>`. When a signal or an
-   error stops it during the deletes, it prints each ref at a missing object that it
-   deleted or was deleting, with its SHA: check the packs with `openstorage list-packs`,
-   and create a ref again where a pack holds its object and the ref is gone.
+   error stops it during the deletes or the restore, it prints each ref at a missing
+   object that it deleted and did not put right, and the ref that it was deleting or
+   creating again, with its SHA: check the packs with `openstorage list-packs`, and
+   create a ref again where a pack holds its object and the ref is gone.
 3. Check the list, then delete the refs: `openstorage repair-refs --yes <repo ID>`. The
    command deletes a ref only if it still holds the SHA that it listed. When a ref
    changed since the list, the command reports `lost CAS`, keeps that ref, does not retry,
@@ -373,9 +374,11 @@ Remove any of these refs from the ref store with
    create it again under a free name once the repository answers. Delete a branch with
    `DELETE /repos/branches` (with `ephemeral` for an ephemeral branch) and a tag with
    `DELETE /repos/tags`: they do not need the cache. No REST route deletes a ref in another
-   namespace (for example a notes ref). `git push <remote> :<ref>` deletes it through a
-   replica whose cache still lists the ref, and the push fails on a replica whose cache
-   does not list it.
+   namespace (for example a notes ref). There, delete the ref that a replica's cache lists,
+   with `git push <remote> :<ref>` through that replica. That is usually the ref that the
+   push created, not the one that step 3 printed: the restored ref was at a missing
+   object, so no cache lists it, and the push that deletes it fails. Ask the pusher to push
+   the deleted ref again.
 
 The command writes to the ref store with the same compare-and-swap as a push, so the
 replicas can keep running. It changes the ref store only: it sends no push webhook and

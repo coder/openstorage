@@ -320,9 +320,10 @@ which the push created), and git reads of it answer `500` again. The
 the pair and delete one of the two refs. It takes a push that is in flight while a restore
 runs, and a restore happens only when a pack registered during the deletes.
 
-When a signal or an error stops the run during the deletes, the command prints each ref at
-a missing object that it deleted or was deleting, with its SHA. A store error does not
-prove that the delete failed: PostgreSQL can return an error for a delete that committed.
+When a signal or an error stops the run during the deletes or the restore, the command
+prints each ref at a missing object that it deleted and did not put right, and the ref that
+it was deleting or creating again, with its SHA. A store error does not prove that the
+delete failed: PostgreSQL can return an error for a delete that committed.
 Check the packs with `openstorage list-packs`, and create a ref again where a pack holds
 its object and the ref is gone.
 

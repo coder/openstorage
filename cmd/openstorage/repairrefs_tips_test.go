@@ -1042,36 +1042,44 @@ func TestRepairRefsListsTheRefWhoseDeleteFailedInTheRecoveryWarning(t *testing.T
 }
 
 // The warning lists a ref whose delete failed only when its tip is missing.
-// A ref that git cannot lock (the name has a part over 255 bytes) has a tip
-// that a pack holds, so no pack that registers later heals it: listing it
-// would send the operator to look for a pack that cannot exist. The command
-// deletes the refs that git cannot lock before the refs at a missing object,
-// so a failed delete of such a ref stops the run with nothing to list.
+// A ref that git cannot lock (a last name part over 250 bytes) and a branch at
+// a blob have a tip that a pack holds, so no pack that registers later heals
+// them: listing one would send the operator to look for a pack that cannot
+// exist. The command deletes these refs before the refs at a missing object,
+// so a failed delete of one of them stops the run with nothing to list.
 func TestRepairRefsKeepsAFailedDeleteOfAnotherKindOutOfTheRecoveryWarning(t *testing.T) {
-	for _, cancel := range []bool{false, true} {
-		t.Run("cancel="+strconv.FormatBool(cancel), func(t *testing.T) {
-			rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			f := newRepairFixture(t, rs)
-			long := "refs/tags/zzz" + strings.Repeat("z", 251)
-			f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/ghost": strings.Repeat("ab", 20), long: f.commit})
-			ctx, stop := context.WithCancel(t.Context())
-			defer stop()
-			store := failingDeleteStore{RefStore: f.rs, name: long}
-			if cancel {
-				store.cancel = stop
-			}
-			var out bytes.Buffer
-			err = repairRefs(ctx, store, f.target(), true, &out)
-			if err == nil || !strings.Contains(err.Error(), "(0 deleted before the error)") {
-				t.Fatalf("--yes with a failing delete = %v\n%s", err, out.String())
-			}
-			if warning := afterStopWarning(out.String()); warning != "" {
-				t.Fatalf("the run lists refs for a delete of a ref at a commit that failed:\n%s", out.String())
-			}
-		})
+	for _, tc := range []struct {
+		name string
+		ref  string
+		sha  func(f *repairFixture) string
+	}{
+		{"unlockable name at a commit", "refs/tags/zzz" + strings.Repeat("z", 251), func(f *repairFixture) string { return f.commit }},
+		{"branch at a blob", "refs/heads/blobby", func(f *repairFixture) string { return f.blob }},
+	} {
+		for _, cancel := range []bool{false, true} {
+			t.Run(tc.name+"/cancel="+strconv.FormatBool(cancel), func(t *testing.T) {
+				rs, err := ref.OpenSQLite(t.Context(), "sqlite://"+filepath.Join(t.TempDir(), "refs.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := newRepairFixture(t, rs)
+				f.plant(t, map[string]string{"refs/heads/main": f.commit, "refs/tags/ghost": strings.Repeat("ab", 20), tc.ref: tc.sha(f)})
+				ctx, stop := context.WithCancel(t.Context())
+				defer stop()
+				store := failingDeleteStore{RefStore: f.rs, name: tc.ref}
+				if cancel {
+					store.cancel = stop
+				}
+				var out bytes.Buffer
+				err = repairRefs(ctx, store, f.target(), true, &out)
+				if err == nil || !strings.Contains(err.Error(), "(0 deleted before the error)") {
+					t.Fatalf("--yes with a failing delete = %v\n%s", err, out.String())
+				}
+				if warning := afterStopWarning(out.String()); warning != "" {
+					t.Fatalf("the run lists refs for a failed delete of a ref that no pack can heal:\n%s", out.String())
+				}
+			})
+		}
 	}
 }
 
