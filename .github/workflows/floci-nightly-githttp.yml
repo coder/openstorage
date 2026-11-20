@@ -37,9 +37,10 @@ jobs:
       # installed so the lane cannot quietly lose coverage (mirrors ci.yml).
       - run: git lfs version
       - name: boot floci
-        # Keep this OCI index digest in sync with s3waltest.FlociImage and
-        # floci-nightly.yml. Release 2.5.0 passed the baseline/candidate
-        # qualification and credential lanes before adoption.
+        # testimages.Floci is the pin; TestDigestCopiesMatch fails until this
+        # copy, floci-nightly.yml and the docs match it. Release 2.5.0 passed
+        # the baseline/candidate qualification and credential lanes before
+        # adoption.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \
