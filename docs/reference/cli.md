@@ -317,15 +317,14 @@ lands after it is not refused: the repository then holds both refs (for example
 `refs/tags/a`, which the command printed as `restored: refs/tags/a`, and `refs/tags/a/b`,
 which the push created), and git reads of it answer `500` again. The
 [runbook](../how-to/deploy-production.md#refs-that-git-can-never-lock) says how to find
-the pair and delete one of the two refs. Such a push has to land in the instant between
-the check and the create of a restore, and a restore happens only when a pack registered
-during the deletes.
+the pair and delete one of the two refs. It takes a push that is in flight while a restore
+runs, and a restore happens only when a pack registered during the deletes.
 
-When a signal or an error stops the run after it deleted a ref at a missing object, the
-command prints each such ref, and the ref that it was deleting, with its SHA. A store
-error does not prove that the last delete failed: PostgreSQL can return an error for a
-delete that committed. Check the packs with `openstorage list-packs`, and create a ref
-again where a pack holds its object and the ref is gone.
+When a signal or an error stops the run during the deletes, the command prints each ref at
+a missing object that it deleted or was deleting, with its SHA. A store error does not
+prove that the delete failed: PostgreSQL can return an error for a delete that committed.
+Check the packs with `openstorage list-packs`, and create a ref again where a pack holds
+its object and the ref is gone.
 
 The command ignores every `GIT_` variable of the shell (for example `GIT_DIR`,
 `GIT_OBJECT_DIRECTORY` and `GIT_DEFAULT_HASH`) and pins git's global and system config to

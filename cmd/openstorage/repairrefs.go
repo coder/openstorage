@@ -184,8 +184,8 @@ same instant as a restore (refs/tags/a/b while it creates refs/tags/a again)
 can leave both refs, and git reads of the repository then answer 500 again.
 docs/how-to/deploy-production.md (Refs that git can never lock) says how to
 find the pair and delete one of the two. If a signal or an error stops it
-after a delete, it prints each ref that it deleted as missing, and the ref
-that it was deleting, with its SHA.
+during the deletes, it prints each ref at a missing object that it deleted or
+was deleting, with its SHA.
 
 The command ignores every GIT_ variable of the shell and every git config file.
 It stops with an error, and deletes nothing, when git does not work on its
@@ -405,7 +405,7 @@ func warnDeletedMissing(out io.Writer, refs []repairRef) {
 	if len(refs) == 0 {
 		return
 	}
-	fmt.Fprintf(out, "the run stopped before it checked the packs again: a pack that registered since can hold the object of one of these %d refs, which the run deleted as missing or was deleting when it stopped (a store error can leave the last one in place). Check them with openstorage list-packs, and create a ref again where a pack holds its object and the ref is gone:\n", len(refs))
+	fmt.Fprintf(out, "the run stopped before it checked the packs again: a pack that registered since can hold the object of one of these %d refs, which the run deleted as missing, or was deleting or creating again when it stopped, so some of them can still exist. Check them with openstorage list-packs, and create a ref again where a pack holds its object and the ref is gone:\n", len(refs))
 	for _, r := range refs {
 		fmt.Fprintf(out, "  %s %s\n", r.sha, sanitizeTerm(r.name))
 	}
