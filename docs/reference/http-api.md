@@ -753,6 +753,20 @@ for a tag that exists or for a create that leaves the branch at its tip (with `f
 `expected_target_sha`). So a request that the policy denies
 answers `403` even when its commit is only in the cache.
 
+The registered packs must also hold what git needs to read the commit's history: its ancestors,
+down to the commits that a ref of the repository reaches, and their trees and blobs. A push can
+leave a commit in a registered pack whose parent, tree or blob no pack holds, because
+`receive-pack` checks the commits that a push's refs reach and no other commit of its pack. A ref
+at such a commit would hydrate, and every clone, fetch and archive that walks the history would
+fail. A commit whose history the registered packs cannot walk answers `404`, like a commit that
+does not exist. The check is the walk that `receive-pack` runs for the new tips of a push (`git
+rev-list --objects --not --all`) over the registered packs, without a commit-graph, because a
+commit-graph can describe a commit that no registered pack holds. A commit that a ref reaches ends
+the walk at once, so a base near the tip of a branch costs milliseconds. The oldest commit of
+500,000 linear commits costs about two seconds, and a commit that no ref reaches costs the walk of
+the commits since the ones that a ref reaches, with their trees. A walk of more than 30 seconds
+answers `503`.
+
 #### Guarded branch create and move
 
 `expected_target_sha` on `POST /repos/branches/create` (both path styles) guards the

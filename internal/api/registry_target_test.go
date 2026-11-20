@@ -47,13 +47,18 @@ func plantCacheOnlyCommit(t *testing.T, repoPath, parent string) string {
 	return run("", "commit-tree", "-p", parent, "-m", "cache only", tree)
 }
 
-func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
-	type shape struct {
-		name, path string
-		body       func(sha string) map[string]any
-		ref        string // the ref that the request would create
-	}
-	shapes := []shape{
+// refWriteShape is one request that stores a commit of the body in a ref.
+type refWriteShape struct {
+	name, path string
+	body       func(sha string) map[string]any
+	ref        string // the ref that the request would create
+}
+
+// refWriteShapes lists the requests that store a commit that the request names
+// in a ref: the base of a branch (named, as a fallback, forced, ephemeral) and
+// the target of a tag.
+func refWriteShapes() []refWriteShape {
+	return []refWriteShape{
 		{"branch base_ref", "/api/v1/repos/branches/create", func(sha string) map[string]any {
 			return map[string]any{"target_branch": "co", "base_ref": sha}
 		}, "refs/heads/co"},
@@ -70,6 +75,10 @@ func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
 			return map[string]any{"name": "co", "ref": sha}
 		}, "refs/tags/co"},
 	}
+}
+
+func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
+	shapes := refWriteShapes()
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		for _, tc := range shapes {
 			t.Run(tc.name, func(t *testing.T) {
