@@ -9,12 +9,14 @@ package githttp
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/openstorage/internal/ref"
 )
@@ -266,8 +268,17 @@ func packObjectList(t *testing.T, dir string, ids ...string) []byte {
 // the store, and git still hands a command that names one to pre-receive. A
 // commit-graph would answer from the commits it holds, so this node reads
 // none: git then cannot read the planted commit.
+//
+// git cannot walk the history between two real commits there, so the
+// operator also gets a line in serve's log, through the hook-errors file.
 func TestPlantedCommitWithoutParentIsRefused(t *testing.T) {
-	node := startNodeT(t, "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.commitGraph", "GIT_CONFIG_VALUE_0=false")
+	var serveLog syncBuffer
+	node, err := startBinaryNode(binPath, t.TempDir(), io.MultiWriter(os.Stderr, &serveLog),
+		"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.commitGraph", "GIT_CONFIG_VALUE_0=false")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	t.Cleanup(node.stop)
 	repo := registerRepo(t, "t-planted")
 	work := initWorkRepo(t)
 	c1 := revParse(t, work, "HEAD")
@@ -294,6 +305,7 @@ func TestPlantedCommitWithoutParentIsRefused(t *testing.T) {
 		{"planted new id, verify-sig", signed, unreadable, rawPushCommand{c1, planted, main}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			logStart := len(serveLog.String())
 			report, remote := rawReceivePack(t, node, repo, tc.token, false, pack, tc.cmd)
 			assertNoCrashText(t, remote)
 			if !strings.HasPrefix(report[main], "ng") || !strings.Contains(remote, tc.want) {
@@ -302,31 +314,79 @@ func TestPlantedCommitWithoutParentIsRefused(t *testing.T) {
 			if got := pgRefs(t, repo)[main]; got != c1 {
 				t.Fatalf("main = %s after a refused push, want %s", got, c1)
 			}
+			// serve logs the hook-errors file after the push ends.
+			pushLog := func() string { return serveLog.String()[logStart:] }
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline) && unwalkableLine(pushLog(), planted) == ""; {
+				time.Sleep(20 * time.Millisecond)
+			}
+			if unwalkableLine(pushLog(), planted) == "" {
+				t.Fatalf("serve's log has no line that git cannot walk the history to %s:\n%s", planted, pushLog())
+			}
 		})
 	}
 }
 
-// A git that fails for two readable commits is a broken git or repository,
-// not a pusher's input: the ancestry check must not turn it into a refusal.
-func TestBrokenGitStillFailsFast(t *testing.T) {
+// unwalkableLine returns the operator line of logUnwalkableHistory that
+// names sha in log, or "".
+func unwalkableLine(log, sha string) string {
+	for l := range strings.Lines(log) {
+		if strings.Contains(l, "git cannot walk the history between two commits") && strings.Contains(l, sha) {
+			return l
+		}
+	}
+	return ""
+}
+
+// merge-base exits 128 for two commits when git cannot walk their history:
+// a planted commit or a damaged repository. That is a refusal with an
+// operator line in the hook-errors file, and no further walk decides which
+// one it is. An id that names no commit is a refusal without that line. A
+// corrupt object, or any other failure of git, is a broken git or
+// repository and fails fast.
+func TestAncestryCheckOnAGitThatExits128(t *testing.T) {
+	old, new := strings.Repeat("a", 40), strings.Repeat("b", 40)
 	for _, tc := range []struct{ name, cases, panics string }{
-		{"merge-base fails for two readable commits", "merge-base) exit 128;;", "merge-base --is-ancestor"},
+		{"two commits git cannot walk", "merge-base) exit 128;;", ""},
+		{"an id that names no commit", "merge-base) exit 128;; rev-parse) exit 1;;", ""},
 		{"rev-parse fails with a corrupt object", "merge-base|rev-parse) exit 128;;", "rev-parse --verify"},
-		{"rev-list fails for another reason", "merge-base) exit 128;; rev-list) exit 1;;", "rev-list --quiet"},
+		{"merge-base fails for another reason", "merge-base) exit 129;;", "merge-base --is-ancestor"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bin := t.TempDir()
-			script := "#!/bin/sh\ncase \"$1\" in " + tc.cases + " esac\nexit 0\n"
+			// The stand-in logs each git command it runs.
+			calls := filepath.Join(bin, "calls")
+			script := "#!/bin/sh\necho \"$1\" >> " + calls + "\ncase \"$1\" in " + tc.cases + " esac\nexit 0\n"
 			if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-			defer func() {
-				if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), tc.panics) {
-					t.Fatalf("isAncestorUncached recovered %v, want a panic naming %q", r, tc.panics)
-				}
-			}()
-			isAncestorUncached(strings.Repeat("a", 40), strings.Repeat("b", 40))
+			records, err := createHookErrors(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(EnvHookErrors, records)
+			if tc.panics != "" {
+				defer func() {
+					if r := recover(); r == nil || !strings.Contains(fmt.Sprint(r), tc.panics) {
+						t.Fatalf("isAncestorUncached recovered %v, want a panic naming %q", r, tc.panics)
+					}
+				}()
+			}
+			if isAncestorUncached(old, new) {
+				t.Fatal("isAncestorUncached = true for a walk that git refused")
+			}
+			line := unwalkableLine(readRecords(t, records), new)
+			if two := tc.name == "two commits git cannot walk"; (line != "") != two {
+				t.Fatalf("operator line %q, want one: %v", line, two)
+			}
+			// No walk beyond merge-base: only the two cheap commit checks.
+			b, err := os.ReadFile(calls)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(b), "rev-list") {
+				t.Fatalf("the check ran rev-list after merge-base:\n%s", b)
+			}
 		})
 	}
 }
