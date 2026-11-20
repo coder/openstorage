@@ -675,7 +675,7 @@ components:
       type: object
     GitSyncFailedEvent:
       additionalProperties: false
-      description: Sent when a repository sync run fails, including failures after retries are exhausted and infrastructure failures. Internal cancellations do not produce this event. run_count includes the run that just finished.
+      description: Sent at the first failure of a series of failed repository sync runs. Pierre retries a sync that fails with a transient error for up to 2 hours. A later run of the series that fails again with a transient error does not produce this event. An error that a retry cannot fix always produces this event. When the retries stop, no event is sent, and the next sync trigger starts a new series. During the move to the new sync engine, some repositories get this event once per run, when the retries of the run end. Internal cancellations do not produce this event. run_count includes the run that just finished.
       properties:
         completed_at:
           description: When the sync run finished, as an RFC 3339 timestamp.
@@ -720,7 +720,7 @@ components:
       type: object
     GitSyncStartedEvent:
       additionalProperties: false
-      description: Sent when a repository sync run begins, before the upstream fetch starts. run_count counts previously completed runs.
+      description: "Sent when a repository sync run begins, before the upstream fetch starts. After a run fails, a later run of the same failing series sends this event only when it succeeds: at the end of the run, right before repo.sync.succeeded. During the move to the new sync engine, some repositories send this event at the start of every run, also after a failure. Also during the move, one sync of each repository sends this event and repo.sync.succeeded only when it changes refs. Each event has its own delivery, so deliveries can arrive out of order. run_count counts previously completed runs."
       properties:
         is_first_sync:
           description: Whether the repository had never synced successfully before this run began.
@@ -756,7 +756,7 @@ components:
       type: object
     GitSyncSucceededEvent:
       additionalProperties: false
-      description: Sent when a repository sync run completes successfully. run_count includes the run that just finished.
+      description: Sent when a repository sync run completes successfully. If an earlier run of the same series failed, Pierre sends repo.sync.started right before this event. During the move to the new sync engine, some repositories send repo.sync.started at the start of the run instead. Each event has its own delivery, so this event can arrive before repo.sync.started. The events of one run have the same started_at, and repo.sync.started has a run_count that is 1 lower. run_count includes the run that just finished.
       properties:
         completed_at:
           description: When the sync run finished, as an RFC 3339 timestamp.
@@ -16347,7 +16347,7 @@ webhooks:
         - Webhooks
   repo.sync.failed:
     post:
-      description: Sent when a repository sync run fails, including failures after retries are exhausted and infrastructure failures. Internal cancellations do not produce this event. run_count includes the run that just finished.
+      description: Sent at the first failure of a series of failed repository sync runs. Pierre retries a sync that fails with a transient error for up to 2 hours. A later run of the series that fails again with a transient error does not produce this event. An error that a retry cannot fix always produces this event. When the retries stop, no event is sent, and the next sync trigger starts a new series. During the move to the new sync engine, some repositories get this event once per run, when the retries of the run end. Internal cancellations do not produce this event. run_count includes the run that just finished.
       operationId: webhooks-repo-sync-failed
       parameters:
         - description: The event type for this delivery.
@@ -16380,7 +16380,7 @@ webhooks:
         - Webhooks
   repo.sync.started:
     post:
-      description: Sent when a repository sync run begins, before the upstream fetch starts. run_count counts previously completed runs.
+      description: "Sent when a repository sync run begins, before the upstream fetch starts. After a run fails, a later run of the same failing series sends this event only when it succeeds: at the end of the run, right before repo.sync.succeeded. During the move to the new sync engine, some repositories send this event at the start of every run, also after a failure. Also during the move, one sync of each repository sends this event and repo.sync.succeeded only when it changes refs. Each event has its own delivery, so deliveries can arrive out of order. run_count counts previously completed runs."
       operationId: webhooks-repo-sync-started
       parameters:
         - description: The event type for this delivery.
@@ -16413,7 +16413,7 @@ webhooks:
         - Webhooks
   repo.sync.succeeded:
     post:
-      description: Sent when a repository sync run completes successfully. run_count includes the run that just finished.
+      description: Sent when a repository sync run completes successfully. If an earlier run of the same series failed, Pierre sends repo.sync.started right before this event. During the move to the new sync engine, some repositories send repo.sync.started at the start of the run instead. Each event has its own delivery, so this event can arrive before repo.sync.started. The events of one run have the same started_at, and repo.sync.started has a run_count that is 1 lower. run_count includes the run that just finished.
       operationId: webhooks-repo-sync-succeeded
       parameters:
         - description: The event type for this delivery.

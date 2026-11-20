@@ -118,6 +118,9 @@ jobs:
           grep -F "openstorage v0.0.0-ci (commit $GITHUB_SHA," <<<"$out"
       - name: Check runtime Git and signature tools
         run: docker run --rm --entrypoint /bin/sh "$OPENSTORAGE_IMAGE" -c 'command -v git && command -v gpg && command -v ssh-keygen'
+      # Every package and version in the image, for comparing two builds.
+      - name: List the image's Alpine packages
+        run: docker run --rm --network none --entrypoint /sbin/apk "$OPENSTORAGE_IMAGE" list -I
       # The image's Git is Alpine's. internal/api reads its patch refusals by
       # their words, so a reworded message must fail here, not answer 500.
       - name: Check the words of the image's Git patch refusals
