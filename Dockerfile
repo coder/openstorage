@@ -31,12 +31,12 @@ FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c
 # of a package, so an exact pin would make a release tag unbuildable after the
 # next update, and image.yml rebuilds a tag from its own Dockerfile. The image
 # jobs run scripts/check-apply-messages.sh against the git that the build got.
-# The pinned base holds zlib 1.3.2-r1 (ALPINE-CVE-2026-4738, fixed in 1.4-r0)
-# and `apk add` does not upgrade a package that the base already holds. The same
-# layer upgrades zlib, without a version pin (see git above). Remove the
-# `apk upgrade` line once the pinned alpine base ships zlib 1.4-r0 or newer.
+# `apk add` does not upgrade a package that the base already holds, and the v3.24
+# repository ships fixes to base packages (OpenSSL, zlib) before an Alpine point
+# release does. So the same layer upgrades every installed package to the
+# repository's current build, without version pins (see git above).
 RUN apk add --no-cache git ca-certificates gnupg openssh-keygen \
-    && apk upgrade --no-cache zlib \
+    && apk upgrade --no-cache \
     && adduser -D -H openstorage
 COPY --from=build /out/openstorage /usr/local/bin/openstorage
 USER openstorage
