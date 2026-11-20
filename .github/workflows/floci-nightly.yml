@@ -35,8 +35,9 @@ jobs:
         with:
           go-version-file: go.mod
       - name: boot floci
-        # Keep this OCI index digest in sync with s3waltest.FlociImage and
-        # floci-nightly-githttp.yml so every lane tests the qualified release.
+        # testimages.Floci is the pin; TestDigestCopiesMatch fails until this
+        # copy, floci-nightly-githttp.yml and the docs match it, so every lane
+        # tests the qualified release.
         run: |
           docker run -d --name floci -p 4566:4566 \
             -e FLOCI_SERVICES_S3_ENFORCE_AUTH=true \

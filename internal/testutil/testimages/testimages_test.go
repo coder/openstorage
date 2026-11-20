@@ -28,6 +28,8 @@ type pinCopies struct {
 var pins = []pinCopies{
 	{Postgres, []string{"docker-compose.yml"}},
 	{SeaweedFS, []string{"docker-compose.yml", "README.md", "CONTRIBUTING.md"}},
+	{Floci, []string{".github/workflows/floci-nightly.yml", ".github/workflows/floci-nightly-githttp.yml", "docs/reference/testing.md"}},
+	{AmazonLinux, []string{"deploy/terraform/aws/bootstrap/Dockerfile.test"}},
 }
 
 // TestDigestCopiesMatch keeps the hand-written copies of the pins in sync
