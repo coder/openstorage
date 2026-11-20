@@ -5,8 +5,7 @@
 # (from /etc/alpine-release and /etc/apk/repositories) offers the installed
 # build of every package. A package that only `community`, another
 # repository or no repository offers fails, and so does a virtual package.
-# Prints one line per package that does not pass or passes with a warning, then
-# a count line.
+# Prints one line per package that does not pass, then a count line.
 set -u
 work=$(mktemp -d) || exit 2
 trap 'rm -rf "$work"' EXIT
@@ -66,29 +65,24 @@ while IFS='|' read -r name inst repos offered; do
 	case "$repos " in
 	*" $main "*) continue ;;
 	esac
+	failed=$((failed + 1))
 	if [ -n "$repos" ]; then
-		failed=$((failed + 1))
 		echo "FAIL $name $inst: offered by$repos, not by $main"
-		continue
-	fi
-	# Alpine keeps only the newest build in an index. When main replaced the
-	# package between the build and this check, no repository offers the
-	# installed version any more, and main offers a newer one.
-	newer=""
-	for v in $offered; do
-		[ "$(apk version -t "$inst" "$v" </dev/null)" = "<" ] && newer=$v
-	done
-	if [ -n "$newer" ]; then
-		echo "::warning::$name $inst: no repository offers it any more, and $main offers the newer $newer"
+	elif [ -n "$offered" ]; then
+		# An index holds only the newest build of a package, so a package that
+		# main replaced after the build looks like this too. A rerun of the job
+		# builds the image against the new index.
+		echo "FAIL $name $inst: no repository offers this build, and $main offers$offered (rerun the job if Alpine replaced the package after the build)"
 	else
-		failed=$((failed + 1))
 		echo "FAIL $name $inst: no repository offers it"
 	fi
 done <"$work/rows"
-want=$(grep -c . "$work/names")
-if [ "$checked" != "$want" ]; then
+# apk policy must describe each installed package exactly once.
+cut -d'|' -f1 "$work/rows" | sort >"$work/described"
+sort "$work/names" >"$work/installed"
+if ! cmp -s "$work/installed" "$work/described"; then
 	failed=$((failed + 1))
-	echo "FAIL apk policy described $checked of $want installed packages"
+	echo "FAIL apk policy described $checked rows for $(grep -c . "$work/names") installed packages, not one row per package"
 fi
 echo "CHECKED $checked FAILED $failed"
 [ "$checked" -gt 0 ] && [ "$failed" -eq 0 ]

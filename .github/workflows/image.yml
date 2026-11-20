@@ -235,6 +235,20 @@ jobs:
             -v "$PWD/scripts/check-apply-messages.sh:/check-apply-messages.sh:ro" \
             -v "$PWD/internal/api/testdata/applymsg:/cases:ro" \
             "$OPENSTORAGE_IMAGE" /check-apply-messages.sh /cases
+      - name: Check that every Alpine package comes from main
+        # docs/how-to/deploy-production.md says every package comes from Alpine
+        # `main`. publish ships exactly the digests checked here, and
+        # verify-published leaves this check out: it can run days after the
+        # build, when main has replaced packages. Tags cut before the script
+        # landed skip the check.
+        run: |
+          if [ ! -f scripts/check-apk-origin.sh ]; then
+            echo "::notice::$TAG has no scripts/check-apk-origin.sh, so its image's packages are not checked for their repository"
+            exit 0
+          fi
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/scripts/check-apk-origin.sh:/check-apk-origin.sh:ro" \
+            "$OPENSTORAGE_IMAGE" /check-apk-origin.sh
       - name: Smoke the Compose quickstart
         run: bash scripts/smoke-compose-quickstart.sh
 
