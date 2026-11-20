@@ -47,13 +47,18 @@ func plantCacheOnlyCommit(t *testing.T, repoPath, parent string) string {
 	return run("", "commit-tree", "-p", parent, "-m", "cache only", tree)
 }
 
-func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
-	type shape struct {
-		name, path string
-		body       func(sha string) map[string]any
-		ref        string // the ref that the request would create
-	}
-	shapes := []shape{
+// refWriteShape is one request that stores a commit of the body in a ref.
+type refWriteShape struct {
+	name, path string
+	body       func(sha string) map[string]any
+	ref        string // the ref that the request would create
+}
+
+// refWriteShapes lists the requests that store a commit that the request names
+// in a ref: the base of a branch (named, as a fallback, forced, ephemeral) and
+// the target of a tag.
+func refWriteShapes() []refWriteShape {
+	return []refWriteShape{
 		{"branch base_ref", "/api/v1/repos/branches/create", func(sha string) map[string]any {
 			return map[string]any{"target_branch": "co", "base_ref": sha}
 		}, "refs/heads/co"},
@@ -70,6 +75,10 @@ func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
 			return map[string]any{"name": "co", "ref": sha}
 		}, "refs/tags/co"},
 	}
+}
+
+func TestRefWritesRefuseACommitThatOnlyTheCacheHolds(t *testing.T) {
+	shapes := refWriteShapes()
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		for _, tc := range shapes {
 			t.Run(tc.name, func(t *testing.T) {
@@ -121,8 +130,9 @@ func (c *countsPackListings) ListPacks(ctx context.Context, repo string) ([]ref.
 
 // The registry is read only for a request that is about to write a ref. A
 // writer with a token can send the same request again and again, and a request
-// that the ref policy denies, that names a tag that exists, or that leaves a
-// branch where it is, must not cost a registry read and a view of the cache.
+// that the ref policy denies, that names a tag or a branch that exists, or that
+// leaves a branch where it is, must not cost a registry read, a view of the
+// cache and a walk of its history.
 func TestRefWritesReadTheRegistryOnlyBeforeAWrite(t *testing.T) {
 	runBackends(t, func(t *testing.T, e *testEnv) {
 		fx := wrefSeedFixture(t, e)
@@ -146,6 +156,7 @@ func TestRefWritesReadTheRegistryOnlyBeforeAWrite(t *testing.T) {
 			{"policy denies a tag", "/api/v1/repos/tags", denyAll, map[string]any{"name": "denied", "ref": fx.c1}, http.StatusForbidden},
 			{"the tag exists", "/api/v1/repos/tags", fx.token, map[string]any{"name": "annot", "ref": fx.c1}, http.StatusConflict},
 			{"the branch is already at the base", "/api/v1/repos/branches/create", fx.token, map[string]any{"target_branch": "feature", "base_ref": fx.c1, "force": true}, http.StatusOK},
+			{"a plain create of a branch that exists", "/api/v1/repos/branches/create", fx.token, map[string]any{"target_branch": "feature", "base_ref": fx.c2}, http.StatusConflict},
 		} {
 			before := counter.n.Load()
 			resp, body := wrefDo(t, srv, http.MethodPost, tc.path, tc.token, tc.body)

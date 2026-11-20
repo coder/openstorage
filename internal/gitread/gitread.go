@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/coder/openstorage/internal/auth"
 	"github.com/coder/openstorage/internal/blob"
@@ -298,4 +299,105 @@ func RegisteredKinds(ctx context.Context, st ref.RefStore, bl blob.BlobStore, re
 		}
 		return githttp.ParseObjectKinds(ids, out)
 	})
+}
+
+// registeredWalkTimeout bounds the history walk of RegisteredClosure. The walk
+// reads the commits between sha and the commits that refs reach: a base that a
+// ref reaches ends it at once, and the oldest commit of 500,000 linear commits
+// costs about two seconds without a commit-graph. A write endpoint has no
+// request budget, so the walk carries its own.
+var registeredWalkTimeout = 30 * time.Second
+
+// missingObjectScan reads the output of `git rev-list --missing=print --quiet`,
+// which holds one "?<id>" line for each object that the walk could not read and
+// nothing else. The first byte decides: git is stopped there, because one
+// missing object answers the question.
+type missingObjectScan struct {
+	missing bool
+	err     error
+}
+
+func (m *missingObjectScan) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if p[0] != '?' {
+		m.err = errors.New("rev-list --missing=print --quiet printed something other than a missing object")
+		return 0, ErrStop
+	}
+	m.missing = true
+	return 0, ErrStop
+}
+
+// RegisteredClosure reports whether the registered packs hold what git needs to
+// read sha and everything that sha names that no ref of the node's cache
+// reaches: the commits down to the ones that a ref reaches, and their trees and
+// blobs. A ref may be created at sha only then. A pack can hold a commit whose
+// parent no registered pack holds (a push can carry commits that its refs do
+// not reach, and git checks the commits that the refs reach alone), and a ref
+// at such a commit lets git read the ref, yet every clone that walks the
+// history fails.
+//
+// The walk is git's own connectivity check, the one that receive-pack runs for
+// the new tips of a push: `rev-list --objects --not --all` over a view of the
+// registered packs (githttp.RegisteredPackView). The answer rests on which
+// objects git can read, never on git's error text. A cat-file first asks for
+// sha itself, because git before 2.45 dies on a start object that it cannot
+// read, whatever --missing says. Then --missing=print makes git print the id of
+// each object that it cannot read and exit 0. git before 2.43 also dies on a
+// missing parent commit, and git 2.43 dies on a ref at a missing object: exit
+// status 128 means that git could not walk the history, so it is the same
+// answer, as it is for the ancestry check of a push (isAncestorUncached). Any
+// other outcome of git is an error. The view has no commit-graph on purpose,
+// because a commit-graph can describe commits that no registered pack holds and
+// git then walks past them. So the cost is the same with and without a
+// commit-graph in the cache.
+//
+// A registered pack that the cache lacks makes a "missing" answer an error that
+// wraps githttp.ErrViewIncomplete, as it does for RegisteredKinds. A walk that
+// outlasts registeredWalkTimeout, or the request budget in ctx, is an error that
+// wraps ErrTimeBudget.
+func RegisteredClosure(ctx context.Context, st ref.RefStore, bl blob.BlobStore, repoPath, repo, sha string) (bool, error) {
+	assertf(ref.ValidSHA(sha), "RegisteredClosure: malformed sha %q", sha)
+	kinds, err := githttp.AskRegisteredPacks(ctx, st, repoPath, repo, func(ctx context.Context) error {
+		return githttp.HydratePacks(ctx, st, bl, repoPath, repo)
+	}, func(view *githttp.RegisteredPackView) (map[string]string, error) {
+		walkCtx, cancel := context.WithTimeout(ctx, registeredWalkTimeout)
+		defer cancel()
+		env := view.Env(os.Environ())
+		out, err := Run(walkCtx, Cmd{Class: Light, Dir: repoPath, Env: env, Stdin: strings.NewReader(sha + "\n"),
+			Args: []string{"cat-file", "--batch-check=%(objecttype)"}})
+		if err == nil {
+			var start map[string]string
+			if start, err = githttp.ParseObjectKinds([]string{sha}, out); err == nil && start[sha] == "missing" {
+				return start, nil
+			}
+		}
+		if err == nil {
+			scan := &missingObjectScan{}
+			_, err = Run(walkCtx, Cmd{Class: Heavy, Dir: repoPath, Env: env, Stdout: scan,
+				Args: []string{"-c", "core.commitGraph=false", "rev-list", "--objects", "--missing=print", "--quiet", sha, "--not", "--all"}})
+			switch {
+			case err == nil && scan.err != nil:
+				err = scan.err
+			case err == nil && scan.missing:
+				return map[string]string{sha: "missing"}, nil
+			case err == nil:
+				return map[string]string{sha: "commit"}, nil
+			}
+		}
+		switch {
+		case ctx.Err() == nil && errors.Is(walkCtx.Err(), context.DeadlineExceeded):
+			return nil, fmt.Errorf("walk the history of %s: %w", sha, ErrTimeBudget)
+		default:
+			if _, unreadable := gitStderr(err, 128); unreadable {
+				return map[string]string{sha: "missing"}, nil
+			}
+		}
+		return nil, err
+	})
+	if err != nil {
+		return false, err
+	}
+	return kinds[sha] != "missing", nil
 }

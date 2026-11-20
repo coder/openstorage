@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -35,10 +36,16 @@ import (
 // with the production auth middleware, backed by the lane's stores.
 func newWrefServer(t *testing.T, e *testEnv) *httptest.Server {
 	t.Helper()
+	return newWrefServerLogging(t, e, discardLogger())
+}
+
+// newWrefServerLogging is newWrefServer with the server's log lines going to logger.
+func newWrefServerLogging(t *testing.T, e *testEnv, logger *slog.Logger) *httptest.Server {
+	t.Helper()
 	s := &server{
 		store:       e.store,
 		httpBaseURL: testHTTPBaseURL,
-		logger:      discardLogger(),
+		logger:      logger,
 		refStore:    e.refStore,
 		blobStore:   e.blobStore,
 		cacheDir:    e.cacheDir,

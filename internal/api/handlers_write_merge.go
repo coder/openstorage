@@ -684,6 +684,25 @@ func (s *server) handleMerge(w http.ResponseWriter, r *http.Request) {
 			writeRefGuardFailed(w, "expected_source_sha", sourceSHA, sourceMovedMsg)
 			return
 		}
+		// The source branch reaches the pin, but the pin can still be a commit
+		// that only this node's cache holds (a push can leave a commit behind
+		// a ref tip that no registered pack holds). A ref or a merge commit at
+		// it would wedge every other node, so it answers like a pin that the
+		// source branch does not contain. The tip needs no check: a ref is at it.
+		if req.sourcePin != sourceSHA {
+			usable, err := s.wrefUsableCommitAlone(ctx, repo.RepoID, repoPath, req.sourcePin)
+			if err != nil {
+				const op = "check that the registered packs hold expected_source_sha and its history"
+				if !s.writeGitLimitErr(w, r, op, err) {
+					s.wmInternal(w, r, op, err)
+				}
+				return
+			}
+			if !usable {
+				writeRefGuardFailed(w, "expected_source_sha", sourceSHA, sourceMovedMsg)
+				return
+			}
+		}
 		sourceSHA = req.sourcePin
 	}
 
