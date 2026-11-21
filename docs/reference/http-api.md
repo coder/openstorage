@@ -774,9 +774,10 @@ on 500,000 linear commits: the tip of a branch takes 5 ms, a commit 1,000 back 1
 commits and trees, and also the walk of the history of the refs down to its commit date (1,000 new
 commits dated after the tip took 14 ms, and the same commits dated 1970 took 1.7 s). A commit
 whose parent no pack holds always costs the whole history (1.6 s). A separate unreferenced history
-costs more, because git also holds its trees: 50,000 commits took 2.4 s, and 100,000 commits need
-more than the heap cap. The walk runs under the admission slots, the 30-second time budget and the
-256 MiB heap cap (Linux) of the git:read routes ([Resource limits on git
+costs more, because git also holds its trees: 50,000 commits took 2.4 s. A long enough one needs
+more than the heap cap: with one new blob and three new trees per commit, 100,000 commits fit
+under it and 500,000 did not (git 2.55). The walk runs under the admission slots, the 30-second
+time budget and the 256 MiB heap cap (Linux) of the git:read routes ([Resource limits on git
 reads](#resource-limits-on-git-reads)): a request that finds no free slot answers `503` with
 `Retry-After`, a walk that outlasts its budget answers `503`, and a walk that needs more memory
 answers `422`. A create whose `base_ref` is refused walks `preferred_base` under the same slot
@@ -1162,7 +1163,7 @@ Other limits and gaps:
 
 - **Platforms.** The memory limit needs `RLIMIT_DATA`, which only Linux enforces. On other server platforms, such as macOS, git runs without a memory cap, and the concurrency, time, output and file-size limits still apply. No endpoint refuses a request because the memory cap is unavailable. For deployments where untrusted users can push, run the server on Linux. See [ADR-49](../adr/049-read-side-git-children-run-under-one-per-request-budget.md).
 - `archive` streams its response. An error after the response has started (for example, the time limit, or a delta-compressed file whose base object does not fit in memory) closes the connection, so the client sees a truncated, invalid gzip stream instead of a status code.
-- Not covered by these limits: hydrating the cache repository before the git reads (serialized per repository), git clone and fetch over the git protocol (`upload-pack`, which has its own request-size limits), and the write endpoints.
+- Not covered by these limits: hydrating the cache repository before the git reads (serialized per repository), git clone and fetch over the git protocol (`upload-pack`, which has its own request-size limits), and the write endpoints. The exception is the history walk of `POST /repos/branches/create`, `POST /repos/tags` and a `POST /repos/merge` whose `expected_source_sha` is not the source tip, which runs under these limits ([which commit the base and the tag target can name](#which-commit-the-base-and-the-tag-target-can-name)).
 
 ## Status-code contract (what clients key on)
 
